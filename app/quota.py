@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
+import uuid
 
 import httpx
 
@@ -14,9 +16,40 @@ from . import logs, settings
 from .models import Account, Status
 from .store import store
 
+_DEVICE_MID: str | None = None
+
+
+def device_mid() -> str:
+    """本机设备 ID（ZCode 客户端 telemetry 同款语义）。
+
+    billing 全家桶（current/balance/usage/preview/claim）必需 X-Device-Mid，
+    缺失时上游返回 code=3001 parameter error。首次生成后持久化到 data 目录。
+    """
+    global _DEVICE_MID
+    if _DEVICE_MID:
+        return _DEVICE_MID
+    path = settings.DATA_DIR / "device_mid"
+    try:
+        _DEVICE_MID = path.read_text().strip()
+        if _DEVICE_MID:
+            return _DEVICE_MID
+    except OSError:
+        pass
+    _DEVICE_MID = str(uuid.uuid4())
+    try:
+        os.makedirs(settings.DATA_DIR, exist_ok=True)
+        with open(path, "x") as f:
+            f.write(_DEVICE_MID)
+    except OSError as err:  # noqa: BLE001 - 生成失败不阻断查询，仅进程内复用
+        logs.warn("quota", f"device_mid 持久化失败（仅进程内生效）: {err}")
+    return _DEVICE_MID
+
 
 def _auth_headers(account: Account) -> dict:
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Device-Mid": device_mid(),
+    }
     if account.mode == "jwt" and account.jwt_token:
         headers["Authorization"] = f"Bearer {account.jwt_token}"
     elif account.api_key:

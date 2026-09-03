@@ -83,6 +83,7 @@ class TestClaim:
         _method, _path, headers, body = claim_calls[0]
         assert headers.get("x-aliyun-captcha-verify-param") == "stub-verify-param"
         assert headers.get("x-aliyun-captcha-verify-region") == "sgp"
+        assert headers.get("x-device-mid")  # billing 全家桶必需（否则上游 3001）
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 1
         # 领取成功后触发额度刷新
