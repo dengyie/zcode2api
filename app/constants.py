@@ -43,12 +43,13 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
 # ── 客户端配置（公开、免鉴权）─────────────────────────────────────────────────
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
-CLIENT_CONFIGS_QUERY = "app_version=3.0.0&platform=win32"
+# 上游校验 app_version（3.0.0 已 400），取值与 X_ZCODE_APP_VERSION 对齐
+CLIENT_CONFIGS_QUERY = "app_version=3.10.2&platform=win32"
 # 免登录额度口径（免费 Start Plan 日额度），仅作展示参考，不参与状态机
 FREE_QUOTA = {"GLM-5.3": 3_000_000, "GLM-5-Turbo": 2_000_000}
 
 # ── 验证码默认配置（client/configs 拉取失败时的兜底）──────────────────────────
-CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "sgp", "sceneId": "11xygtvd"}
+CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
 
 # ── 模型名 ───────────────────────────────────────────────────────────────────
 # Z.AI 上游模型名大小写敏感；客户端传小写别名时映射到官方名（gateway.MODEL_NAME_MAP）
