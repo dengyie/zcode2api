@@ -43,8 +43,8 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
 # ── 客户端配置（公开、免鉴权）─────────────────────────────────────────────────
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
-# 上游校验 app_version（3.0.0 已 400），取值与 X_ZCODE_APP_VERSION 对齐
-CLIENT_CONFIGS_QUERY = "app_version=3.10.2&platform=win32"
+# 上游校验 app_version（3.0.0 已 400）；实测带 platform 参数直接 3001，只带版本号
+CLIENT_CONFIGS_QUERY = "app_version=3.10.2"
 # 免登录额度口径（免费 Start Plan 日额度），仅作展示参考，不参与状态机
 FREE_QUOTA = {"GLM-5.3": 3_000_000, "GLM-5-Turbo": 2_000_000}
 

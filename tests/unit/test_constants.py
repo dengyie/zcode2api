@@ -23,12 +23,14 @@ def test_billing_base():
 
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
+    # 实测带 platform 参数上游 3001，只允许 app_version
+    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.10.2"
 
 
 def test_captcha_defaults_match_zcode2api():
-    # 与 zcode2api captcha.py 的兜底值一致（回归锁定）
+    # 实测线上 captcha region=cn（非 zcode2api 的 sgp 兜底），以线上为准
     assert constants.CAPTCHA_DEFAULTS == {
-        "enabled": True, "prefix": "no8xfe", "region": "sgp", "sceneId": "11xygtvd",
+        "enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd",
     }
 
 
