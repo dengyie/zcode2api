@@ -126,6 +126,31 @@
   </div>
 </div>
 
+<!-- 手动领取弹窗：浏览器内完成阿里人机验证 → verifyParam 提交 hub 转发领取 -->
+<div class="modal-overlay" id="modal-claim">
+  <div class="modal" style="max-width:440px">
+    <div class="modal-title">手动领取活动套餐</div>
+    <div class="dialog-body">
+      <div class="dialog-help" id="claim-help">完成下方人机验证后自动提交领取。活动套餐列表为空时，也可直接输入活动 plan_id 领取。</div>
+      <div class="dialog-field">
+        <span class="dialog-label">账号</span>
+        <select class="input" id="claim-account"></select>
+      </div>
+      <div class="dialog-field">
+        <span class="dialog-label">活动套餐</span>
+        <select class="input" id="claim-plan"><option value="">自动选择（可领套餐中优先级最高）</option></select>
+        <input class="input" id="claim-plan-id" placeholder="或直接填活动 plan_id（如 zcode-v3-start-plan-xxxx）" style="margin-top:8px;font-size:12px">
+      </div>
+      <div id="claim-captcha-box" style="min-height:80px;margin:12px 0 4px;display:flex;align-items:center;justify-content:center"></div>
+      <div class="dialog-help" id="claim-status" style="min-height:18px"></div>
+    </div>
+    <div class="dialog-actions">
+      <button onclick="closeClaimModal()" class="dialog-btn">关闭</button>
+      <button onclick="submitManualClaim()" class="dialog-btn dialog-btn-primary" id="claim-submit">领取</button>
+    </div>
+  </div>
+</div>
+
 <!-- Confirm modal -->
 <div class="modal-overlay" id="modal-confirm">
   <div class="modal" style="max-width:400px">
@@ -241,7 +266,8 @@ function rowHtml(a){
       </div>
       <div class="acct-actions row-actions">
         ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>
-        <button onclick="claimOne('${a.id}')" class="row-icon-btn${claiming.has(a.id)?' is-loading':''}" title="领取赠送额度"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg></button>`:''}
+        <button onclick="claimOne('${a.id}')" class="row-icon-btn${claiming.has(a.id)?' is-loading':''}" title="自动领取赠送额度"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg></button>
+        <button onclick="openClaimModal('${a.id}')" class="row-icon-btn" title="手动领取活动套餐（浏览器过验证码）"><svg viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="m9 12 2 2 4-4"/></svg></button>`:''}
         <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
           ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
         </button>
@@ -440,6 +466,118 @@ async function claimAll(){
     else showToast(`领取完成：成功 ${d.summary.ok}，失败 ${d.summary.fail}`,d.summary.ok?'success':'error');
   }catch(e){showToast('领取失败: '+e.message,'error');}
   finally{btn.disabled=false;await load();}
+}
+
+/* ── 手动领取：浏览器内过阿里滑块 → verifyParam 提交 hub 转发 ── */
+let claimSdkLoaded=false, claimVerifyParam='', claimCfgRegion='';
+function claimStatus(msg){document.getElementById('claim-status').textContent=msg||'';}
+function setClaimBusy(b){document.getElementById('claim-submit').disabled=b;
+  document.getElementById('claim-submit').textContent=b?'提交中…':'领取';}
+
+async function openClaimModal(id){
+  const jwtAll=allAccounts.filter(a=>a.mode==='jwt');
+  if(!jwtAll.length){showToast('没有可领取的 JWT 账号','info');return;}
+  const sel=document.getElementById('claim-account');
+  sel.innerHTML=jwtAll.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
+  if(id)sel.value=id;
+  sel.onchange=()=>loadClaimPlans();
+  document.getElementById('claim-plan-id').value='';
+  claimVerifyParam='';
+  claimStatus('');
+  setClaimBusy(false);
+  openModal('modal-claim');
+  await loadClaimPlans();
+  initClaimCaptcha();
+}
+
+async function loadClaimPlans(){
+  const sel=document.getElementById('claim-plan');
+  sel.innerHTML='<option value="">加载中…</option>';
+  try{
+    const d=await api('GET','/claim/preview?account_id='+encodeURIComponent(document.getElementById('claim-account').value));
+    const item=(d.preview||[])[0]||{};
+    const plans=item.plans||[];
+    if(item.error)claimStatus('套餐列表：'+item.error);
+    sel.innerHTML='<option value="">自动选择（可领套餐中优先级最高）</option>'+
+      plans.map(p=>`<option value="${esc(p.plan_id)}">${esc(p.name||p.plan_id)}</option>`).join('')+
+      (!plans.length?'<option value="" disabled>（当前无可领活动套餐）</option>':'');
+  }catch(e){
+    sel.innerHTML='<option value="">自动选择（列表加载失败，可直接填 plan_id）</option>';
+    claimStatus('套餐列表加载失败：'+e.message);
+  }
+}
+
+async function loadCaptchaSdk(){
+  if(claimSdkLoaded&&typeof window.initAliyunCaptcha==='function')return;
+  await new Promise((res,rej)=>{
+    const s=document.createElement('script');
+    s.src='https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js';
+    s.onload=res;s.onerror=()=>rej(new Error('验证码 SDK 加载失败'));
+    document.head.appendChild(s);
+  });
+  claimSdkLoaded=true;
+}
+
+async function initClaimCaptcha(){
+  const box=document.getElementById('claim-captcha-box');
+  box.innerHTML='<span class="dialog-help">验证码加载中…</span>';
+  try{
+    const cfg=await api('GET','/claim/captcha-config');
+    if(cfg.enabled===false||!cfg.scene_id)throw new Error('验证码未启用');
+    claimCfgRegion=cfg.region||'';
+    await loadCaptchaSdk();
+    box.innerHTML='<div id="claim-cap-holder"></div><button id="claim-cap-btn" type="button" style="display:none"></button>';
+    window.AliyunCaptchaConfig={region:cfg.region,prefix:cfg.prefix};
+    window.initAliyunCaptcha({
+      SceneId:cfg.scene_id, mode:'popup', language:'zh-CN', showErrorTip:false,
+      element:'#claim-cap-holder', button:'#claim-cap-btn',
+      getInstance:(inst)=>{try{inst.startTracelessVerification&&inst.startTracelessVerification();}catch(e){}},
+      success:(param)=>{
+        claimVerifyParam=typeof param==='string'?param:(param&&param.captchaVerifyParam)||'';
+        claimStatus('✓ 人机验证已通过，点击「领取」提交');
+        claimStatusColor(true);
+      },
+      fail:(p)=>{claimStatus('无感验证未通过，已弹出交互验证，请完成滑块');claimStatusColor(false);},
+      onError:()=>{claimStatus('验证码出错，请重试');claimStatusColor(false);},
+    });
+    claimStatus('请完成人机验证（无感通过或滑块）');
+    claimStatusColor(false);
+  }catch(e){
+    box.innerHTML='';
+    claimStatus('验证码初始化失败：'+e.message);
+    claimStatusColor(false);
+  }
+}
+function claimStatusColor(ok){
+  const el=document.getElementById('claim-status');
+  el.style.color=ok?'var(--mint, #4ade80)':'';
+}
+
+async function submitManualClaim(){
+  if(!claimVerifyParam){
+    claimStatus('请先完成人机验证');claimStatusColor(false);return;
+  }
+  setClaimBusy(true);
+  const account_id=document.getElementById('claim-account').value;
+  const plan_sel=document.getElementById('claim-plan').value;
+  const plan_manual=document.getElementById('claim-plan-id').value.trim();
+  try{
+    const d=await api('POST','/claim/manual',{
+      account_id,
+      captcha_verify_param:claimVerifyParam,
+      captcha_region:claimCfgRegion||undefined,
+      plan_id:plan_manual||plan_sel||undefined,
+    });
+    d.outcomes.forEach(claimToast);
+    if(d.summary.ok)closeModal('modal-claim');
+    else{claimStatus('领取失败：'+(d.outcomes[0]||{}).message+'，可重做验证再试');claimStatusColor(false);
+      claimVerifyParam='';initClaimCaptcha();}
+  }catch(e){claimStatus('提交失败：'+e.message);claimStatusColor(false);}
+  finally{setClaimBusy(false);await load();}
+}
+function closeClaimModal(){
+  closeModal('modal-claim');
+  try{window.AliyunCaptchaConfig=undefined;}catch(e){}
 }
 
 async function doExport(){

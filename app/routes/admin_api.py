@@ -8,7 +8,7 @@ import time
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth_admin import verify_admin_key
-from ..claim import ClaimError, preview_plans
+from ..claim import ClaimError, claim_with_captcha, preview_plans
 from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
@@ -293,6 +293,49 @@ async def claim(payload: dict = Body(default=None)):
                              "ok": False, "message": str(err)})
     ok = sum(1 for o in outcomes if o["ok"])
     return {"outcomes": outcomes, "summary": {"ok": ok, "fail": len(outcomes) - ok}}
+
+
+@router.get("/claim/captcha-config")
+async def claim_captcha_config():
+    """手动领取用：阿里验证码 SDK 初始化参数（前端浏览器内完成人机验证）。"""
+    from ..captcha import captcha_manager
+
+    config = await captcha_manager.fetch_config()
+    return {
+        "enabled": bool(config.get("enabled", True)),
+        "scene_id": config.get("sceneId") or "",
+        "region": config.get("region") or "",
+        "prefix": config.get("prefix") or "",
+    }
+
+
+@router.post("/claim/manual")
+async def claim_manual(payload: dict = Body(...)):
+    """手动领取：body {account_id, captcha_verify_param, captcha_region?, plan_id?}。
+
+    verify_param 必须来自用户浏览器内阿里 SDK 滑块成功回调（无头环境无法求解）。
+    """
+    account_id = (payload.get("account_id") or "").strip()
+    verify_param = (payload.get("captcha_verify_param") or "").strip()
+    region = (payload.get("captcha_region") or "").strip() or None
+    plan_id = (payload.get("plan_id") or "").strip() or None
+    if not account_id:
+        raise HTTPException(400, "缺少 account_id")
+
+    acc = store.find("zai", account_id)
+    if not acc or acc.mode != "jwt" or not acc.jwt_token:
+        raise HTTPException(404, "JWT 账号不存在")
+
+    try:
+        result = await claim_with_captcha(acc, verify_param, region, plan_id)
+    except ClaimError as err:
+        return {"outcomes": [{"account_id": acc.id, "account_name": acc.name,
+                              "ok": False, "message": str(err)}],
+                "summary": {"ok": 0, "fail": 1}}
+    await refresh_accounts([acc])
+    return {"outcomes": [{"account_id": acc.id, "account_name": acc.name,
+                          "ok": True, **result}],
+            "summary": {"ok": 1, "fail": 0}}
 
 
 # ── 设置 ─────────────────────────────────────────────────────────────────────

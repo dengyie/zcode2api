@@ -112,6 +112,48 @@ async def preview_plans(account: Account) -> list[dict]:
     return plans
 
 
+async def claim_with_captcha(
+    account: Account,
+    verify_param: str,
+    region: str | None,
+    plan_id: str | None = None,
+) -> dict:
+    """手动领取：verify_param 由用户浏览器内阿里 SDK 滑块产生，本端只做转发。
+
+    plan_id 缺省时先 preview 自动选优先级最高套餐（无需验证码）。
+    """
+    from .quota import _auth_headers
+
+    if not (account.mode == "jwt" and account.jwt_token):
+        raise ClaimError("仅 Coding Plan (JWT) 账号支持领取")
+    if not (verify_param or "").strip():
+        raise ClaimError("缺少验证码参数，请先完成人机验证")
+
+    plan_name, grants = plan_id or "", []
+    if not plan_id:
+        plans = await preview_plans(account)
+        if not plans:
+            raise ClaimError("没有待领取的套餐")
+        best = plans[0]
+        plan_id = best["plan_id"]
+        plan_name = best["name"] or plan_id
+        grants = best["grants"]
+
+    headers = _auth_headers(account)
+    headers[constants.CAPTCHA_HEADER] = verify_param.strip()
+    if region and region.strip():
+        headers["X-Aliyun-Captcha-Verify-Region"] = region.strip()
+
+    body = await _billing_request(
+        account, "POST", "/billing/claim",
+        headers=headers, json={"plan_id": plan_id},
+    )
+    code = _business_code(body)
+    if code != 0:
+        raise ClaimError(_fail_message(code, body))
+    return {"plan_id": plan_id, "plan_name": plan_name, "grants": grants}
+
+
 async def claim(account: Account, plan_id: str | None = None) -> dict:
     """领取套餐。plan_id 缺省时自动选优先级最高的可领套餐。
 

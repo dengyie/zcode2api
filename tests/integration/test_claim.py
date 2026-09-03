@@ -17,6 +17,7 @@ GOOD_JWT = "h1.eyJzdWIiOiJhIn0.sig"
 def claim_env(gateway_client, fresh_app, monkeypatch):
     """网关客户端 + JWT 账号 + claim 模块的验证码桩。"""
     client, mock = gateway_client
+    from app import captcha as captcha_module
     from app import claim as claim_module
 
     class _StubCaptcha:
@@ -36,6 +37,7 @@ def claim_env(gateway_client, fresh_app, monkeypatch):
 
     stub = _StubCaptcha()
     monkeypatch.setattr(claim_module, "captcha_manager", stub)
+    monkeypatch.setattr(captcha_module, "captcha_manager", stub)
     mock.state.claim_scenario = None  # session 级 mock，防止场景跨用例残留
     acc = seed_account(fresh_app, GOOD_JWT, name="claim-a")
     return client, mock, stub, acc
@@ -136,4 +138,104 @@ class TestClaim:
     async def test_claim_requires_admin_key(self, claim_env):
         client, _mock, _stub, acc = claim_env
         res = await client.post("/admin/api/claim", json={"account_ids": [acc.id]})
+        assert res.status_code == 401
+
+
+@pytest.mark.integration
+class TestManualClaim:
+    """手动领取：verifyParam 由用户浏览器滑块产生，服务端只转发（不调用求解器）。"""
+
+    async def test_captcha_config_endpoint(self, claim_env):
+        client, _mock, _stub, _acc = claim_env
+        res = await client.get("/admin/api/claim/captcha-config",
+                               headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        cfg = res.json()
+        assert cfg["enabled"] is True
+        assert cfg["scene_id"] == "mock-scene"
+        assert cfg["region"] == "sgp"
+        assert cfg["prefix"] == "mockpre"
+
+    async def test_manual_claim_success_forwards_browser_param(self, claim_env):
+        client, mock, stub, acc = claim_env
+        calls_before = len(mock.state.calls)
+        res = await client.post(
+            "/admin/api/claim/manual",
+            json={"account_id": acc.id, "captcha_verify_param": "browser-slider-param",
+                  "captcha_region": "cn", "plan_id": "mock-claim-plan"},
+            headers={"Authorization": "Bearer zcode"},
+        )
+        assert res.status_code == 200
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is True
+        assert res.json()["summary"] == {"ok": 1, "fail": 0}
+        # 浏览器参数原样转发；服务端求解器零调用
+        claim_calls = [c for c in mock.state.calls[calls_before:]
+                       if c[1].endswith("/billing/claim")]
+        assert len(claim_calls) == 1
+        _method, _path, headers, body = claim_calls[0]
+        assert headers.get("x-aliyun-captcha-verify-param") == "browser-slider-param"
+        assert headers.get("x-aliyun-captcha-verify-region") == "cn"
+        assert headers.get("x-device-mid")
+        assert b"mock-claim-plan" in body
+        assert stub.solve_count == 0
+        # 成功后触发额度刷新
+        assert any(c[1].endswith("/billing/balance") for c in mock.state.calls[calls_before:])
+
+    async def test_manual_claim_auto_picks_plan(self, claim_env):
+        client, mock, _stub, acc = claim_env
+        res = await client.post(
+            "/admin/api/claim/manual",
+            json={"account_id": acc.id, "captcha_verify_param": "browser-slider-param"},
+            headers={"Authorization": "Bearer zcode"},
+        )
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is True
+        assert outcome["plan_id"] == "mock-claim-plan"
+        _m, _p, headers, _body = next(
+            c for c in mock.state.calls if c[1].endswith("/billing/claim"))
+        assert headers.get("x-aliyun-captcha-verify-region") == "sgp"  # 缺省用 config.region
+
+    async def test_manual_claim_without_param_rejected(self, claim_env):
+        client, mock, stub, acc = claim_env
+        calls_before = len(mock.state.calls)
+        res = await client.post(
+            "/admin/api/claim/manual",
+            json={"account_id": acc.id},
+            headers={"Authorization": "Bearer zcode"},
+        )
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert "缺少验证码参数" in outcome["message"]
+        assert stub.solve_count == 0
+        assert not [c for c in mock.state.calls[calls_before:]
+                    if c[1].endswith("/billing/claim")]
+
+    async def test_manual_claim_business_failure_surfaced(self, claim_env):
+        client, mock, _stub, acc = claim_env
+        mock.state.claim_scenario = "claim_claimed"
+        res = await client.post(
+            "/admin/api/claim/manual",
+            json={"account_id": acc.id, "captcha_verify_param": "p",
+                  "plan_id": "mock-claim-plan"},
+            headers={"Authorization": "Bearer zcode"},
+        )
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert "已经领取过" in outcome["message"]
+        assert res.json()["summary"] == {"ok": 0, "fail": 1}
+
+    async def test_manual_claim_unknown_account_404(self, claim_env):
+        client, _mock, _stub, _acc = claim_env
+        res = await client.post(
+            "/admin/api/claim/manual",
+            json={"account_id": "no-such", "captcha_verify_param": "p"},
+            headers={"Authorization": "Bearer zcode"},
+        )
+        assert res.status_code == 404
+
+    async def test_manual_claim_requires_admin_key(self, claim_env):
+        client, _mock, _stub, acc = claim_env
+        res = await client.post("/admin/api/claim/manual",
+                                json={"account_id": acc.id, "captcha_verify_param": "p"})
         assert res.status_code == 401
