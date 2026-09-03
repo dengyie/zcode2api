@@ -30,6 +30,10 @@
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>
         刷新额度
       </button>
+      <button onclick="claimAll()" class="page-action-btn" id="btn-claim-all">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg>
+        一键领取
+      </button>
       <button onclick="openAdd()" class="page-action-btn page-action-btn-primary">
         <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         新增
@@ -141,7 +145,7 @@
 <script src="/static/js/header.js?v={{APP_VERSION}}"></script>
 <script>
 let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null;
-const refreshing=new Set();
+const refreshing=new Set(), claiming=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
 const NOTCH_COLORS=['var(--notch-1)','var(--notch-2)','var(--notch-3)','var(--notch-4)','var(--notch-5)','var(--notch-6)'];
@@ -236,7 +240,8 @@ function rowHtml(a){
         <div class="acct-meta">${meta}<span>·</span><span>调用 ${a.use_count||0}</span><span>失败 ${a.fail_count||0}</span><span>最近 ${fmtDate(a.last_used_at)}</span></div>
       </div>
       <div class="acct-actions row-actions">
-        ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>`:''}
+        ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>
+        <button onclick="claimOne('${a.id}')" class="row-icon-btn${claiming.has(a.id)?' is-loading':''}" title="领取赠送额度"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg></button>`:''}
         <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
           ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
         </button>
@@ -407,6 +412,34 @@ async function refreshAll(){
   showToast('正在刷新全部额度…','info');
   try{const d=await api('POST','/accounts/refresh',{all:true});showToast(`刷新完成：成功 ${d.summary.ok}，失败 ${d.summary.fail}`,'success');load();}
   catch(e){showToast('刷新失败: '+e.message,'error');}
+}
+
+/* ── 额度领取 ── */
+function claimToast(o){
+  if(o.ok)showToast(`「${o.account_name}」已领取「${o.plan_name||o.plan_id}」`,'success');
+  else showToast(`「${o.account_name}」领取失败：${o.message||'未知错误'}`,'error');
+}
+async function claimOne(id){
+  if(claiming.has(id))return;
+  claiming.add(id);renderList();
+  try{
+    const d=await api('POST','/claim',{account_ids:[id]});
+    d.outcomes.forEach(claimToast);
+  }catch(e){showToast('领取失败: '+e.message,'error');}
+  finally{claiming.delete(id);await load();}
+}
+async function claimAll(){
+  const btn=document.getElementById('btn-claim-all');
+  if(btn.disabled)return;
+  btn.disabled=true;
+  showToast('正在逐账号领取赠送额度…','info');
+  try{
+    const d=await api('POST','/claim',{});
+    d.outcomes.forEach(claimToast);
+    if(!d.outcomes.length)showToast('没有可领取的 JWT 账号','info');
+    else showToast(`领取完成：成功 ${d.summary.ok}，失败 ${d.summary.fail}`,d.summary.ok?'success':'error');
+  }catch(e){showToast('领取失败: '+e.message,'error');}
+  finally{btn.disabled=false;await load();}
 }
 
 async function doExport(){

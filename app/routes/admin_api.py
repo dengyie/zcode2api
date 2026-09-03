@@ -8,6 +8,8 @@ import time
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..auth_admin import verify_admin_key
+from ..claim import ClaimError, preview_plans
+from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
 from ..quota import fetch_quota, refresh_accounts
@@ -239,6 +241,58 @@ async def login_poll(flow_id: str):
     if account.mode == "jwt":
         await refresh_accounts([account])
     return {"status": "ready", "account": account.public_view()}
+
+
+# ── 额度领取 ─────────────────────────────────────────────────────────────────
+def _jwt_accounts(account_ids: list[str] | None) -> list:
+    accounts = store.list_accounts("zai")
+    if account_ids:
+        wanted = set(account_ids)
+        accounts = [a for a in accounts if a.id in wanted]
+    return [a for a in accounts if a.mode == "jwt" and a.jwt_token]
+
+
+@router.get("/claim/preview")
+async def claim_preview(account_id: str | None = None):
+    """立即拉取可领取套餐（全部/单个 JWT 账号）。"""
+    ids = [account_id] if account_id else None
+    out = []
+    for acc in _jwt_accounts(ids):
+        try:
+            plans = await preview_plans(acc)
+            out.append({"account_id": acc.id, "account_name": acc.name,
+                        "plans": plans, "error": None})
+        except ClaimError as err:
+            out.append({"account_id": acc.id, "account_name": acc.name,
+                        "plans": [], "error": str(err)})
+    return {"preview": out}
+
+
+@router.post("/claim")
+async def claim(payload: dict = Body(default=None)):
+    """领取套餐（body 可选 account_ids / plan_id）；缺省对全部 JWT 账号自动选最优套餐。
+
+    返回 outcomes[]：{account_id, account_name, ok, plan_name?, grants?, message?}。
+    """
+    payload = payload or {}
+    account_ids = payload.get("account_ids") or None
+    plan_id = (payload.get("plan_id") or "").strip() or None
+    targets = _jwt_accounts(account_ids)
+    if not targets:
+        return {"outcomes": [], "summary": {"ok": 0, "fail": 0}}
+
+    outcomes = []
+    for acc in targets:
+        try:
+            result = await do_claim(acc, plan_id)
+            await refresh_accounts([acc])
+            outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                             "ok": True, **result})
+        except ClaimError as err:
+            outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                             "ok": False, "message": str(err)})
+    ok = sum(1 for o in outcomes if o["ok"])
+    return {"outcomes": outcomes, "summary": {"ok": ok, "fail": len(outcomes) - ok}}
 
 
 # ── 设置 ─────────────────────────────────────────────────────────────────────

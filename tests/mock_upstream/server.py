@@ -3,7 +3,8 @@
 一个 FastAPI 应用，模拟 zcode.z.ai / api.z.ai 的全部被依赖端点：
   POST /api/v1/zcode-plan/anthropic/v1/messages   Plan 通道（JWT）
   POST /api/anthropic/v1/messages                 API Key 通道
-  GET  /api/v1/zcode-plan/billing/current|balance|usage
+  GET  /api/v1/zcode-plan/billing/current|balance|usage|preview
+  POST /api/v1/zcode-plan/billing/claim           套餐领取（需验证码头）
   GET  /api/v1/client/configs                     验证码配置（公开）
   POST /api/v1/oauth/cli/init, GET poll/{id}      OAuth CLI 流程
 
@@ -259,6 +260,61 @@ def build_app() -> FastAPI:
             }}},
         }), media_type="application/json")
 
+    # ── 套餐领取（claim）───────────────────────────────────────────────────
+    _CLAIM_PLAN = {
+        "plan_id": "mock-claim-plan",
+        "name": "Mock Daily Plan",
+        "description": "mock 每日赠送",
+        "priority": 100,
+        "entitlements": [
+            {"entitlement_id": "e1", "show_name": "GLM-5.3", "meter": "model_usage",
+             "unit_type": "token", "grant_units": 3000000, "period": "daily"},
+            {"entitlement_id": "e2", "show_name": "噪音项", "meter": "other",
+             "unit_type": "token", "grant_units": 1, "period": "daily"},
+        ],
+    }
+
+    async def _billing_preview(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        scenario = getattr(app.state, "claim_scenario", None) or headers.get("x-mock-scenario")
+        if scenario == "claim_none":
+            plans: list = []
+        elif scenario == "claim_claimed":
+            return Response(json.dumps({"code": 1003, "msg": "already claimed"}),
+                            media_type="application/json")
+        elif scenario == "claim_expired":
+            return Response(json.dumps({"code": 1002, "msg": "expired"}),
+                            media_type="application/json")
+        else:
+            plans = [dict(_CLAIM_PLAN)]
+        return Response(json.dumps({"code": 0, "data": {"plans": plans}}),
+                        media_type="application/json")
+
+    async def _billing_claim(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        body = await request.body()
+        _record("POST", request.url.path, headers, body)
+        if not headers.get("x-aliyun-captcha-verify-param"):
+            return Response(json.dumps({"code": 3007, "msg": "captcha required"}),
+                            media_type="application/json")
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            payload = {}
+        if not payload.get("plan_id"):
+            return Response(json.dumps({"code": 3001, "msg": "bad plan"}),
+                            media_type="application/json")
+        scenario = getattr(app.state, "claim_scenario", None) or headers.get("x-mock-scenario")
+        if scenario == "claim_captcha_fail":
+            return Response(json.dumps({"code": 3007, "msg": "captcha invalid"}),
+                            media_type="application/json")
+        if scenario == "claim_claimed":
+            return Response(json.dumps({"code": 1003, "msg": "already claimed"}),
+                            media_type="application/json")
+        return Response(json.dumps({"code": 0, "data": {"plan_id": payload["plan_id"]}}),
+                        media_type="application/json")
+
     @app.post("/api/v1/oauth/cli/init")
     async def oauth_init(request: Request) -> Response:
         body = await request.body()
@@ -333,6 +389,8 @@ def build_app() -> FastAPI:
     app.post("/api/anthropic/v1/messages")(_messages_api)
     app.get("/api/v1/zcode-plan/billing/current")(_billing_current)
     app.get("/api/v1/zcode-plan/billing/balance")(_billing_balance)
+    app.get("/api/v1/zcode-plan/billing/preview")(_billing_preview)
+    app.post("/api/v1/zcode-plan/billing/claim")(_billing_claim)
     app.get("/api/v1/zcode-plan/usage")(_usage)
     app.get("/api/v1/client/configs")(_client_configs)
 
