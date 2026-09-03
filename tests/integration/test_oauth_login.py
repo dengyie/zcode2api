@@ -6,6 +6,8 @@ login/start → （测试侧模拟用户授权：切 Mock oauth_state）→ logi
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 
@@ -47,10 +49,10 @@ class TestOAuthLoginFlow:
         assert any(a["id"] == acc["id"] for a in accounts["accounts"])
         assert accounts["stats"]["active"] == 1
 
-        # 会话已清理：再 poll 404
-        res = await client.get(f"/admin/api/login/poll/{fid}",
-                               headers={"Authorization": "Bearer zcode"})
-        assert res.status_code == 404
+        # 会话已摘除：再 poll 返回 expired（契约见 admin_api.login_poll docstring）
+        poll2 = (await client.get(f"/admin/api/login/poll/{fid}",
+                                  headers={"Authorization": "Bearer zcode"})).json()
+        assert poll2["status"] == "expired"
 
     async def test_denied_flow_reports_failure_reason(self, gateway_client):
         client, mock = gateway_client
@@ -76,11 +78,59 @@ class TestOAuthLoginFlow:
                                  headers={"Authorization": "Bearer zcode"})).json()
         assert poll["status"] == "pending"
 
-    async def test_unknown_flow_404(self, gateway_client):
+    async def test_unknown_flow_expired(self, gateway_client):
+        """未知 flow_id 与超时会话同响应 {"status": "expired"}（幂等，无 404）。"""
         client, _ = gateway_client
         res = await client.get("/admin/api/login/poll/nonexistent",
                                headers={"Authorization": "Bearer zcode"})
-        assert res.status_code == 404
+        assert res.status_code == 200
+        assert res.json()["status"] == "expired"
+
+    async def test_flow_ttl_expiry(self, gateway_client, monkeypatch):
+        """超过 LOGIN_FLOW_TTL 的会话被 GC，poll 返回 expired。"""
+        from app.routes import admin_api
+
+        client, mock = gateway_client
+        fid = (await client.post("/admin/api/login/start",
+                                 headers={"Authorization": "Bearer zcode"})).json()["flow_id"]
+        assert fid in admin_api._login_flows
+
+        # 快进时钟：把会话创建时间拨回 TTL+1 秒之前
+        entry = admin_api._login_flows[fid]
+        entry["created"] -= admin_api.LOGIN_FLOW_TTL + 1.0
+        poll = (await client.get(f"/admin/api/login/poll/{fid}",
+                                 headers={"Authorization": "Bearer zcode"})).json()
+        assert poll["status"] == "expired"
+        assert fid not in admin_api._login_flows
+
+    async def test_ready_poll_reentry_protected(self, gateway_client):
+        """P2-1 回归：ready 后会话已摘除再兑换，重复/并发 poll 不会触发第二份
+        兑换链（z/login → getCustomerInfo → api_keys/copy），也不会重复入池。"""
+        client, mock = gateway_client
+        fid = (await client.post("/admin/api/login/start", json={"label": "acct-3"},
+                                 headers={"Authorization": "Bearer zcode"})).json()["flow_id"]
+        # mock 上游 session 级共享，calls 跨用例累积 —— 记录基线后断言增量
+        copy_calls_before = sum(1 for c in mock.state.calls
+                                if c[1].endswith("/api_keys/copy/mock-api-key-id"))
+        mock.state.oauth_state = "ready"
+        first = (await client.get(f"/admin/api/login/poll/{fid}",
+                                  headers={"Authorization": "Bearer zcode"})).json()
+        assert first["status"] == "ready"
+
+        # 无论如何并发再 poll 一轮 —— 已摘除的会话只能拿到 expired，绝不重入兑换
+        results = await asyncio.gather(*[
+            client.get(f"/admin/api/login/poll/{fid}",
+                       headers={"Authorization": "Bearer zcode"}) for _ in range(4)
+        ])
+        assert all(r.json()["status"] == "expired" for r in results)
+
+        # 兑换链只跑了一遍：copy 端点恰好 +1 次；账号只入池了 1 个
+        copy_calls_after = sum(1 for c in mock.state.calls
+                               if c[1].endswith("/api_keys/copy/mock-api-key-id"))
+        assert copy_calls_after - copy_calls_before == 1
+        accounts = (await client.get("/admin/api/accounts",
+                                     headers={"Authorization": "Bearer zcode"})).json()
+        assert accounts["stats"]["total"] == 1
 
     async def test_admin_key_required(self, gateway_client):
         client, _ = gateway_client

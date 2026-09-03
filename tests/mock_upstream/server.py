@@ -33,6 +33,70 @@ SSE_EVENT = (
 )
 SSE_DONE = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
+
+_MESSAGES_PATHS = {
+    "/api/v1/zcode-plan/anthropic/v1/messages",
+    "/api/anthropic/v1/messages",
+}
+
+
+_DISCONNECT = object()  # 非 None 哨兵：见 _wrap_asgi docstring
+
+
+def _wrap_asgi(app):
+    """真断连实现（connect_fail_first）。
+
+    断连语义只能发生在 FastAPI 之外：ServerErrorMiddleware 会把端点异常兜底成
+    500 响应，内层无法表达"连接中断"。因此这里在最外层直接读 scope 头做判定
+    （bind/sequence 解析与端点 _messages 重复，有意为之），命中"首次失败"时不调
+    用 app，返回非 None 哨兵 —— uvicorn 的 run_asgi 对「未开始响应 + 返回值非
+    None」的处理是 transport.close()（protocols/http/httptools_impl.py），连接上
+    不写任何响应字节。客户端（真 TCP）拿到的是连接级错误（httpx 的
+    RemoteProtocolError/ConnectError 族），与上游真实断连同形，网关的
+    httpx.HTTPError 分支才能被正确触发。
+
+    注意：命中时端点不执行，app.state.calls 不记录这次调用（计数仍 +1）。
+    """
+
+    async def wrapped(scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") in _MESSAGES_PATHS:
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers", [])
+            }
+            bind = headers.get("x-mock-bind") or (headers.get("authorization", "")
+                                                  .removeprefix("Bearer ") or
+                                                  headers.get("x-api-key", ""))[:16] or "anonymous"
+            scenario = headers.get("x-mock-scenario")
+            state = app.state
+            n = state.counters.get(bind, 0)
+            if not scenario:
+                seq = state.sequences.get(bind)
+                if seq:
+                    scenario = seq[min(n, len(seq) - 1)]
+            if scenario == "connect_fail_first" and n == 0:
+                state.counters[bind] = 1
+                return _DISCONNECT
+        await app(scope, receive, send)
+
+    class _Wrapped:
+        # 测试侧直接拿 `app.state` 断言（conftest fixture 返回的是包装对象），
+        # 因此包装对象把属性访问转发给内层 FastAPI 实例。
+        def __init__(self, inner, asgi):
+            self._inner = inner
+            self._asgi = asgi
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        async def __call__(self, scope, receive, send):
+            # 必须 return：wrapped 的 _DISCONNECT 哨兵（非 None）正是 uvicorn
+            # transport.close() 的触发条件，吞掉返回值会退化成 500 兜底。
+            return await self._asgi(scope, receive, send)
+
+    return _Wrapped(app, wrapped)
+
+
 # scenario → (status, body-builder)。独立函数便于维护矩阵。
 def _error_body(message: str, **extra: Any) -> dict:
     return {"error": {"message": message, "type": extra.pop("type", "upstream_error")}}
@@ -78,8 +142,8 @@ def build_app() -> FastAPI:
             payload = {}
         stream = bool(payload.get("stream"))
 
-        if scenario == "connect_fail_first" and n == 0:
-            raise ConnectionResetError("mock: connection reset")
+        # connect_fail_first 不在这里处理：判定在 _wrap_asgi 最外层
+        #（FastAPI 的 ServerErrorMiddleware 会把异常兜底成 500，无法表达断连语义）
 
         if scenario == "slow_first_byte":
             await asyncio.sleep(30)
@@ -275,7 +339,8 @@ def build_app() -> FastAPI:
     return app
 
 
-app = build_app()
+_fastapi_app = build_app()
+app = _wrap_asgi(_fastapi_app)
 
 
 if __name__ == "__main__":  # pragma: no cover

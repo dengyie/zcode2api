@@ -15,9 +15,6 @@ from ..store import store
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
 
-# 进行中的 OAuth 登录流程（flow_id -> ZaiAuthFlow），需跨请求保留 poll_token
-_login_flows: dict[str, ZaiAuthFlow] = {}
-
 
 # ── 鉴权探针 ─────────────────────────────────────────────────────────────────
 @router.get("/verify")
@@ -146,13 +143,15 @@ async def refresh_one(account_id: str):
 
 
 # ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
-# 授权链接有效期：上游 cli/init 发起的流程约 5 分钟过期（zcode.z.ai 行为），
-# 过期后会话主动清理，poll 返回 expired 而不是永远 pending。
+# 授权链接有效期：上游 cli/init 发起的流程约 5 分钟过期（zcode.z.ai 行为）。
+# 会话过期后 poll 返回 {"status": "expired"}（幂等，可安全重试）。
 LOGIN_FLOW_TTL = 300.0
 # 兑换 API Key（getCustomerInfo → api_keys → copy）总时长上限
 LOGIN_EXCHANGE_TIMEOUT = 60.0
 
-_login_flows: dict[str, dict] = {}  # flow_id -> {"flow": ZaiAuthFlow, "created": float, "label": str}
+# flow_id -> {"flow": ZaiAuthFlow, "created": float, "label": str}
+# 单进程内存态即可：登录会话不该跨进程存活，重启后用户重新生成链接。
+_login_flows: dict[str, dict] = {}
 
 
 def _login_gc() -> None:
@@ -189,12 +188,13 @@ async def login_poll(flow_id: str):
     """轮询授权状态；成功后自动兑换凭证并加入账号池。
 
     返回 status ∈ pending / ready / failed / expired。
-    failed 附带 message（上游拒绝原因），expired 表示会话超时需重新发起。
+    failed 附带 message（上游拒绝原因）；expired 表示会话超时需重新发起；
+    未知 flow_id 一律 expired（而非 404），前端据此提示重新生成链接。
     """
     _login_gc()
     entry = _login_flows.get(flow_id)
     if not entry:
-        raise HTTPException(404, "登录会话不存在或已过期")
+        return {"status": "expired"}
     flow = entry["flow"]
     try:
         data = await flow.poll(flow_id)
@@ -208,6 +208,10 @@ async def login_poll(flow_id: str):
         return {"status": "failed", "message": str(reason)}
     if state != "ready":
         return {"status": "pending"}
+
+    # 会话先摘除再兑换：并发/重复 poll 不会再进入兑换链，
+    # 也不会在长时间内联操作期间让前端轮询叠加出第二份上游调用。
+    _login_flows.pop(flow_id, None)
 
     # 授权成功：保存 Coding Plan JWT，并尝试兑换 API Key 作为同账号回退
     zcode_jwt = data.get("token")
@@ -229,7 +233,6 @@ async def login_poll(flow_id: str):
         except Exception:  # noqa: BLE001 - 兑换失败不影响 JWT 已入池
             pass
 
-    _login_flows.pop(flow_id, None)
     if account is None:
         return {"status": "failed", "message": "未能从授权结果中获取凭证"}
 

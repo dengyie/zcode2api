@@ -30,7 +30,7 @@
 |----|------|------|------|
 | INT-020 | .zsb 导入→服务 | zsw 生成向量包导入 → 池内账号即刻可服务请求 | 互通即用 |
 | INT-021 | 导出→再导入 | 导出全池 → 清库 → 导入 → 请求分布与原池一致 | 往返等价 |
-| INT-022 | OAuth 后台化登录 | admin API init → 模拟授权回调 → poll 返回成功 → 池新增 | UI 流程可用 |
+| INT-022 | OAuth 后台化登录 | admin API `/login/start` → 模拟授权回调 → `/login/poll/{fid}` 返回 ready → 池新增；重复 poll 得 `{"status":"expired"}`（会话已摘除，不重入兑换链）；未知/超时 flow_id 同样 expired | UI 流程可用 |
 
 ### INT-D 验证码
 
@@ -51,7 +51,7 @@
 | `captcha_challenge` | 403 + 验证码响应头 | CLS-005/006 |
 | `captcha_3007` | 400 + `{"code":3007}` | in-body 挑战 |
 | `captcha_loop` | 每次都挑战 | GW-008 上限 |
-| `connect_fail_first` | 首次 RST，之后正常 | GW-009 |
+| `connect_fail_first` | 首次真断连（连接上无任何响应字节，客户端 httpx 抛 ReadError/RemoteProtocolError），之后正常 | GW-009 |
 | `slow_first_byte` | TTFB 延迟 30s | 超时/取消路径 |
 | `sse_truncate` | SSE 中途断流 | GW-013/014 |
 | `waf_block` | billing 端点 403 HTML | INT-011 |

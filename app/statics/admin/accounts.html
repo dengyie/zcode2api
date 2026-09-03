@@ -328,11 +328,11 @@ function pollLogin(flowId){
       }else if(d.status==='failed'){
         stopLoginPoll();
         setLoginStatus(d.message||'授权失败或被拒绝',true);
-      }else if(d.status===404||d.error){
+      }else if(d.status==='expired'){
         stopLoginPoll();
-        setLoginStatus('会话已过期，请重新生成链接',true);
+        setLoginStatus('链接已过期，请重新生成',true);
       }
-    }catch(e){/* 单次失败继续轮询；404 = 会话过期 */}
+    }catch(e){/* 单次网络抖动继续轮询 */}
   },2500);
 }
 function setLoginStatus(text,isErr){

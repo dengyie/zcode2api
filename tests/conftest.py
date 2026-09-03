@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import threading
 import time
 
@@ -20,7 +21,13 @@ import uvicorn
 from httpx import ASGITransport, AsyncClient
 
 from app import settings
-from tests.mock_upstream.server import build_app
+from tests.mock_upstream import server as mock_server_module
+
+# 开发机常驻系统代理（如 Clash 监听 127.0.0.1:7897）时，httpx 默认 trust_env=True
+# 会把发往 127.0.0.1 的请求也交给代理（httpx 不读 macOS 例外列表），断连场景会被
+# 代理转译成 502。测试进程内全局屏蔽代理，保证网关→Mock 走真实 TCP。
+os.environ.setdefault("NO_PROXY", "*")
+os.environ.setdefault("no_proxy", "*")
 
 # 底座中绑定了 store 名字的全部模块 —— 新增导入点时必须同步加入
 _STORE_BINDING_MODULES = (
@@ -34,8 +41,12 @@ _STORE_BINDING_MODULES = (
 
 @pytest.fixture(scope="session")
 def mock_server():
-    """真实端口上的 Mock 上游。返回 (app, port)。"""
-    app = build_app()
+    """真实端口上的 Mock 上游。返回 (app, port)。
+
+    用模块级 `mock_server_module.app`（含 _wrap_asgi 断连包装）而非裸 build_app()：
+    connect_fail_first 的真断连判定发生在 FastAPI 之外的包装层。
+    """
+    app = mock_server_module.app
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)

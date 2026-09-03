@@ -9,7 +9,7 @@ import secrets
 
 import httpx
 
-from . import constants, settings
+from . import settings
 
 
 class ZaiAuthFlow:
@@ -17,8 +17,8 @@ class ZaiAuthFlow:
     默认值来自 settings（其缺省又来自 constants 收口）。"""
 
     def __init__(self, api_base: str | None = None, exchange_origin: str | None = None) -> None:
-        self.api_base = api_base or getattr(settings, "OAUTH_API_BASE", None)             or constants.ZCODE_ORIGIN + "/api/v1"
-        self.exchange_origin = exchange_origin or getattr(settings, "ZAI_EXCHANGE_ORIGIN", None)             or constants.ZAI_API_ORIGIN
+        self.api_base = api_base or settings.OAUTH_API_BASE
+        self.exchange_origin = exchange_origin or settings.ZAI_EXCHANGE_ORIGIN
         self.poll_token = secrets.token_hex(32)
 
     async def init(self) -> tuple[str, str]:

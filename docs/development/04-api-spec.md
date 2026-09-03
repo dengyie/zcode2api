@@ -73,8 +73,8 @@
 
 | 方法/路径 | 说明 |
 |-----------|------|
-| `POST /admin/api/oauth/init` | `{provider}` → `{flow_id, authorize_url}`（zai server-mediated；前端展示链接） |
-| `GET /admin/api/oauth/poll/{flow_id}` | 轮询授权结果；成功即入池 |
+| `POST /admin/api/login/start` | `{label?}` → `{flow_id, authorize_url, expires_in:300}`（zai server-mediated；前端展示链接，`label` 作账号名入池） |
+| `GET /admin/api/login/poll/{flow_id}` | 轮询：`{status}` ∈ `pending`/`ready`/`failed`/`expired`；`failed` 附 `message`；`ready` 附 `account`（已兑换 API Key 回填并入池）。ready/失败后或未知/超时 flow_id 一律 `expired`（会话一次性，防重入兑换链） |
 | `POST /admin/api/bundle/export` | `{ids?, password}` → `.zsb` 二进制流（口令 PBKDF2+AES-GCM） |
 | `POST /admin/api/bundle/import` | multipart `.zsb` + password → 导入报告（新增/跳过/失败计数） |
 
