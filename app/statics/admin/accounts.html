@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api · 账号池</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/accounts"></div>
+
+<main class="admin-main">
+  <div class="page-hd">
+    <div>
+      <div class="page-title">账号池</div>
+      <div class="page-sub">多账号轮询 · 额度用完自动切换下一个账号 · 实时用量监控</div>
+    </div>
+    <div class="page-actions">
+      <span class="live-dot" id="live-dot">实时监控中</span>
+      <button onclick="openImport()" class="page-action-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        导入
+      </button>
+      <button onclick="doExport()" class="page-action-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+        导出
+      </button>
+      <button onclick="refreshAll()" class="page-action-btn" id="btn-refresh-all">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>
+        刷新额度
+      </button>
+      <button onclick="openAdd()" class="page-action-btn page-action-btn-primary">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" fill="none"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        新增
+      </button>
+    </div>
+  </div>
+
+  <div class="section-head"><div class="section-title">账户概览</div></div>
+  <div class="stat-grid">
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">账户总数</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 19a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4"/><circle cx="12" cy="8" r="4"/></svg></span></div><div class="stat-num" id="s-total">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:#16a34a"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:#16a34a">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:#8d6bbd"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#8d6bbd">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（剩余）</div><span class="stat-icon" style="color:#4c9168"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:#4c9168">0</div></div>
+  </div>
+
+  <div class="section-head">
+    <div class="section-title">账户明细 <span class="section-count-badge" id="tbl-count">0</span></div>
+    <div class="section-meta" id="last-updated"></div>
+  </div>
+
+  <div class="filter-bar" id="filter-bar"></div>
+
+  <div class="table-card">
+    <table>
+      <thead><tr>
+        <th>Token</th><th class="table-center" style="width:88px">提供商</th>
+        <th class="table-center" style="width:72px">类型</th>
+        <th class="table-center" style="width:80px">状态</th>
+        <th style="min-width:220px">额度</th>
+        <th class="table-center" style="width:60px">调用</th>
+        <th class="table-center" style="width:60px">失败</th>
+        <th style="width:120px">最近使用</th>
+        <th style="width:120px">操作</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</main>
+
+<!-- Add modal -->
+<div class="modal-overlay" id="modal-add">
+  <div class="modal">
+    <div class="modal-title">新增账号</div>
+    <div class="filter-bar" style="margin-bottom:16px">
+      <button class="filter-chip active" id="tab-paste" onclick="switchAddTab('paste')">粘贴凭证</button>
+      <button class="filter-chip" id="tab-login" onclick="switchAddTab('login')">授权登录</button>
+    </div>
+
+    <!-- 粘贴凭证 -->
+    <div id="add-pane-paste">
+      <div class="dialog-body">
+        <div>
+          <div class="dialog-help">每行一个 Coding Plan JWT 或 API Key，已存在的会自动跳过</div>
+          <textarea class="input" id="add-tokens" rows="7" placeholder="粘贴 JWT / API Key，每行一个..."></textarea>
+        </div>
+        <div class="dialog-field">
+          <span class="dialog-label">提供商</span>
+          <select class="input" id="add-provider"><option value="zai">Z.AI (Coding Plan)</option><option value="bigmodel">BigModel</option></select>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button onclick="closeModal('modal-add')" class="dialog-btn">取消</button>
+        <button onclick="doAdd()" class="dialog-btn dialog-btn-primary">添加</button>
+      </div>
+    </div>
+
+    <!-- 授权登录 -->
+    <div id="add-pane-login" style="display:none">
+      <div class="dialog-body">
+        <div class="dialog-help">通过 Z.AI 官方 OAuth 授权登录，授权成功后自动导入到账号池（含 Coding Plan 额度）。</div>
+        <div id="login-idle">
+          <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">开始登录</button>
+        </div>
+        <div id="login-active" style="display:none">
+          <div class="dialog-help" style="margin-bottom:6px">请在浏览器中打开下面链接完成授权：</div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input class="input" id="login-url" readonly style="font-size:12px">
+            <button onclick="copyLoginUrl()" class="dialog-btn">复制</button>
+            <button onclick="openLoginUrl()" class="dialog-btn dialog-btn-primary">打开</button>
+          </div>
+          <div class="live-dot" id="login-status" style="margin-top:16px">等待授权中…</div>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button onclick="cancelLogin()" class="dialog-btn">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Edit modal -->
+<div class="modal-overlay" id="modal-edit">
+  <div class="modal">
+    <div class="modal-title">编辑账号</div>
+    <div class="dialog-body">
+      <div class="dialog-field"><span class="dialog-label">名称</span><input class="input" id="edit-name"></div>
+      <div class="dialog-field"><span class="dialog-label">Token</span><input class="input" id="edit-token" placeholder="留空则不修改"></div>
+    </div>
+    <div class="dialog-actions">
+      <button onclick="closeModal('modal-edit')" class="dialog-btn">取消</button>
+      <button onclick="doEdit()" class="dialog-btn dialog-btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm modal -->
+<div class="modal-overlay" id="modal-confirm">
+  <div class="modal" style="max-width:400px">
+    <div class="modal-title" id="confirm-title">确认</div>
+    <div id="confirm-body" class="dialog-help"></div>
+    <div class="dialog-actions">
+      <button onclick="closeModal('modal-confirm')" class="dialog-btn">取消</button>
+      <button onclick="_cb&&_cb()" class="dialog-btn dialog-btn-danger">确认</button>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="import-file" accept=".json" style="display:none" onchange="onImportFile(event)">
+
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null;
+const refreshing=new Set();
+
+const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
+
+(async()=>{
+  await renderAdminHeader();
+  const key=await adminKey.get();
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  await load();
+  startPolling();
+})();
+
+function startPolling(){
+  if(_timer)clearInterval(_timer);
+  _timer=setInterval(()=>{ if(!document.hidden && !anyModalOpen()) load(true); },5000);
+}
+function anyModalOpen(){return!!document.querySelector('.modal-overlay.open');}
+
+async function load(silent){
+  try{
+    const d=await api('GET','/accounts');
+    allAccounts=d.accounts||[];
+    renderStats(d.stats||{});
+    renderFilters();
+    renderTable();
+    document.getElementById('last-updated').textContent='更新于 '+new Date().toLocaleTimeString();
+  }catch(e){ if(!silent)showToast('加载失败: '+e.message,'error'); }
+}
+
+function renderStats(s){
+  set('s-total',s.total||0);
+  set('s-active',s.active||0);
+  set('s-exhausted',s.exhausted||0);
+  let totalRem=0;
+  allAccounts.forEach(a=>{const q=a.quota||{};Object.values(q).forEach(w=>{totalRem+=Number(w.remaining)||0;});});
+  set('s-quota',fmt(totalRem));
+}
+
+function renderFilters(){
+  const counts={all:allAccounts.length,exhausted:0,disabled:0};
+  allAccounts.forEach(a=>{counts[a.status]=(counts[a.status]||0)+1;});
+  const chips=[['all','全部'],['exhausted','用完'],['disabled','禁用']];
+  document.getElementById('filter-bar').innerHTML=chips.map(([k,l])=>
+    `<button class="filter-chip${curFilter===k?' active':''}" onclick="setFilter('${k}')">${l}<span class="filter-chip-count">${counts[k]||0}</span></button>`
+  ).join('');
+}
+function setFilter(k){curFilter=k;renderFilters();renderTable();}
+
+function renderTable(){
+  const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
+  document.getElementById('tbl-count').textContent=items.length;
+  const tb=document.getElementById('tbody');
+  if(!items.length){tb.innerHTML='<tr><td colspan="9" class="empty-state">暂无账号，点击右上角「新增」添加</td></tr>';return;}
+  tb.innerHTML=items.map(rowHtml).join('');
+}
+
+function rowHtml(a){
+  const isJwt=a.mode==='jwt';
+  const isDisabled=a.status==='disabled';
+  const loading=refreshing.has(a.id);
+  return `<tr>
+    <td><span class="tok">${esc(a.token_masked)}</span><div style="font-size:11px;color:#aaa;margin-top:2px">${esc(a.name)}</div></td>
+    <td class="table-center">${a.provider}</td>
+    <td class="table-center"><span class="badge badge-${a.mode}">${isJwt?'JWT':'Key'}</span></td>
+    <td class="table-center"><span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span></td>
+    <td>${quotaCell(a)}</td>
+    <td class="table-center" style="color:#8f8f8f">${a.use_count||0}</td>
+    <td class="table-center" style="color:#9a9a9a">${a.fail_count||0}</td>
+    <td style="font-size:12px;color:#9a9a9a">${fmtDate(a.last_used_at)}</td>
+    <td><div class="row-actions">
+      ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>`:''}
+      <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
+        ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
+      </button>
+      <button onclick="openEdit('${a.id}')" class="row-icon-btn" title="编辑"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button>
+      <button onclick="doDelete('${a.id}')" class="row-icon-btn row-icon-danger" title="删除"><svg viewBox="0 0 24 24"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button>
+    </div></td>
+  </tr>`;
+}
+
+function quotaCell(a){
+  const q=a.quota||{};
+  const keys=Object.keys(q);
+  if(!keys.length)return a.mode==='jwt'?'<span class="quota-empty">未获取</span>':'<span class="quota-empty">—</span>';
+  return '<div class="quota-rows">'+keys.map(k=>{
+    const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
+    const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
+    const color=rem<=0?'#c9c9cf':(pct<15?'#b0632a':'#4c9168');
+    return `<div class="quota-row">
+      <span class="quota-row-name">${esc(shortModel(k))}</span>
+      <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
+      <span class="quota-row-val">${fmt(rem)} / ${fmt(tot)}</span>
+    </div>`;
+  }).join('')+'</div>';
+}
+function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,10)||n;}
+
+/* ── Actions ── */
+function openAdd(){
+  document.getElementById('add-tokens').value='';
+  switchAddTab('paste');
+  resetLoginPane();
+  openModal('modal-add');
+}
+async function doAdd(){
+  const tokens=document.getElementById('add-tokens').value;
+  const provider=document.getElementById('add-provider').value;
+  const list=tokens.split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!list.length)return showToast('请输入至少一个 Token','error');
+  try{
+    const d=await api('POST','/accounts',{provider,tokens:list});
+    closeModal('modal-add');
+    showToast(`新增 ${d.count} 个账号`,'success');
+    load();
+  }catch(e){showToast('添加失败: '+e.message,'error');}
+}
+
+/* ── 授权登录 ── */
+let _loginTimer=null, _loginUrl='';
+function switchAddTab(tab){
+  document.getElementById('tab-paste').classList.toggle('active',tab==='paste');
+  document.getElementById('tab-login').classList.toggle('active',tab==='login');
+  document.getElementById('add-pane-paste').style.display=tab==='paste'?'':'none';
+  document.getElementById('add-pane-login').style.display=tab==='login'?'':'none';
+  if(tab!=='login')stopLoginPoll();
+}
+function resetLoginPane(){
+  stopLoginPoll();
+  _loginUrl='';
+  document.getElementById('login-idle').style.display='';
+  document.getElementById('login-active').style.display='none';
+  document.getElementById('login-start-btn').disabled=false;
+}
+async function startLogin(){
+  const btn=document.getElementById('login-start-btn');
+  btn.disabled=true;
+  try{
+    const d=await api('POST','/login/start');
+    _loginUrl=d.authorize_url;
+    document.getElementById('login-url').value=_loginUrl;
+    document.getElementById('login-idle').style.display='none';
+    document.getElementById('login-active').style.display='';
+    setLoginStatus('等待授权中…',false);
+    try{window.open(_loginUrl,'_blank','noopener');}catch{}
+    pollLogin(d.flow_id);
+  }catch(e){
+    showToast('发起登录失败: '+e.message,'error');
+    btn.disabled=false;
+  }
+}
+function pollLogin(flowId){
+  let n=0;
+  _loginTimer=setInterval(async()=>{
+    if(++n>120){stopLoginPoll();setLoginStatus('登录超时，请重试',true);return;}
+    try{
+      const d=await api('GET','/login/poll/'+flowId);
+      if(d.status==='ready'){
+        stopLoginPoll();
+        showToast('登录成功，已导入账号池','success');
+        closeModal('modal-add');
+        load();
+      }else if(d.status==='failed'){
+        stopLoginPoll();
+        setLoginStatus(d.message||'授权失败或被拒绝',true);
+      }
+    }catch(e){/* 单次失败继续轮询 */}
+  },2500);
+}
+function setLoginStatus(text,isErr){
+  const el=document.getElementById('login-status');
+  el.textContent=text;
+  el.classList.toggle('live-dot',!isErr);
+  el.style.color=isErr?'var(--error)':'';
+}
+function stopLoginPoll(){if(_loginTimer){clearInterval(_loginTimer);_loginTimer=null;}}
+function cancelLogin(){stopLoginPoll();closeModal('modal-add');}
+function copyLoginUrl(){navigator.clipboard.writeText(_loginUrl).then(()=>showToast('已复制','success')).catch(()=>showToast('复制失败','error'));}
+function openLoginUrl(){if(_loginUrl)window.open(_loginUrl,'_blank','noopener');}
+
+function openEdit(id){
+  const a=allAccounts.find(x=>x.id===id);if(!a)return;
+  _editId=id;
+  document.getElementById('edit-name').value=a.name;
+  document.getElementById('edit-token').value='';
+  openModal('modal-edit');
+}
+async function doEdit(){
+  const name=document.getElementById('edit-name').value.trim();
+  const token=document.getElementById('edit-token').value.trim();
+  try{
+    await api('PUT','/accounts/'+_editId,{name,...(token&&{token})});
+    closeModal('modal-edit');showToast('已保存','success');load();
+  }catch(e){showToast('保存失败: '+e.message,'error');}
+}
+
+function doDelete(id){
+  const a=allAccounts.find(x=>x.id===id);
+  openConfirm('删除账号',`确认删除 <code>${esc(a?a.token_masked:id)}</code>？此操作不可撤销。`,async()=>{
+    try{await api('DELETE','/accounts',[id]);showToast('已删除','success');load();}
+    catch(e){showToast('删除失败: '+e.message,'error');}
+  });
+}
+
+async function toggleEnabled(id,enable){
+  try{await api('POST','/accounts/'+id+'/enabled',{enabled:enable});load();}
+  catch(e){showToast('操作失败: '+e.message,'error');}
+}
+
+async function refreshOne(id){
+  if(refreshing.has(id))return;
+  refreshing.add(id);renderTable();
+  try{await api('POST','/accounts/'+id+'/refresh');showToast('额度已刷新','success');}
+  catch(e){showToast('刷新失败: '+e.message,'error');}
+  finally{refreshing.delete(id);await load();}
+}
+async function refreshAll(){
+  showToast('正在刷新全部额度…','info');
+  try{const d=await api('POST','/accounts/refresh',{all:true});showToast(`刷新完成：成功 ${d.summary.ok}，失败 ${d.summary.fail}`,'success');load();}
+  catch(e){showToast('刷新失败: '+e.message,'error');}
+}
+
+async function doExport(){
+  try{
+    const d=await api('GET','/export');
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(d,null,2)],{type:'application/json'}));
+    a.download='zcode-accounts.json';a.click();
+  }catch(e){showToast('导出失败: '+e.message,'error');}
+}
+function openImport(){document.getElementById('import-file').click();}
+async function onImportFile(ev){
+  const file=ev.target.files?.[0];if(!file)return;
+  try{
+    const payload=JSON.parse(await file.text());
+    const d=await api('POST','/import',payload);
+    showToast(`导入 ${d.count} 个账号`,'success');load();
+  }catch(e){showToast('导入失败: '+e.message,'error');}
+  ev.target.value='';
+}
+
+/* ── Helpers ── */
+function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
+function fmt(n){n=Number(n)||0;return n>=10000?(n/1000).toFixed(1)+'k':n;}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
+function openModal(id){document.getElementById(id).classList.add('open');}
+function closeModal(id){document.getElementById(id).classList.remove('open');}
+function openConfirm(title,body,cb){_cb=async()=>{closeModal('modal-confirm');await cb();};document.getElementById('confirm-title').textContent=title;document.getElementById('confirm-body').innerHTML=body;openModal('modal-confirm');}
+document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el){el.classList.remove('open');if(el.id==='modal-add')stopLoginPoll();}}));
+</script>
+</body>
+</html>

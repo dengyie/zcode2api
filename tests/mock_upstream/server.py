@@ -1,0 +1,238 @@
+"""Mock 上游 —— zcode-hub 的核心测试资产（docs/testing/04 §2 故障注入矩阵）。
+
+一个 FastAPI 应用，模拟 zcode.z.ai / api.z.ai 的全部被依赖端点：
+  POST /api/v1/zcode-plan/anthropic/v1/messages   Plan 通道（JWT）
+  POST /api/anthropic/v1/messages                 API Key 通道
+  GET  /api/v1/zcode-plan/billing/current|balance|usage
+  GET  /api/v1/client/configs                     验证码配置（公开）
+  POST /api/v1/oauth/cli/init, GET poll/{id}      OAuth CLI 流程
+
+控制协议（请求头，docs 04 §2）：
+  x-mock-scenario: <name>        本请求的故障场景（默认 ok）
+  x-mock-sequence: s1,s2,...     按该凭证的请求次数依序消费，耗尽后保持最后一个
+  x-mock-bind: <凭证前缀>        与凭证绑定；网关不会带这个头，测试侧先注入到
+                                 账号的上游头里即可实现「按账号注入」
+  x-mock-sse-chunks / x-mock-sse-truncate-at: SSE 形态控制
+
+观测协议（响应头）：
+  x-mock-call-index: <n>         该凭证第 n 次被调用
+记录：app.state.calls —— [(method, path, headers, body_bytes)]，测试直接断言。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+from fastapi import FastAPI, Request, Response
+
+SSE_EVENT = (
+    'event: content_block_delta\ndata: {{"type":"content_block_delta",'
+    '"index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}\n\n'
+)
+SSE_DONE = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+# scenario → (status, body-builder)。独立函数便于维护矩阵。
+def _error_body(message: str, **extra: Any) -> dict:
+    return {"error": {"message": message, "type": extra.pop("type", "upstream_error")}}
+
+
+def build_app() -> FastAPI:
+    app = FastAPI(title="mock-upstream")
+    app.state.calls: list[tuple[str, str, dict, bytes]] = []
+    app.state.counters: dict[str, int] = {}      # 凭证前缀 → 调用次数
+    app.state.sequences: dict[str, list[str]] = {}  # bind → scenario 队列（测试侧写入）
+
+    def _record(method: str, path: str, headers: dict, body: bytes) -> None:
+        app.state.calls.append((method, path, headers, body))
+
+    def _bind_key(headers: dict) -> str:
+        auth = headers.get("authorization") or ""
+        api_key = headers.get("x-api-key") or ""
+        cred = auth.removeprefix("Bearer ") or api_key
+        return cred[:16] or "anonymous"
+
+    def _scenario_for(headers: dict, bind: str) -> str:
+        explicit = headers.get("x-mock-scenario")
+        if explicit:
+            return explicit
+        seq = app.state.sequences.get(bind)
+        if seq:
+            idx = min(app.state.counters.get(bind, 0), len(seq) - 1)
+            return seq[idx]
+        return "ok"
+
+    async def _messages(request: Request, plan_channel: bool) -> Response:
+        body = await request.body()
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("POST", request.url.path, headers, body)
+        bind = headers.get("x-mock-bind") or _bind_key(headers)
+        n = app.state.counters.get(bind, 0)
+        app.state.counters[bind] = n + 1
+        scenario = _scenario_for(headers, bind)
+
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            payload = {}
+        stream = bool(payload.get("stream"))
+
+        if scenario == "connect_fail_first" and n == 0:
+            raise ConnectionResetError("mock: connection reset")
+
+        if scenario == "slow_first_byte":
+            await asyncio.sleep(30)
+
+        status, resp_body, extra_headers = _messages_result(scenario, payload)
+        if status != 200:
+            return Response(
+                json.dumps(resp_body), status_code=status,
+                media_type="application/json",
+                headers={"x-mock-call-index": str(n), **extra_headers},
+            )
+
+        if stream:
+            chunks = int(headers.get("x-mock-sse-chunks", 3))
+            truncate_at = headers.get("x-mock-sse-truncate-at")
+            content = _sse_stream(chunks)
+            if scenario == "sse_truncate" and truncate_at is not None:
+                cut = int(truncate_at)
+                content = content[:cut]
+            elif scenario == "sse_truncate":
+                content = content[: len(content) // 2]
+            return Response(
+                content, status_code=200, media_type="text/event-stream",
+                headers={"x-mock-call-index": str(n), "cache-control": "no-cache"},
+            )
+
+        media = "text/html" if scenario == "garbage_body" else "application/json"
+        raw = resp_body if isinstance(resp_body, str) else json.dumps(resp_body)
+        return Response(raw, status_code=200, media_type=media,
+                        headers={"x-mock-call-index": str(n)})
+
+    def _messages_result(scenario: str, payload: dict) -> tuple[int, Any, dict]:
+        """返回 (status, body, extra_headers)。"""
+        model = payload.get("model", "GLM-5.2")
+        mid = payload.get("id") or "msg_mock_001"
+        ok_body = {
+            "id": mid,
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": "Hello from mock upstream"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        if scenario == "quota_exhausted":
+            return 402, _error_body("insufficient balance"), {}
+        if scenario == "quota_exhausted_400":
+            return 400, {"code": 1002, "message": "额度已用完"}, {}
+        if scenario == "rate_limited":
+            return 429, _error_body("rate limited"), {"retry-after": "30"}
+        if scenario == "auth_invalid":
+            return 401, _error_body("invalid api key", type="authentication_error"), {}
+        if scenario == "captcha_challenge":
+            return 403, _error_body("captcha verify failed"), {"x-aliyun-captcha-verify-param": "need"}
+        if scenario == "captcha_3007":
+            return 400, {"code": 3007, "message": "captcha required"}, {}
+        if scenario == "server_error":
+            return 500, {"error": "internal"}, {}
+        if scenario == "garbage_body":
+            return 200, "<html>not json</html>", {}
+        return 200, ok_body, {}
+
+    def _sse_stream(chunks: int) -> str:
+        parts = [
+            'event: message_start\ndata: {"type":"message_start","message":{"role":"assistant"}}\n\n'
+        ]
+        for i in range(chunks):
+            parts.append(SSE_EVENT.format(text=f"chunk-{i}"))
+        parts.append(SSE_DONE)
+        return "".join(parts)
+
+    async def _billing_current(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        if headers.get("x-mock-scenario") == "waf_block":
+            return Response("<html>waf</html>", status_code=403, media_type="text/html")
+        if headers.get("authorization", "").endswith("bad-jwt"):
+            return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        return Response(json.dumps({
+            "data": {"plans": [{
+                "plan_id": "start", "show_name": "Start Plan",
+                "status": "active", "expires_at": "2099-01-01T00:00:00Z",
+            }]},
+        }), media_type="application/json")
+
+    async def _billing_balance(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        if headers.get("x-mock-scenario") == "waf_block":
+            return Response("<html>waf</html>", status_code=403, media_type="text/html")
+        if headers.get("authorization", "").endswith("bad-jwt"):
+            return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        return Response(json.dumps({
+            "data": {"balances": [
+                {"model": "GLM-5.3", "show_name": "GLM-5.3",
+                 "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000,
+                 "expires_at": "2099-01-01T00:00:00Z"},
+                {"model": "GLM-5-Turbo", "show_name": "GLM-5-Turbo",
+                 "total_units": 2000000, "used_units": 2000000, "remaining_units": 0,
+                 "expires_at": "2099-01-01T00:00:00Z"},
+            ]},
+        }), media_type="application/json")
+
+    async def _usage(request: Request) -> Response:
+        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        return Response(json.dumps({"data": {"requests": 42}}), media_type="application/json")
+
+    async def _client_configs(request: Request) -> Response:
+        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        return Response(json.dumps({
+            "data": {"configs": {"captcha": {
+                "enabled": True, "prefix": "mockpre", "region": "sgp", "sceneId": "mock-scene",
+            }}},
+        }), media_type="application/json")
+
+    @app.post("/api/v1/oauth/cli/init")
+    async def oauth_init(request: Request) -> Response:
+        body = await request.body()
+        _record("POST", request.url.path, {k.lower(): v for k, v in request.headers.items()}, body)
+        return Response(json.dumps({
+            "data": {"flow_id": "mock-flow-1", "authorize_url": "https://mock.example/authorize"}
+        }), media_type="application/json")
+
+    @app.get("/api/v1/oauth/cli/poll/{flow_id}")
+    async def oauth_poll(flow_id: str, request: Request) -> Response:
+        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        state = app.state.oauth_state if hasattr(app.state, "oauth_state") else "pending"
+        data: dict = {"status": state}
+        if state == "ready":
+            data["token"] = "mock-gateway-jwt-header.eyJzdWIiOiJtb2NrIn0.sig"
+            data["zai"] = {"access_token": "mock-access-token"}
+            data["status"] = "ready"
+        return Response(json.dumps({"data": data}), media_type="application/json")
+
+    async def _messages_plan(request: Request) -> Response:
+        return await _messages(request, plan_channel=True)
+
+    async def _messages_api(request: Request) -> Response:
+        return await _messages(request, plan_channel=False)
+
+    app.post("/api/v1/zcode-plan/anthropic/v1/messages")(_messages_plan)
+    app.post("/api/anthropic/v1/messages")(_messages_api)
+    app.get("/api/v1/zcode-plan/billing/current")(_billing_current)
+    app.get("/api/v1/zcode-plan/billing/balance")(_billing_balance)
+    app.get("/api/v1/zcode-plan/usage")(_usage)
+    app.get("/api/v1/client/configs")(_client_configs)
+
+    return app
+
+
+app = build_app()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=5201, log_level="warning")

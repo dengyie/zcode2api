@@ -1,0 +1,23 @@
+# zcode-hub 配置样例（M0）
+#
+# zcode-hub 的运行配置分两层：
+#   1. 环境变量（.env，见 .env.example）—— 进程级参数
+#   2. 本 YAML —— 账号运营策略（M1 起生效：pool / claim / bundle）
+#
+# M0 阶段本文件仅为占位说明；gateway / store 行为由环境变量与 meta 表驱动，
+# 与 zcode2api 完全一致。
+
+# 账号池故障转移（M1 生效）
+# pool:
+#   maxAttempts: 4            # 单请求最多尝试的账号数
+#   cooldownSeconds: 300      # 429 冷却时长
+#   exhaustedRetrySeconds: 1800  # 额度耗尽后的重试窗口
+
+# 额度探测（M1 生效）
+# quota:
+#   staggerSeconds: 45        # 多账号错峰间隔（WAF 规避）
+#   refreshInterval: 60       # 后台轮询周期，0 关闭
+
+# 加密封包（M1 生效）
+# bundle:
+#   passwordEnv: ZSW_PASSWORD # .zsb 导出口令来源；ZCODE_BUNDLE_PASSWORD 为备选

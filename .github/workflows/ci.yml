@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Ruff
+        run: ruff check app tests
+      - name: Mypy (strict scope)
+        run: mypy app/constants.py
+      - name: Pytest
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=50

@@ -1,0 +1,46 @@
+[project]
+name = "zcode-hub"
+version = "0.1.0"
+description = "ZCode 账号运营 + 网关一体机（zcode2api 全面扩展版）"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-only" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: 需要起 Mock 上游进程的集成用例",
+    "e2e: 端到端用例（compose 层）",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/statics/*"]
+
+[tool.coverage.report]
+# M0 基线 50%（底座 admin UI 等尚未覆盖）；M1 起 80%，关键纯逻辑 ≥95% 单独门禁
+show_missing = true
+fail_under = 50
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = ["app/statics", "captcha_node"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# 底座复制代码暂不强制全面现代化，M1 起逐模块收紧
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# B008: FastAPI Body()/Depends() 惯用法；B023: _body_iter 定义后立即 return，闭包捕获安全
+"app/routes/admin_api.py" = ["B008"]
+"app/routes/gateway.py" = ["B023"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true
+# M0：仅对纯逻辑新模块开启严格检查；底座文件逐模块加入
+files = ["app/constants.py"]

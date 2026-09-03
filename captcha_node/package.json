@@ -1,0 +1,11 @@
+{
+  "name": "zcode2api-captcha-solver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "无浏览器阿里云无痕验证求解器（Node + jsdom 模拟浏览器环境）",
+  "type": "commonjs",
+  "main": "solver.js",
+  "dependencies": {
+    "jsdom": "^24.1.0"
+  }
+}

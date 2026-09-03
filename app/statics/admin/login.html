@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api · 登录</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body class="login-body">
+  <div class="login-shell">
+    <div class="login-card">
+      <div class="login-brand">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="m2 17 10 5 10-5"/><path d="m2 12 10 5 10-5"/></svg>
+        <span>zcode2api</span>
+      </div>
+      <div class="login-title">后台管理</div>
+      <div class="login-subtitle">请输入后台密码以继续</div>
+      <div class="login-form">
+        <input type="password" id="key" placeholder="后台密码" class="input">
+        <button onclick="login()" class="btn btn-primary w-full">继续</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+  <script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+  <script>
+    const el=document.getElementById('key');
+    el.addEventListener('keypress',e=>{if(e.key==='Enter')login();});
+    async function login(){
+      const key=el.value.trim();
+      if(!key)return;
+      try{
+        if(await verifyKey(ADMIN_API+'/verify',key)){await adminKey.set(key);location.href='/admin/accounts';}
+        else showToast('密码无效','error');
+      }catch{showToast('连接失败','error');}
+    }
+    (async()=>{
+      const key=await adminKey.get();
+      if(key)try{if(await verifyKey(ADMIN_API+'/verify',key))location.href='/admin/accounts';}catch{}
+    })();
+  </script>
+</body>
+</html>

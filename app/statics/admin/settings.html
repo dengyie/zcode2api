@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode2api · 设置</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/settings"></div>
+
+<main class="admin-main">
+  <div class="page-hd">
+    <div>
+      <div class="page-title">设置</div>
+      <div class="page-sub">后台鉴权密钥与网关访问控制</div>
+    </div>
+  </div>
+
+  <div class="settings-card">
+    <div class="section-title" style="margin-bottom:16px">鉴权</div>
+    <div class="settings-row">
+      <label>后台密码</label>
+      <div class="hint">用于登录此管理后台。修改后需用新密码重新登录。</div>
+      <input class="input" id="admin-key" type="text" placeholder="后台密码">
+    </div>
+    <div class="settings-row">
+      <label>网关 API Key（可选）</label>
+      <div class="hint">设置后，调用 <code>/v1/messages</code> 须携带 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>x-api-key</code>。留空则不校验。</div>
+      <input class="input" id="gateway-key" type="text" placeholder="留空表示不启用">
+    </div>
+    <div class="settings-row">
+      <label>额度刷新间隔（秒）</label>
+      <div class="hint">后台自动刷新各账号额度与状态的周期。设为 0 关闭自动刷新（仍可手动刷新）。修改后即时生效。</div>
+      <input class="input" id="quota-interval" type="number" min="0" step="5" placeholder="60">
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
+      <button onclick="saveSettings()" class="dialog-btn dialog-btn-primary">保存</button>
+    </div>
+  </div>
+
+  <div class="settings-card">
+    <div class="section-title" style="margin-bottom:12px">使用说明</div>
+    <div class="hint" style="line-height:1.9">
+      · 在「账号池」粘贴 Coding Plan JWT 或 API Key 即可加入轮询。<br>
+      · 请求按 round-robin 分发；某账号额度用完会自动切到下一个账号。<br>
+      · 账号额度、状态在「账号池」页实时刷新展示。<br>
+      · 对话端点：<code id="endpoint">/v1/messages</code>（兼容 Anthropic Messages 协议）。
+    </div>
+  </div>
+</main>
+
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+(async()=>{
+  await renderAdminHeader();
+  const key=await adminKey.get();
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  document.getElementById('endpoint').textContent=location.origin+'/v1/messages';
+  load();
+})();
+
+async function load(){
+  try{
+    const d=await api('GET','/settings');
+    document.getElementById('admin-key').value=d.admin_key||'';
+    document.getElementById('gateway-key').value=d.gateway_key||'';
+    document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
+  }catch(e){showToast('加载失败: '+e.message,'error');}
+}
+
+async function saveSettings(){
+  const admin_key=document.getElementById('admin-key').value.trim();
+  const gateway_key=document.getElementById('gateway-key').value.trim();
+  const quota_refresh_interval=parseInt(document.getElementById('quota-interval').value,10);
+  if(!admin_key)return showToast('后台密码不能为空','error');
+  if(isNaN(quota_refresh_interval)||quota_refresh_interval<0)return showToast('刷新间隔必须是非负整数','error');
+  try{
+    await api('PUT','/settings',{admin_key,gateway_key,quota_refresh_interval});
+    await adminKey.set(admin_key);   // 同步本地保存，避免改密后被登出
+    showToast('已保存','success');
+  }catch(e){showToast('保存失败: '+e.message,'error');}
+}
+</script>
+</body>
+</html>
