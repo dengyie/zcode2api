@@ -199,20 +199,65 @@ def build_app() -> FastAPI:
     async def oauth_init(request: Request) -> Response:
         body = await request.body()
         _record("POST", request.url.path, {k.lower(): v for k, v in request.headers.items()}, body)
+        n = app.state.oauth_init_count = getattr(app.state, "oauth_init_count", 0) + 1
         return Response(json.dumps({
-            "data": {"flow_id": "mock-flow-1", "authorize_url": "https://mock.example/authorize"}
+            "data": {"flow_id": f"mock-flow-{n}", "authorize_url": "https://mock.example/authorize"}
         }), media_type="application/json")
 
     @app.get("/api/v1/oauth/cli/poll/{flow_id}")
     async def oauth_poll(flow_id: str, request: Request) -> Response:
         _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
-        state = app.state.oauth_state if hasattr(app.state, "oauth_state") else "pending"
+        # 测试协议：app.state.oauth_state = "ready" | "failed" | "pending"
+        #（默认 pending；ready 时附带可兑换的 mock 凭证组）
+        state = getattr(app.state, "oauth_state", "pending")
         data: dict = {"status": state}
+        if state == "failed":
+            data["message"] = getattr(app.state, "oauth_fail_message", "user denied")
         if state == "ready":
-            data["token"] = "mock-gateway-jwt-header.eyJzdWIiOiJtb2NrIn0.sig"
-            data["zai"] = {"access_token": "mock-access-token"}
-            data["status"] = "ready"
+            data.update({
+                "status": "ready",
+                "token": "mock-gateway-jwt-header.eyJzdWIiOiJtb2NrIn0.sig",
+                "zai": {"access_token": "mock-access-token"},
+            })
         return Response(json.dumps({"data": data}), media_type="application/json")
+
+    @app.post("/api/auth/z/login")
+    async def z_login(request: Request) -> Response:
+        body = await request.body()
+        _record("POST", request.url.path, {k.lower(): v for k, v in request.headers.items()}, body)
+        return Response(json.dumps({
+            "data": {"access_token": "mock-biz-token"}
+        }), media_type="application/json")
+
+    @app.get("/api/biz/customer/getCustomerInfo")
+    async def customer_info(request: Request) -> Response:
+        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        return Response(json.dumps({
+            "data": {"organizations": [{
+                "organizationId": "mock-org-1", "organizationName": "默认机构",
+                "projects": [{"projectId": "mock-proj-1", "projectName": "默认项目"}],
+            }]},
+        }), media_type="application/json")
+
+    @app.get("/api/biz/v1/organization/{org_id}/projects/{proj_id}/api_keys")
+    async def list_api_keys(org_id: str, proj_id: str, request: Request) -> Response:
+        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        return Response(json.dumps({"data": []}), media_type="application/json")
+
+    @app.post("/api/biz/v1/organization/{org_id}/projects/{proj_id}/api_keys")
+    async def create_api_key(org_id: str, proj_id: str, request: Request) -> Response:
+        body = await request.body()
+        _record("POST", request.url.path, {k.lower(): v for k, v in request.headers.items()}, body)
+        return Response(json.dumps({
+            "data": {"apiKey": "mock-api-key-id"}
+        }), media_type="application/json")
+
+    @app.get("/api/biz/v1/organization/{org_id}/projects/{proj_id}/api_keys/copy/{api_key}")
+    async def copy_api_key(org_id: str, proj_id: str, api_key: str, request: Request) -> Response:
+        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        return Response(json.dumps({
+            "data": {"secretKey": "mock-secret-key"}
+        }), media_type="application/json")
 
     async def _messages_plan(request: Request) -> Response:
         return await _messages(request, plan_channel=True)

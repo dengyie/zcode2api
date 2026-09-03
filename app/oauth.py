@@ -9,12 +9,16 @@ import secrets
 
 import httpx
 
-from . import constants
+from . import constants, settings
 
 
 class ZaiAuthFlow:
-    def __init__(self, api_base: str = constants.ZCODE_ORIGIN + "/api/v1") -> None:
-        self.api_base = api_base
+    """api_base / exchange_origin 可注入（测试指向 Mock 上游）；
+    默认值来自 settings（其缺省又来自 constants 收口）。"""
+
+    def __init__(self, api_base: str | None = None, exchange_origin: str | None = None) -> None:
+        self.api_base = api_base or getattr(settings, "OAUTH_API_BASE", None)             or constants.ZCODE_ORIGIN + "/api/v1"
+        self.exchange_origin = exchange_origin or getattr(settings, "ZAI_EXCHANGE_ORIGIN", None)             or constants.ZAI_API_ORIGIN
         self.poll_token = secrets.token_hex(32)
 
     async def init(self) -> tuple[str, str]:
@@ -47,7 +51,7 @@ class ZaiAuthFlow:
         """OAuth access_token → 业务 token → 机构/项目 → API Key。"""
         async with httpx.AsyncClient(timeout=30) as client:
             login = await client.post(
-                "https://api.z.ai/api/auth/z/login",
+                f"{self.exchange_origin}/api/auth/z/login",
                 headers={"Content-Type": "application/json"},
                 json={"token": access_token},
             )
@@ -58,7 +62,7 @@ class ZaiAuthFlow:
                 raise RuntimeError("返回数据中不含业务凭证")
 
             info = await client.get(
-                "https://api.z.ai/api/biz/customer/getCustomerInfo",
+                f"{self.exchange_origin}/api/biz/customer/getCustomerInfo",
                 headers={"Authorization": f"Bearer {biz_token}"},
             )
             info.raise_for_status()
@@ -72,7 +76,8 @@ class ZaiAuthFlow:
                 raise RuntimeError("找不到可用的项目")
 
             org_id, proj_id = org["organizationId"], proj["projectId"]
-            key_url = f"https://api.z.ai/api/biz/v1/organization/{org_id}/projects/{proj_id}/api_keys"
+            key_url = (f"{self.exchange_origin}/api/biz/v1/organization/"
+                       f"{org_id}/projects/{proj_id}/api_keys")
 
             keys_res = await client.get(key_url, headers={"Authorization": f"Bearer {biz_token}"})
             keys_res.raise_for_status()

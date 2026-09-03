@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -145,24 +146,56 @@ async def refresh_one(account_id: str):
 
 
 # ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
+# 授权链接有效期：上游 cli/init 发起的流程约 5 分钟过期（zcode.z.ai 行为），
+# 过期后会话主动清理，poll 返回 expired 而不是永远 pending。
+LOGIN_FLOW_TTL = 300.0
+# 兑换 API Key（getCustomerInfo → api_keys → copy）总时长上限
+LOGIN_EXCHANGE_TIMEOUT = 60.0
+
+_login_flows: dict[str, dict] = {}  # flow_id -> {"flow": ZaiAuthFlow, "created": float, "label": str}
+
+
+def _login_gc() -> None:
+    now = time.time()
+    expired = [fid for fid, entry in _login_flows.items() if now - entry["created"] > LOGIN_FLOW_TTL]
+    for fid in expired:
+        _login_flows.pop(fid, None)
+
+
 @router.post("/login/start")
-async def login_start():
-    """发起 Z.AI OAuth，返回授权链接供前端展示。"""
+async def login_start(payload: dict = Body(default=None)):
+    """发起 Z.AI OAuth，返回授权链接供前端展示。
+
+    payload 可选 {"label": "acct-1"} —— 作为账号名前缀入池，便于多号识别。
+    """
+    payload = payload or {}
+    label = (payload.get("label") or "").strip()[:32]
+    _login_gc()
     flow = ZaiAuthFlow()
     try:
         flow_id, authorize_url = await flow.init()
     except Exception as err:  # noqa: BLE001
         raise HTTPException(502, f"登录初始化失败: {err}") from err
-    _login_flows[flow_id] = flow
-    return {"flow_id": flow_id, "authorize_url": authorize_url}
+    _login_flows[flow_id] = {"flow": flow, "created": time.time(), "label": label}
+    return {
+        "flow_id": flow_id,
+        "authorize_url": authorize_url,
+        "expires_in": int(LOGIN_FLOW_TTL),
+    }
 
 
 @router.get("/login/poll/{flow_id}")
 async def login_poll(flow_id: str):
-    """轮询授权状态；成功后自动兑换凭证并加入账号池。"""
-    flow = _login_flows.get(flow_id)
-    if not flow:
+    """轮询授权状态；成功后自动兑换凭证并加入账号池。
+
+    返回 status ∈ pending / ready / failed / expired。
+    failed 附带 message（上游拒绝原因），expired 表示会话超时需重新发起。
+    """
+    _login_gc()
+    entry = _login_flows.get(flow_id)
+    if not entry:
         raise HTTPException(404, "登录会话不存在或已过期")
+    flow = entry["flow"]
     try:
         data = await flow.poll(flow_id)
     except Exception:  # noqa: BLE001 - 单次网络抖动按 pending 处理
@@ -171,24 +204,28 @@ async def login_poll(flow_id: str):
     state = data.get("status")
     if state == "failed":
         _login_flows.pop(flow_id, None)
-        return {"status": "failed"}
+        reason = (data.get("message") or data.get("reason") or "授权失败或被拒绝")
+        return {"status": "failed", "message": str(reason)}
     if state != "ready":
         return {"status": "pending"}
 
     # 授权成功：保存 Coding Plan JWT，并尝试兑换 API Key 作为同账号回退
     zcode_jwt = data.get("token")
     access_token = (data.get("zai") or {}).get("access_token")
+    label = entry.get("label") or "oauth-login"
     account = None
     if zcode_jwt:
-        account = store.add_account("zai", "oauth-login", zcode_jwt)
+        account = store.add_account("zai", label, zcode_jwt)
     if access_token:
         try:
-            api_key = await flow.exchange_api_key(access_token)
+            api_key = await asyncio.wait_for(
+                flow.exchange_api_key(access_token), timeout=LOGIN_EXCHANGE_TIMEOUT
+            )
             if account is not None:
                 account.api_key = api_key
                 store.update_account(account)
             else:
-                account = store.add_account("zai", "oauth-login", api_key)
+                account = store.add_account("zai", label, api_key)
         except Exception:  # noqa: BLE001 - 兑换失败不影响 JWT 已入池
             pass
 

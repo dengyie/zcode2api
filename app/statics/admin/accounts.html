@@ -99,12 +99,13 @@
     <!-- 授权登录 -->
     <div id="add-pane-login" style="display:none">
       <div class="dialog-body">
-        <div class="dialog-help">通过 Z.AI 官方 OAuth 授权登录，授权成功后自动导入到账号池（含 Coding Plan 额度）。</div>
+        <div class="dialog-help">通过 Z.AI 官方 OAuth 授权登录，授权成功后自动导入到账号池（含 Coding Plan 额度）。链接约 5 分钟内有效，换设备打开亦可。</div>
         <div id="login-idle">
-          <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">开始登录</button>
+          <input class="input" id="login-label" placeholder="账号备注（可选，如 acct-1）" maxlength="32" style="margin-bottom:10px">
+          <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">生成授权链接</button>
         </div>
         <div id="login-active" style="display:none">
-          <div class="dialog-help" style="margin-bottom:6px">请在浏览器中打开下面链接完成授权：</div>
+          <div class="dialog-help" style="margin-bottom:6px">在任意浏览器打开下面的链接完成授权（本页保持打开即自动入池）：</div>
           <div style="display:flex;gap:8px;align-items:center">
             <input class="input" id="login-url" readonly style="font-size:12px">
             <button onclick="copyLoginUrl()" class="dialog-btn">复制</button>
@@ -272,7 +273,7 @@ async function doAdd(){
 }
 
 /* ── 授权登录 ── */
-let _loginTimer=null, _loginUrl='';
+let _loginTimer=null, _loginUrl='', _loginDeadline=0, _expireTimer=null;
 function switchAddTab(tab){
   document.getElementById('tab-paste').classList.toggle('active',tab==='paste');
   document.getElementById('tab-login').classList.toggle('active',tab==='login');
@@ -286,17 +287,26 @@ function resetLoginPane(){
   document.getElementById('login-idle').style.display='';
   document.getElementById('login-active').style.display='none';
   document.getElementById('login-start-btn').disabled=false;
+  document.getElementById('login-label').value='';
 }
 async function startLogin(){
   const btn=document.getElementById('login-start-btn');
   btn.disabled=true;
   try{
-    const d=await api('POST','/login/start');
+    const label=document.getElementById('login-label').value.trim();
+    const d=await api('POST','/login/start',label?{label}:{});
     _loginUrl=d.authorize_url;
+    _loginDeadline=Date.now()+(d.expires_in||300)*1000;
     document.getElementById('login-url').value=_loginUrl;
     document.getElementById('login-idle').style.display='none';
     document.getElementById('login-active').style.display='';
     setLoginStatus('等待授权中…',false);
+    _expireTimer=setInterval(()=>{
+      const left=Math.max(0,Math.round((_loginDeadline-Date.now())/1000));
+      const cur=document.getElementById('login-status');
+      if(cur&&!cur.dataset.err)cur.textContent=left>0?`等待授权中… 链接 ${Math.floor(left/60)}:${String(left%60).padStart(2,'0')}`:'链接已过期，请关闭后重新生成';
+      if(left<=0&&_expireTimer){clearInterval(_expireTimer);_expireTimer=null;}
+    },1000);
     try{window.open(_loginUrl,'_blank','noopener');}catch{}
     pollLogin(d.flow_id);
   }catch(e){
@@ -307,28 +317,32 @@ async function startLogin(){
 function pollLogin(flowId){
   let n=0;
   _loginTimer=setInterval(async()=>{
-    if(++n>120){stopLoginPoll();setLoginStatus('登录超时，请重试',true);return;}
+    if(++n>200){stopLoginPoll();setLoginStatus('登录超时，请重新生成链接',true);return;}
     try{
       const d=await api('GET','/login/poll/'+flowId);
       if(d.status==='ready'){
         stopLoginPoll();
-        showToast('登录成功，已导入账号池','success');
+        showToast('登录成功，已导入账号池：'+(d.account&&d.account.name||''),'success');
         closeModal('modal-add');
         load();
       }else if(d.status==='failed'){
         stopLoginPoll();
         setLoginStatus(d.message||'授权失败或被拒绝',true);
+      }else if(d.status===404||d.error){
+        stopLoginPoll();
+        setLoginStatus('会话已过期，请重新生成链接',true);
       }
-    }catch(e){/* 单次失败继续轮询 */}
+    }catch(e){/* 单次失败继续轮询；404 = 会话过期 */}
   },2500);
 }
 function setLoginStatus(text,isErr){
   const el=document.getElementById('login-status');
   el.textContent=text;
+  el.dataset.err=isErr?'1':'';
   el.classList.toggle('live-dot',!isErr);
   el.style.color=isErr?'var(--error)':'';
 }
-function stopLoginPoll(){if(_loginTimer){clearInterval(_loginTimer);_loginTimer=null;}}
+function stopLoginPoll(){if(_loginTimer){clearInterval(_loginTimer);_loginTimer=null;}if(_expireTimer){clearInterval(_expireTimer);_expireTimer=null;}}
 function cancelLogin(){stopLoginPoll();closeModal('modal-add');}
 function copyLoginUrl(){navigator.clipboard.writeText(_loginUrl).then(()=>showToast('已复制','success')).catch(()=>showToast('复制失败','error'));}
 function openLoginUrl(){if(_loginUrl)window.open(_loginUrl,'_blank','noopener');}

@@ -94,6 +94,9 @@ async def gateway_client(fresh_app, mock_server, monkeypatch):
     })
     # 后台额度刷新也指向 Mock（billing/current|balance|usage）
     monkeypatch.setattr(settings, "ZCODE_BILLING_BASE", f"{base}/api/v1/zcode-plan")
+    # OAuth（cli init/poll + api-key 兑换链）全部收敛到 Mock —— 测试永不打真网
+    monkeypatch.setattr(settings, "OAUTH_API_BASE", f"{base}/api/v1")
+    monkeypatch.setattr(settings, "ZAI_EXCHANGE_ORIGIN", base)
 
     from app.routes import gateway as gateway_module
     monkeypatch.setattr(gateway_module, "captcha_manager", _StubCaptcha())
