@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>zcode2api · 账号池</title>
+  <title>zcode-hub · 账号池</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
 </head>
@@ -40,9 +40,9 @@
   <div class="section-head"><div class="section-title">账户概览</div></div>
   <div class="stat-grid">
     <div class="stat-cell"><div class="stat-top"><div class="stat-label">账户总数</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 19a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4"/><circle cx="12" cy="8" r="4"/></svg></span></div><div class="stat-num" id="s-total">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:#16a34a"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:#16a34a">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:#8d6bbd"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#8d6bbd">0</div></div>
-    <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（剩余）</div><span class="stat-icon" style="color:#4c9168"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:#4c9168">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">正常</div><span class="stat-icon" style="color:var(--mint)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-active" style="color:var(--mint)">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">额度用完</div><span class="stat-icon" style="color:#b78ae0"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M6 19h12"/><path d="M12 16V9"/></svg></span></div><div class="stat-num" id="s-exhausted" style="color:#b78ae0">0</div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">总额度（剩余）</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/></svg></span></div><div class="stat-num" id="s-quota" style="color:var(--amber)">0</div></div>
   </div>
 
   <div class="section-head">
@@ -52,21 +52,7 @@
 
   <div class="filter-bar" id="filter-bar"></div>
 
-  <div class="table-card">
-    <table>
-      <thead><tr>
-        <th>Token</th><th class="table-center" style="width:88px">提供商</th>
-        <th class="table-center" style="width:72px">类型</th>
-        <th class="table-center" style="width:80px">状态</th>
-        <th style="min-width:220px">额度</th>
-        <th class="table-center" style="width:60px">调用</th>
-        <th class="table-center" style="width:60px">失败</th>
-        <th style="width:120px">最近使用</th>
-        <th style="width:120px">操作</th>
-      </tr></thead>
-      <tbody id="tbody"></tbody>
-    </table>
-  </div>
+  <div class="acct-list" id="acct-list"></div>
 </main>
 
 <!-- Add modal -->
@@ -158,6 +144,7 @@ let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null;
 const refreshing=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
+const NOTCH_COLORS=['var(--notch-1)','var(--notch-2)','var(--notch-3)','var(--notch-4)','var(--notch-5)','var(--notch-6)'];
 
 (async()=>{
   await renderAdminHeader();
@@ -179,7 +166,7 @@ async function load(silent){
     allAccounts=d.accounts||[];
     renderStats(d.stats||{});
     renderFilters();
-    renderTable();
+    renderList();
     document.getElementById('last-updated').textContent='更新于 '+new Date().toLocaleTimeString();
   }catch(e){ if(!silent)showToast('加载失败: '+e.message,'error'); }
 }
@@ -190,7 +177,7 @@ function renderStats(s){
   set('s-exhausted',s.exhausted||0);
   let totalRem=0;
   allAccounts.forEach(a=>{const q=a.quota||{};Object.values(q).forEach(w=>{totalRem+=Number(w.remaining)||0;});});
-  set('s-quota',fmt(totalRem));
+  set('s-quota',fmtNum(totalRem));
 }
 
 function renderFilters(){
@@ -201,56 +188,89 @@ function renderFilters(){
     `<button class="filter-chip${curFilter===k?' active':''}" onclick="setFilter('${k}')">${l}<span class="filter-chip-count">${counts[k]||0}</span></button>`
   ).join('');
 }
-function setFilter(k){curFilter=k;renderFilters();renderTable();}
+function setFilter(k){curFilter=k;renderFilters();renderList();}
 
-function renderTable(){
+function renderList(){
   const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
   document.getElementById('tbl-count').textContent=items.length;
-  const tb=document.getElementById('tbody');
-  if(!items.length){tb.innerHTML='<tr><td colspan="9" class="empty-state">暂无账号，点击右上角「新增」添加</td></tr>';return;}
-  tb.innerHTML=items.map(rowHtml).join('');
+  const el=document.getElementById('acct-list');
+  if(!items.length){el.innerHTML='<div class="empty-state">暂无账号，点击右上角「新增」添加</div>';return;}
+  el.innerHTML=items.map(rowHtml).join('');
 }
 
+/* ── Z·SWITCH 风格账号行 ── */
+function notchColor(id){
+  let h=0;for(const c of String(id))h=(h*31+c.charCodeAt(0))>>>0;
+  return NOTCH_COLORS[h%NOTCH_COLORS.length];
+}
+function tierBadgeHtml(a){
+  const p=a.plan||{};
+  const s=String(p.show_name||p.plan_id||'').toLowerCase();
+  let label=esc(p.show_name||p.plan_id||''),cls='other';
+  if(s.includes('max')){label='Max';cls='max';}
+  else if(s.includes('pro')&&!s.includes('preview')){label='Pro';cls='pro';}
+  else if(s.includes('lite')){label='Lite';cls='lite';}
+  else if(s.includes('start')||s.includes('trial')||s.includes('体验')){label='Trial';cls='trial';}
+  return label?`<span class="tier-b ${cls}">${label}</span>`:'';
+}
 function rowHtml(a){
   const isJwt=a.mode==='jwt';
   const isDisabled=a.status==='disabled';
   const loading=refreshing.has(a.id);
-  return `<tr>
-    <td><span class="tok">${esc(a.token_masked)}</span><div style="font-size:11px;color:#aaa;margin-top:2px">${esc(a.name)}</div></td>
-    <td class="table-center">${a.provider}</td>
-    <td class="table-center"><span class="badge badge-${a.mode}">${isJwt?'JWT':'Key'}</span></td>
-    <td class="table-center"><span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span></td>
-    <td>${quotaCell(a)}</td>
-    <td class="table-center" style="color:#8f8f8f">${a.use_count||0}</td>
-    <td class="table-center" style="color:#9a9a9a">${a.fail_count||0}</td>
-    <td style="font-size:12px;color:#9a9a9a">${fmtDate(a.last_used_at)}</td>
-    <td><div class="row-actions">
-      ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>`:''}
-      <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
-        ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
-      </button>
-      <button onclick="openEdit('${a.id}')" class="row-icon-btn" title="编辑"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button>
-      <button onclick="doDelete('${a.id}')" class="row-icon-btn row-icon-danger" title="删除"><svg viewBox="0 0 24 24"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button>
-    </div></td>
-  </tr>`;
+  const p=a.plan||{};
+  let meta=`<span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span>`;
+  if(p.expires_at){
+    const days=Math.ceil((new Date(p.expires_at)-Date.now())/86400000);
+    meta+=`<span class="${days<=7?'warn-line':''}">有效期至 ${esc(String(p.expires_at).slice(0,10))}</span>`;
+  }
+  if(a.last_error)meta+=`<span class="err-line" title="${esc(a.last_error)}">${esc(a.last_error.length>40?a.last_error.slice(0,40)+'…':a.last_error)}</span>`;
+  return `<div class="acct-row${isDisabled?' is-disabled':''}" data-id="${a.id}">
+    <div class="acct-row-top">
+      <span class="notch" style="background:${notchColor(a.id)}"></span>
+      <div class="acct-main">
+        <div class="acct-name-line">
+          <span class="acct-name">${esc(a.name)}</span>
+          ${tierBadgeHtml(a)}
+          <span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span>
+        </div>
+        <div class="acct-meta">${meta}<span>·</span><span>调用 ${a.use_count||0}</span><span>失败 ${a.fail_count||0}</span><span>最近 ${fmtDate(a.last_used_at)}</span></div>
+      </div>
+      <div class="acct-actions row-actions">
+        ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>`:''}
+        <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
+          ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
+        </button>
+        <button onclick="openEdit('${a.id}')" class="row-icon-btn" title="编辑"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button>
+        <button onclick="doDelete('${a.id}')" class="row-icon-btn row-icon-danger" title="删除"><svg viewBox="0 0 24 24"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button>
+      </div>
+    </div>
+    <div class="acct-quota">${quotaCell(a)}</div>
+  </div>`;
 }
 
 function quotaCell(a){
   const q=a.quota||{};
   const keys=Object.keys(q);
-  if(!keys.length)return a.mode==='jwt'?'<span class="quota-empty">未获取</span>':'<span class="quota-empty">—</span>';
+  if(!keys.length)return a.mode==='jwt'?'<span class="quota-empty">额度未获取，点右上角刷新</span>':'<span class="quota-empty">—</span>';
   return '<div class="quota-rows">'+keys.map(k=>{
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
-    const color=rem<=0?'#c9c9cf':(pct<15?'#b0632a':'#4c9168');
+    const color=rem<=0?'var(--ink-mute)':(pct<15?'var(--amber)':'var(--mint)');
     return `<div class="quota-row">
-      <span class="quota-row-name">${esc(shortModel(k))}</span>
+      <span class="quota-row-name" title="${esc(k)}">${esc(shortModel(k))}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
-      <span class="quota-row-val">${fmt(rem)} / ${fmt(tot)}</span>
+      <span class="quota-row-val">${fmtNum(rem)} / ${fmtNum(tot)}</span>
     </div>`;
   }).join('')+'</div>';
 }
-function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,10)||n;}
+function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,12)||n;}
+/* 万/亿 缩写（zcode-switch 同款） */
+function fmtNum(v){
+  const n=Number(v);if(!isFinite(n))return '—';
+  if(Math.abs(n)>=1e8)return (n/1e8).toFixed(2)+' 亿';
+  if(Math.abs(n)>=1e4)return (n/1e4).toFixed(2)+' 万';
+  return n.toLocaleString('zh-CN',{maximumFractionDigits:2});
+}
 
 /* ── Actions ── */
 function openAdd(){
@@ -340,7 +360,7 @@ function setLoginStatus(text,isErr){
   el.textContent=text;
   el.dataset.err=isErr?'1':'';
   el.classList.toggle('live-dot',!isErr);
-  el.style.color=isErr?'var(--error)':'';
+  el.style.color=isErr?'var(--red)':'';
 }
 function stopLoginPoll(){if(_loginTimer){clearInterval(_loginTimer);_loginTimer=null;}if(_expireTimer){clearInterval(_expireTimer);_expireTimer=null;}}
 function cancelLogin(){stopLoginPoll();closeModal('modal-add');}
@@ -378,7 +398,7 @@ async function toggleEnabled(id,enable){
 
 async function refreshOne(id){
   if(refreshing.has(id))return;
-  refreshing.add(id);renderTable();
+  refreshing.add(id);renderList();
   try{await api('POST','/accounts/'+id+'/refresh');showToast('额度已刷新','success');}
   catch(e){showToast('刷新失败: '+e.message,'error');}
   finally{refreshing.delete(id);await load();}
@@ -410,7 +430,6 @@ async function onImportFile(ev){
 
 /* ── Helpers ── */
 function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
-function fmt(n){n=Number(n)||0;return n>=10000?(n/1000).toFixed(1)+'k':n;}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
 function openModal(id){document.getElementById(id).classList.add('open');}
