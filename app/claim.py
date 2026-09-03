@@ -143,6 +143,9 @@ async def claim_with_captcha(
     headers[constants.CAPTCHA_HEADER] = verify_param.strip()
     if region and region.strip():
         headers["X-Aliyun-Captcha-Verify-Region"] = region.strip()
+    # 客户端 claim 请求形态（asar claimManualPlan）：带版本 + 平台头
+    headers["X-ZCode-App-Version"] = "3.10.2"
+    headers["X-Platform"] = "darwin-arm64"
 
     body = await _billing_request(
         account, "POST", "/billing/claim",

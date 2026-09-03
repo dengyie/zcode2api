@@ -177,6 +177,8 @@ class TestManualClaim:
         assert headers.get("x-aliyun-captcha-verify-param") == "browser-slider-param"
         assert headers.get("x-aliyun-captcha-verify-region") == "cn"
         assert headers.get("x-device-mid")
+        assert headers.get("x-zcode-app-version") == "3.10.2"  # 客户端 claim 头形态
+        assert headers.get("x-platform") == "darwin-arm64"
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 0
         # 成功后触发额度刷新
