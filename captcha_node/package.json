@@ -6,7 +6,6 @@
   "type": "commonjs",
   "main": "solver.js",
   "dependencies": {
-    "happy-dom": "^20.14.0",
-    "undici": "^8.10.2"
+    "happy-dom": "^20.14.0"
   }
 }

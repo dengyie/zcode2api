@@ -18,7 +18,6 @@ const { Window, PropertySymbol } = require("happy-dom");
 const WindowBrowserContext =
   require("happy-dom/lib/window/WindowBrowserContext.js").default ||
   require("happy-dom/lib/window/WindowBrowserContext.js");
-const { ProxyAgent, setGlobalDispatcher } = require("undici");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -36,8 +35,11 @@ const dbg = (msg) => {
 const proxyUrl = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
 if (proxyUrl) {
   try {
+    const { ProxyAgent, setGlobalDispatcher } = require("undici");
     setGlobalDispatcher(new ProxyAgent(proxyUrl));
-  } catch (_) {}
+  } catch (err) {
+    dbg(`proxy setup skipped (undici unavailable): ${err.message}`);
+  }
 }
 
 // ── 指纹（常量；与 zapi 同款 SwiftShader 形态，避免按次漂移）────────────────
