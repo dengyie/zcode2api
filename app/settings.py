@@ -47,8 +47,12 @@ HOST = os.getenv("ZCODE_HOST", "0.0.0.0")
 # 后台管理密码默认值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
 DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
 
-# ── 验证码缓存 ───────────────────────────────────────────────────────────────
-CAPTCHA_CACHE_TTL = _int("CAPTCHA_CACHE_TTL", 45_000)          # ms
+# ── 验证码 ───────────────────────────────────────────────────────────────────
+# 预解 token 池（对齐 zapi captcha.ts：热路径从池直取，后台循环补库存）
+CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 3)        # 目标库存（低于则补）
+CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
+CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
+CAPTCHA_CACHE_TTL = _int("CAPTCHA_CACHE_TTL", 45_000)          # 兼容旧配置，已不再使用
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
 # 验证码求解（无浏览器：Node + jsdom 模拟浏览器环境，运行阿里云无痕 SDK）

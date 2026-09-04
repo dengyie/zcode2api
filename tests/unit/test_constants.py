@@ -53,9 +53,11 @@ def test_rejection_signals():
     assert constants.EXHAUST_HTTP_STATUSES == (402,)
     assert "余额不足" in constants.EXHAUST_KEYWORDS
     assert "insufficient" in constants.EXHAUST_KEYWORDS
-    assert constants.AUTH_INVALID_STATUSES == (401, 403)
+    # 403 不再无条件判 invalid：需先排除验证码挑战（对齐 zapi classifyAccountFailure）
+    assert constants.AUTH_INVALID_STATUSES == (401,)
     assert constants.RATE_LIMITED_STATUSES == (429,)
     assert constants.CAPTCHA_BODY_CODE == 3007
+    assert '"code":3007' in constants.CAPTCHA_BODY_MARKERS
 
 
 def test_identity_headers():
@@ -63,6 +65,12 @@ def test_identity_headers():
     assert constants.ANTHROPIC_VERSION == "2023-06-01"
     assert constants.X_ZCODE_AGENT == "glm"
     assert constants.HTTP_REFERER == "https://zcode.z.ai/"
+    assert constants.IDENTITY_TITLE == "Z Code@cli"
+    assert constants.IDENTITY_RELEASE_CHANNEL == "production"
+    assert constants.IDENTITY_CLIENT_LANGUAGE == "zh-CN"
+    assert constants.IDENTITY_CLIENT_TIMEZONE == "Asia/Shanghai"
+    assert constants.IDENTITY_OS_CATEGORY == "macos"
+    assert constants.CAPTCHA_REGION_HEADER == "X-Aliyun-Captcha-Verify-Region"
 
 
 def test_settings_upstream_defaults_from_constants():

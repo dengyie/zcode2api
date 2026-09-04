@@ -185,9 +185,9 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
     last_err: ClaimError | None = None
     for attempt in (1, 2):
-        verify_param = await captcha_manager.get_verify_param()
+        verify_param, verify_region = await captcha_manager.get_verify_param()
         config = await captcha_manager.fetch_config()
-        headers = _claim_headers(account, verify_param, config.get("region"))
+        headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
 
         body = await _billing_request(
             account, "POST", "/billing/claim",

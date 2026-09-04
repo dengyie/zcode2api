@@ -86,8 +86,8 @@ def fresh_app(tmp_path, monkeypatch):
 class _StubCaptcha:
     """验证码桩：永不打真网。"""
 
-    async def get_verify_param(self, port: int | None = None) -> str:
-        return "mock-verify-param"
+    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+        return "mock-verify-param", None
 
     def invalidate(self) -> None:
         pass

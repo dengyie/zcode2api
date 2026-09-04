@@ -30,6 +30,7 @@ def _display_host() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     monitor.start()
+    captcha_manager.start()   # 验证码预解池后台补充
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
         f"{logs._B}{logs._MAG}zcode-hub{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",

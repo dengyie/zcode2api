@@ -27,7 +27,7 @@ def claim_env(gateway_client, fresh_app, monkeypatch):
 
         async def get_verify_param(self, port=None):
             self.solve_count += 1
-            return "stub-verify-param"
+            return "stub-verify-param", "sgp"
 
         async def fetch_config(self):
             return {"enabled": True, "prefix": "mockpre", "region": "sgp", "sceneId": "mock-scene"}

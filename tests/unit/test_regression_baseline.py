@@ -166,28 +166,38 @@ class TestBuildRequest:
     def test_jwt_routes_to_plan_channel(self):
         from app.agent import build_request
         acc = Account.create("zai", "t", "a.b.c")
-        url, headers = build_request(acc, {}, None)
+        url, headers, _payload = build_request(acc, {}, None)
         assert url == "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
         assert headers["Authorization"] == "Bearer a.b.c"
         assert headers["anthropic-version"] == "2023-06-01"
+        # JWT 通道带全量身份头 + 追踪头（对齐 zapi identity.ts）
+        assert headers["X-Title"] == "Z Code@cli"
+        assert "X-Device-Mid" in headers
+        assert "x-request-id" in headers and "x-zcode-trace-id" in headers
 
     def test_apikey_routes_to_fallback(self):
         from app.agent import build_request
         acc = Account.create("zai", "t", "plain-key")
-        url, headers = build_request(acc, {}, None)
+        url, headers, _payload = build_request(acc, {}, None)
         assert url == "https://api.z.ai/api/anthropic/v1/messages"
         assert headers["x-api-key"] == "plain-key"
 
     def test_captcha_header_injected(self):
         from app.agent import build_request
         acc = Account.create("zai", "t", "a.b.c")
-        _, headers = build_request(acc, {}, "vp-123")
+        _, headers, _payload = build_request(acc, {}, "vp-123")
         assert headers["X-Aliyun-Captcha-Verify-Param"] == "vp-123"
+
+    def test_captcha_region_header_injected(self):
+        from app.agent import build_request
+        acc = Account.create("zai", "t", "a.b.c")
+        _, headers, _payload = build_request(acc, {}, "vp-123", None, "cn")
+        assert headers["X-Aliyun-Captcha-Verify-Region"] == "cn"
 
     def test_client_auth_headers_dropped(self):
         from app.agent import build_request
         acc = Account.create("zai", "t", "a.b.c")
-        _, headers = build_request(acc, {}, None, {
+        _, headers, _payload = build_request(acc, {}, None, {
             "authorization": "Bearer client", "x-api-key": "leak", "user-agent": "UA/1",
             "x-zcode-foo": "strip", "x-custom": "keep",
         })

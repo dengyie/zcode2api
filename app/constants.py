@@ -73,12 +73,31 @@ X_PLATFORM = CLIENT_PLATFORM
 X_ZCODE_AGENT = "glm"
 HTTP_REFERER = "https://zcode.z.ai/"
 CAPTCHA_HEADER = "X-Aliyun-Captcha-Verify-Param"
+# region 头（zapi captcha.ts REGION_HEADER；与 PARAM 成对下发，缺失易 3007）
+CAPTCHA_REGION_HEADER = "X-Aliyun-Captcha-Verify-Region"
+
+# ── 身份头仿真（对齐 zapi identity.ts 的 pio；顺序、取值逐字段镜像官方客户端）──
+# 官方客户端 companion 头集合，让代理在指纹层与官方 ZCode 桌面端不可区分。
+# darwin-arm64 桌面身份。X-Device-Mid 走 quota.device_mid() 持久化复用。
+IDENTITY_TITLE = "Z Code@cli"           # X-Title = "Z Code@{sourceTitle}"
+IDENTITY_RELEASE_CHANNEL = "production"
+IDENTITY_CLIENT_LANGUAGE = "zh-CN"
+IDENTITY_CLIENT_TIMEZONE = "Asia/Shanghai"
+# X-Os-Category：darwin→macos / win32→windows / 其它→linux
+IDENTITY_OS_CATEGORY = "macos"
+# X-Os-Version：os.release() 语义；darwin 25.x 对应 macOS 15。固定伪装值。
+IDENTITY_OS_VERSION = "25.5.0"
 
 # ── 上游被拒信号 → 账号动作（gateway.classify / quota 判定共用）────────────────
 EXHAUST_HTTP_STATUSES = (402,)
 EXHAUST_KEYWORDS = ("quota", "insufficient", "balance", "exhaust", "额度", "余额不足")
 CAPTCHA_KEYWORDS = ("captcha", "verify token", "verify failed")
-AUTH_INVALID_STATUSES = (401, 403)
+AUTH_INVALID_STATUSES = (401,)
 RATE_LIMITED_STATUSES = (429,)
 # 验证码挑战：HTTP 403 + 文案，或 HTTP 400 + body {"code":3007}（docs 05 §被拒信号表）
+# 注意：403 不再无条件判 invalid —— 需先排除验证码挑战（captcha/verify 文案或
+# challenge 头），否则一次人机校验续期就把账号错杀成 INVALID（对齐 zapi
+# classifyAccountFailure：403 + captcha 文案 → 非账号失败）。
 CAPTCHA_BODY_CODE = 3007
+# body 中挑战特征（gateway 有时以 400 + {"code":3007} 下发挑战而非 challenge 头）
+CAPTCHA_BODY_MARKERS = ('"code":3007', '"code": 3007')

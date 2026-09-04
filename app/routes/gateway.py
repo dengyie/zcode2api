@@ -65,6 +65,35 @@ def _is_captcha_error(text: str) -> bool:
     return "captcha" in low or "verify token" in low or "verify failed" in low
 
 
+def _detect_captcha_challenge(resp: httpx.Response, text: str | None = None) -> str | None:
+    """验证码挑战双检测（对齐 zapi handler.ts）。
+
+    三种形态：
+      1. 响应头 x-aliyun-captcha-verify-param 存在（官方挑战信号）
+      2. HTTP 400/403 + body {"code":3007}（2026-08 观测的 body 内挑战）
+      3. HTTP 403 + 文案 captcha/verify（老检测，保留兼容）
+    返回挑战标记（非 None 即挑战），否则 None。
+    """
+    # 1) challenge 响应头
+    header_val = resp.headers.get(constants.CAPTCHA_HEADER)
+    if header_val and header_val.strip():
+        return "header"
+
+    if text is None:
+        return None
+    low = text.lower()
+
+    # 2) body code 3007（400/403 任意状态）
+    if resp.status_code in (400, 403) and any(m in text for m in constants.CAPTCHA_BODY_MARKERS):
+        return "in-body-3007"
+
+    # 3) 403 + 挑战文案
+    if resp.status_code == 403 and _is_captcha_error(low):
+        return "text"
+
+    return None
+
+
 def _is_exhausted(status_code: int, text: str) -> bool:
     if status_code in constants.EXHAUST_HTTP_STATUSES:
         return True
@@ -118,7 +147,6 @@ async def messages(request: Request):
     body = _normalize_body(body)
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
-    payload = json.dumps(body).encode("utf-8")
 
     req_id = secrets.token_hex(3)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
@@ -132,7 +160,7 @@ async def messages(request: Request):
         tried.add(account.id)
         needs_captcha = provider == "zai" and account.mode == "jwt"
 
-        result = await _try_account(req_id, account, body, payload, incoming_headers, port, needs_captcha)
+        result = await _try_account(req_id, account, body, incoming_headers, port, needs_captcha)
         if result is _NEXT_ACCOUNT:
             continue
         return result
@@ -147,13 +175,17 @@ async def messages(request: Request):
 _NEXT_ACCOUNT = object()
 
 
-async def _try_account(req_id, account, body, payload, incoming_headers, port, needs_captcha):
-    """尝试用单个账号转发，含验证码续期。返回 Response 或 _NEXT_ACCOUNT。"""
+async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha):
+    """尝试用单个账号转发，含验证码续期。返回 Response 或 _NEXT_ACCOUNT。
+
+    挑战重试路径（对齐 zapi handler.ts）：检测到挑战 → 清空池 → 取新 token →
+    重建整个请求（body 变换幂等，重建安全）→ 重试，最多 MAX_CAPTCHA_RETRIES 次。
+    """
     for _attempt in range(MAX_CAPTCHA_RETRIES):
-        verify_param = None
+        verify_param = verify_region = None
         if needs_captcha:
             try:
-                verify_param = await captcha_manager.get_verify_param(port)
+                verify_param, verify_region = await captcha_manager.get_verify_param(port)
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"人机校验失败: {err}")
                 return JSONResponse(
@@ -162,7 +194,7 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 )
 
         try:
-            url, headers = build_request(account, body, verify_param, incoming_headers)
+            url, headers, payload = build_request(account, body, verify_param, incoming_headers, verify_region)
         except RuntimeError as err:
             _mark(account, Status.INVALID, str(err))
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
@@ -185,10 +217,12 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
             await cm.__aexit__(None, None, None)
             await client.aclose()
 
-            if status_code == 403 and _is_captcha_error(text) and needs_captcha:
+            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
+            challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
+            if challenge:
                 captcha_manager.invalidate()
-                logs.warn(req_id, f"账号 {account.name} 验证码失效，刷新重试")
-                continue  # 同账号重试验证码
+                logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
+                continue  # 同账号重建请求重试
 
             if _is_exhausted(status_code, text):
                 _mark(account, Status.EXHAUSTED, "额度已用完")
@@ -196,9 +230,15 @@ async def _try_account(req_id, account, body, payload, incoming_headers, port, n
                 asyncio.create_task(_safe_refresh(account))
                 return _NEXT_ACCOUNT
 
-            if status_code in (401, 403):
-                _mark(account, Status.INVALID, f"鉴权失败 HTTP {status_code}")
-                logs.warn(req_id, f"账号 {account.name} 鉴权失败 {status_code}，切换下一个")
+            if status_code == 401:
+                _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
+                logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切换下一个")
+                return _NEXT_ACCOUNT
+
+            if status_code == 403:
+                # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
+                _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
+                logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切换下一个")
                 return _NEXT_ACCOUNT
 
             if status_code == 429:
