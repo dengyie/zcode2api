@@ -106,11 +106,17 @@ API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证
 ```
 GET  billing/preview   → data.previews[]: ClaimPlan{plan_id,name,description,priority,grants,grant_items[{name,units,period}]}
                           （活动未上线时 404 —— 属正常态，静默跳过）
-POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + 身份头; body: {plan_id}
+                          查询参数: app_version 必带；platform 参数 preview 容忍、client/configs 拒绝（3001）
+POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCode-App-Version + X-Platform
+                          （实测缺版本/平台头即使验证码有效也 3007 —— asar claimManualPlan 头形态）; body: {plan_id}
                           成功 → starts_at/ends_at 生效窗口
                           失败码: already_claimed / quota_exhausted → 按服务端 next window 退避
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
+
+版本口径（单一真相源 `app/constants.py`，2026-09 实测）：`CLIENT_APP_VERSION="3.10.2"`（asar `gr`，3.0.x 已被上游拒绝）、
+`CLIENT_PLATFORM="darwin-arm64"`（asar `TH()` = `process.platform-process.arch`，服务端固定伪装）；
+`USER_AGENT` / `X-ZCode-App-Version` / configs 查询串全部引用该常量。
 
 ## 6. 免费额度以外的两条通道（认知备查）
 
