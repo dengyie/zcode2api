@@ -47,6 +47,7 @@ class Account:
 
     use_count: int = 0
     fail_count: int = 0
+    risk_strikes: int = 0  # 连续风控（3012/405）命中次数，用于指数退避；成功即清零
     last_used_at: float | None = None
     last_checked_at: float | None = None
     cooling_until: float | None = None
@@ -70,6 +71,18 @@ class Account:
     def secret(self) -> str | None:
         return self.jwt_token if self.mode == "jwt" else self.api_key
 
+    def begin_risk_cooldown(self, base: int, cap: int, now: float | None = None) -> int:
+        """命中风控：累加连续计数并按指数退避设置冷却截止，返回新冷却秒数。
+
+        第 n 次连续命中冷却 min(base * 2^(n-1), cap) 秒。
+        """
+        self.risk_strikes += 1
+        cooldown = min(base * (2 ** (self.risk_strikes - 1)), cap)
+        now = now or time.time()
+        self.status = Status.COOLING
+        self.cooling_until = now + cooldown
+        return cooldown
+
     def is_selectable(self, now: float | None = None) -> bool:
         """是否可被轮询选中。"""
         if not self.enabled or self.status in (Status.DISABLED, Status.INVALID):
@@ -80,6 +93,13 @@ class Account:
             now = now or time.time()
             return bool(self.cooling_until and now >= self.cooling_until)
         return True
+
+    def is_cooling(self, now: float | None = None) -> bool:
+        """冷却是否仍在生效（含风控指数退避）。冷却期内不应产生任何上游流量。"""
+        if self.status != Status.COOLING:
+            return False
+        now = now or time.time()
+        return bool(self.cooling_until and now < self.cooling_until)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -105,6 +125,7 @@ class Account:
             "plan": self.plan,
             "use_count": self.use_count,
             "fail_count": self.fail_count,
+            "risk_strikes": self.risk_strikes,
             "last_used_at": self.last_used_at,
             "last_checked_at": self.last_checked_at,
             "cooling_until": self.cooling_until,

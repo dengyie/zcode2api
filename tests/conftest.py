@@ -86,15 +86,27 @@ def fresh_app(tmp_path, monkeypatch):
 class _StubCaptcha:
     """验证码桩：永不打真网。"""
 
+    def __init__(self) -> None:
+        self.paused_seconds: list[int] = []
+
     async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
         return "mock-verify-param", None
 
     def invalidate(self) -> None:
         pass
 
+    def pause_refill(self, seconds: int) -> None:
+        self.paused_seconds.append(seconds)
+
+
+@pytest.fixture
+def stub_captcha() -> _StubCaptcha:
+    """验证码桩实例。gateway_client 依赖注入同一实例，测试可直接断言其调用。"""
+    return _StubCaptcha()
+
 
 @pytest_asyncio.fixture
-async def gateway_client(fresh_app, mock_server, monkeypatch):
+async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     """挂好 Mock 上游的网关 ASGI 客户端。返回 (client, mock_app)。"""
     mock_app, port = mock_server
     base = f"http://127.0.0.1:{port}"
@@ -110,7 +122,7 @@ async def gateway_client(fresh_app, mock_server, monkeypatch):
     monkeypatch.setattr(settings, "ZAI_EXCHANGE_ORIGIN", base)
 
     from app.routes import gateway as gateway_module
-    monkeypatch.setattr(gateway_module, "captcha_manager", _StubCaptcha())
+    monkeypatch.setattr(gateway_module, "captcha_manager", stub_captcha)
 
     from app.main import create_app
     gateway = create_app()

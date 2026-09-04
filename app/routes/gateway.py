@@ -101,6 +101,18 @@ def _is_exhausted(status_code: int, text: str) -> bool:
     return any(k in low for k in _EXHAUST_KEYWORDS)
 
 
+def _is_risk_control(status_code: int, text: str) -> bool:
+    """风控信号判定（3012「unusual activity」/ messages 端点 405）。
+
+    与验证码挑战互斥：调用点已先排除 challenge 形态。命中即账号级风控，
+    需指数退避冷却，而非直接回传客户端错误（会导致下次立刻重打、加剧风控）。
+    """
+    if status_code in constants.RISK_CONTROL_HTTP_STATUSES:
+        return True
+    low = text.lower()
+    return any(m.lower() in low for m in constants.RISK_CONTROL_MARKERS)
+
+
 def _mark(account: Account, status_value: str, error: str | None = None) -> None:
     account.status = status_value
     account.last_error = error
@@ -224,6 +236,25 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                 continue  # 同账号重建请求重试
 
+            # 风控（3012「unusual activity」/ 405）：账号指数退避冷却 + 暂停验证码池预热。
+            # 必须先于 exhausted/其它错误判定，且不再空转重打（否则升级为封号）。
+            if _is_risk_control(status_code, text):
+                cooldown = account.begin_risk_cooldown(
+                    settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX
+                )
+                account.last_error = f"风控冷却 (3012/unusual activity)，第 {account.risk_strikes} 次"
+                store.update_account(account)
+                # 预热验证码本身即上游流量，风控期暂停以免加剧
+                pause = getattr(captcha_manager, "pause_refill", None)
+                if callable(pause):
+                    pause(cooldown)
+                logs.warn(
+                    req_id,
+                    f"账号 {account.name} 命中风控 HTTP {status_code}，"
+                    f"冷却 {cooldown}s（第 {account.risk_strikes} 次），切换下一个",
+                )
+                return _NEXT_ACCOUNT
+
             if _is_exhausted(status_code, text):
                 _mark(account, Status.EXHAUSTED, "额度已用完")
                 logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
@@ -258,6 +289,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # 成功：记录用量并流式透传
         account.use_count += 1
         account.last_used_at = time.time()
+        account.risk_strikes = 0  # 成功即清零风控计数（下次命中从 base 重新退避）
         if account.status in (Status.COOLING, Status.EXHAUSTED):
             account.status = Status.ACTIVE
         store.update_account(account)

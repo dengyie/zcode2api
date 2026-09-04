@@ -201,6 +201,9 @@ def build_app() -> FastAPI:
             return 403, _error_body("captcha verify failed"), {"x-aliyun-captcha-verify-param": "need"}
         if scenario == "captcha_3007":
             return 400, {"code": 3007, "message": "captcha required"}, {}
+        if scenario == "risk_control_3012":
+            # 2026-09-05 实测形态：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
+            return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
         if scenario == "server_error":
             return 500, {"error": "internal"}, {}
         if scenario == "garbage_body":

@@ -133,10 +133,12 @@ async def fetch_quota(account: Account) -> dict:
             account.status = Status.EXHAUSTED
             account.last_error = "额度已用完"
         elif account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
-            # 额度恢复 → 重新激活
-            account.status = Status.ACTIVE
-            account.last_error = None
-            account.cooling_until = None
+            # 额度恢复 → 重新激活。风控冷却例外：冷却期内不该有 billing 流量
+            # （monitor 已跳过），此处兜底不再提前解除，按 cooling_until 自然到期。
+            if not account.is_cooling():
+                account.status = Status.ACTIVE
+                account.last_error = None
+                account.cooling_until = None
 
     store.update_account(account)
     return result or {"error": "无法获取额度数据"}
@@ -180,6 +182,7 @@ class QuotaMonitor:
                     accounts = [
                         a for a in store.list_accounts("zai")
                         if a.mode == "jwt" and a.status != Status.DISABLED
+                        and not a.is_cooling()
                     ]
                     if accounts:
                         await refresh_accounts(accounts)

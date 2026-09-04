@@ -90,3 +90,17 @@ def test_gateway_constants():
     from app.routes import gateway
     assert gateway.MAX_CAPTCHA_RETRIES == MAX_CAPTCHA_RETRIES
     assert gateway.MAX_ACCOUNT_ATTEMPTS == MAX_ACCOUNT_ATTEMPTS
+
+
+def test_risk_control_signals():
+    # 2026-09-05 3012 事件锁定：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
+    assert constants.RISK_CONTROL_HTTP_STATUSES == (405,)
+    assert constants.RISK_CONTROL_CODES == (3012,)
+    assert '"code":3012' in constants.RISK_CONTROL_MARKERS
+    assert "unusual activity" in constants.RISK_CONTROL_MARKERS
+
+
+def test_risk_cooldown_settings_defaults():
+    from app import settings
+    assert settings.RISK_COOLDOWN_BASE == 900
+    assert settings.RISK_COOLDOWN_MAX == 21_600

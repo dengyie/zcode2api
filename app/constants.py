@@ -101,3 +101,14 @@ RATE_LIMITED_STATUSES = (429,)
 CAPTCHA_BODY_CODE = 3007
 # body 中挑战特征（gateway 有时以 400 + {"code":3007} 下发挑战而非 challenge 头）
 CAPTCHA_BODY_MARKERS = ('"code":3007', '"code": 3007')
+
+# ── 风控信号（2026-09-05 3012 事件实证）────────────────────────────────────────
+# 3012「unusual activity」= 上游风控（HTTP 405 承载），不在官方公开错误码表；
+# 高频请求触发，官方政策定性为临时限制（限流/冻结，3 次以上违规才封号）。
+# 处置：账号指数退避冷却 + 暂停验证码池预热（池预热本身即上游流量，会加剧风控）。
+RISK_CONTROL_HTTP_STATUSES = (405,)
+RISK_CONTROL_CODES = (3012,)
+RISK_CONTROL_MARKERS = (
+    '"code":3012', '"code": 3012',
+    "unusual activity",
+)

@@ -68,6 +68,13 @@ QUOTA_REFRESH_INTERVAL = _int("ZCODE_QUOTA_REFRESH_INTERVAL", 60)
 # 限流（cooling）冷却时长（秒）
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 
+# ── 风控冷却 ──────────────────────────────────────────────────────────────────
+# 3012/405「unusual activity」命中后的指数退避：第 n 次连续命中冷却
+# base * 2^(n-1) 秒，封顶 max。风控由高频请求触发，退避给上游解封留窗口，
+# 同时避免反复重打升级成封号（官方政策：3 次以上违规可能 ban）。
+RISK_COOLDOWN_BASE = _int("ZCODE_RISK_COOLDOWN_BASE", 900)      # 首次 15 分钟
+RISK_COOLDOWN_MAX = _int("ZCODE_RISK_COOLDOWN_MAX", 21_600)     # 封顶 6 小时
+
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 # 上游端点：默认值统一收口在 constants.py，环境变量仅作覆盖
 UPSTREAM = {
