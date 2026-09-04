@@ -10,8 +10,10 @@
 X-Device-Mid 复用 quota.device_mid()（UUIDv4，首次生成后持久化 data/device_mid，
 与 billing 全家桶同一设备身份 —— 同机异 MID 本身就是异常信号）。
 
-另含追踪头（zapi upstream.ts buildTraceHeaders）：coding-plan 通道发全 5 个
-UUID/类型头。每请求重新生成 request-id / trace-id / query-id / session-id。
+另含追踪头（zapi upstream.ts buildTraceHeaders）：JWT 通道即 zapi 的
+start-plan，只发 x-request-id / x-zcode-session-type / x-zcode-trace-id
+三个头（start-plan 不发 x-query-id / x-session-id，误发触发 3012）。
+每请求重新生成。
 """
 
 from __future__ import annotations
@@ -83,16 +85,23 @@ def build_identity_headers() -> dict[str, str]:
     return headers
 
 
-def build_trace_headers() -> dict[str, str]:
-    """coding-plan 追踪头：每请求全新 UUID（官方客户端行为）。
+def build_trace_headers(plan: str = "start-plan") -> dict[str, str]:
+    """追踪头：每请求全新 UUID（对齐 zapi upstream.ts buildTraceHeaders）。
 
-    start-plan 不发 x-query-id / x-session-id；本服务只跑 coding-plan 通道，
-    因此全量下发（zapi upstream.ts buildTraceHeaders 非 start-plan 分支）。
+    通道差异（关键，误发会触发上游 3012 "unusual activity"）：
+      - start-plan（JWT 通道，cred.jwt 存在）：只发 x-request-id /
+        x-zcode-session-type / x-zcode-trace-id 三个头。**不发**
+        x-query-id / x-session-id —— 官方客户端 start-plan 请求不带这两个。
+      - coding-plan（API Key 通道）：额外发 x-query-id / x-session-id。
+
+    本服务 JWT 通道即 zapi 的 start-plan，故默认 plan="start-plan"。
     """
-    return {
+    headers = {
         "x-request-id": str(uuid.uuid4()),
         "x-zcode-session-type": "main",
         "x-zcode-trace-id": str(uuid.uuid4()),
-        "x-query-id": str(uuid.uuid4()),
-        "x-session-id": str(uuid.uuid4()),
     }
+    if plan != "start-plan":
+        headers["x-query-id"] = str(uuid.uuid4())
+        headers["x-session-id"] = str(uuid.uuid4())
+    return headers

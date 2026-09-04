@@ -73,7 +73,8 @@ def build_request(
     if provider == "zai" and account.mode == "jwt":
         # JWT 通道：全量身份头 + 追踪头（对齐官方客户端 pio + trace 头序）
         user_id = body_transform.jwt_user_id(account.jwt_token)
-        body = body_transform.transform_body(body, user_id)
+        model = body.get("model") if isinstance(body.get("model"), str) else None
+        body = body_transform.transform_body(body, user_id, model)
         headers = {
             "content-type": "application/json",
             **auth,
