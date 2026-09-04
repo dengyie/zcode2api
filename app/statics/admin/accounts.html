@@ -254,6 +254,15 @@ function rowHtml(a){
     const days=Math.ceil((planEnd*1000-Date.now())/86400000);
     meta+=`<span class="${days<=7?'warn-line':''}" title="当前套餐有效期">有效期至 ${fmtDate(planEnd)}</span>`;
   }
+  // 冷却倒计时：限流/风控账号显示剩余恢复时间（cooling_until）+ 风控连击数
+  if(a.status==='cooling'&&Number(a.cooling_until)){
+    const left=Math.max(0,Math.round(Number(a.cooling_until)-Date.now()/1000));
+    if(left>0){
+      const strikes=Number(a.risk_strikes)||0;
+      const tip=strikes>0?`风控冷却（连续第 ${strikes} 次），${fmtDur(left)}后自动恢复`:`限流冷却，${fmtDur(left)}后自动恢复`;
+      meta+=`<span class="cool-line" title="${tip}">❄ ${fmtDur(left)}恢复${strikes>1?` ·×${strikes}`:''}</span>`;
+    }
+  }
   if(a.last_error)meta+=`<span class="err-line" title="${esc(a.last_error)}">${esc(a.last_error.length>40?a.last_error.slice(0,40)+'…':a.last_error)}</span>`;
   return `<div class="acct-row${isDisabled?' is-disabled':''}" data-id="${a.id}">
     <div class="acct-row-top">
@@ -621,6 +630,7 @@ async function onImportFile(ev){
 function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
+function fmtDur(s){s=Math.max(0,Math.round(s));if(s<60)return s+'秒';const m=Math.floor(s/60);if(m<60)return m+'分';const h=Math.floor(m/60);return h+'小时'+(m%60?(m%60)+'分':'');}
 function openModal(id){document.getElementById(id).classList.add('open');}
 function closeModal(id){document.getElementById(id).classList.remove('open');}
 function openConfirm(title,body,cb){_cb=async()=>{closeModal('modal-confirm');await cb();};document.getElementById('confirm-title').textContent=title;document.getElementById('confirm-body').innerHTML=body;openModal('modal-confirm');}

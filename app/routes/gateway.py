@@ -113,6 +113,18 @@ def _is_risk_control(status_code: int, text: str) -> bool:
     return any(m.lower() in low for m in constants.RISK_CONTROL_MARKERS)
 
 
+def _parse_retry_after(value: str | None) -> int | None:
+    """解析 Retry-After（仅秒数形态；HTTP-date 形态少见，放弃即回退默认冷却）。"""
+    if not value:
+        return None
+    try:
+        secs = int(float(value.strip()))
+    except (ValueError, AttributeError):
+        return None
+    # 上游异常值防御：非正数不采信，过长封顶 1h（防呆标记把账号冻结到天外）
+    return secs if 0 < secs <= 3600 else None
+
+
 def _mark(account: Account, status_value: str, error: str | None = None) -> None:
     account.status = status_value
     account.last_error = error
@@ -273,8 +285,16 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 return _NEXT_ACCOUNT
 
             if status_code == 429:
-                _mark(account, Status.COOLING, "上游限流 429")
-                logs.warn(req_id, f"账号 {account.name} 被限流 429，切换下一个")
+                retry_after = _parse_retry_after(resp.headers.get("retry-after"))
+                cool = retry_after if retry_after is not None else settings.COOLING_SECONDS
+                account.status = Status.COOLING
+                account.cooling_until = time.time() + cool
+                account.last_error = (
+                    f"上游限流 429（Retry-After {retry_after}s）" if retry_after is not None
+                    else "上游限流 429"
+                )
+                store.update_account(account)
+                logs.warn(req_id, f"账号 {account.name} 被限流 429（冷却 {cool}s），切换下一个")
                 return _NEXT_ACCOUNT
 
             # 其它错误：直接回传客户端

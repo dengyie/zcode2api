@@ -135,3 +135,55 @@ class TestRiskControlCooldown:
         assert mgr._paused_until == snap
         mgr.pause_refill(60)  # 更长暂停顺延
         assert mgr._paused_until > snap
+
+
+@pytest.mark.integration
+class TestRateLimitRetryAfter:
+    """429（官方频控 1302/1313）：尊重上游 Retry-After，缺失/异常才回退默认冷却。"""
+
+    async def test_429_honors_retry_after(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        acc = seed_account(fresh_app, _RISK_JWT, name="a-429")
+        mock.state.sequences[_RISK_JWT[:16]] = ["rate_limited"]  # mock 带 retry-after: 30
+
+        res = await client.post("/v1/messages", json={"model": "GLM-5.2",
+                                                      "messages": [{"role": "user", "content": "hi"}]})
+        assert res.status_code == 503  # 唯一账号被限流
+        acc = fresh_app.list_accounts("zai")[0]
+        assert acc.status == Status.COOLING
+        # 冷却 ≈ 30s（Retry-After），而非默认 300s
+        assert 25 <= acc.cooling_until - time.time() <= 31
+        assert "Retry-After 30s" in (acc.last_error or "")
+        # 429 不计入风控连击（它是频控不是 unusual activity 风控）
+        assert acc.risk_strikes == 0
+
+    async def test_429_without_header_falls_back(self, gateway_client, fresh_app, monkeypatch):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(gw, "_parse_retry_after", lambda _: None)
+        monkeypatch.setattr(settings, "COOLING_SECONDS", 120)
+        seed_account(fresh_app, _RISK_JWT, name="a-429")
+        mock.state.sequences[_RISK_JWT[:16]] = ["rate_limited"]
+
+        res = await client.post("/v1/messages", json={"model": "GLM-5.2",
+                                                      "messages": [{"role": "user", "content": "hi"}]})
+        assert res.status_code == 503
+        acc = fresh_app.list_accounts("zai")[0]
+        assert 110 <= acc.cooling_until - time.time() <= 121
+
+
+def test_parse_retry_after():
+    from app.routes.gateway import _parse_retry_after
+
+    assert _parse_retry_after("30") == 30
+    assert _parse_retry_after(" 45.0 ") == 45
+    assert _parse_retry_after("0") is None       # 非正数不采信
+    assert _parse_retry_after("-5") is None
+    assert _parse_retry_after("7200") is None    # >1h 封顶防御
+    assert _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT") is None  # HTTP-date 放弃
+    assert _parse_retry_after(None) is None
+    assert _parse_retry_after("") is None
