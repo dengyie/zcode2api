@@ -248,9 +248,11 @@ function rowHtml(a){
   const loading=refreshing.has(a.id);
   const p=a.plan||{};
   let meta=`<span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span>`;
-  if(p.expires_at){
-    const days=Math.ceil((new Date(p.expires_at)-Date.now())/86400000);
-    meta+=`<span class="${days<=7?'warn-line':''}">有效期至 ${esc(String(p.expires_at).slice(0,10))}</span>`;
+  // 套餐窗口：上游字段是 ends_at（unix 秒）；expires_at 为旧兼容。字符串/数字双形态都兜住
+  const planEnd=Number(p.ends_at)||Number(p.expires_at)||0;
+  if(planEnd){
+    const days=Math.ceil((planEnd*1000-Date.now())/86400000);
+    meta+=`<span class="${days<=7?'warn-line':''}" title="当前套餐有效期">有效期至 ${fmtDate(planEnd)}</span>`;
   }
   if(a.last_error)meta+=`<span class="err-line" title="${esc(a.last_error)}">${esc(a.last_error.length>40?a.last_error.slice(0,40)+'…':a.last_error)}</span>`;
   return `<div class="acct-row${isDisabled?' is-disabled':''}" data-id="${a.id}">
@@ -282,17 +284,32 @@ function rowHtml(a){
 function quotaCell(a){
   const q=a.quota||{};
   const keys=Object.keys(q);
-  if(!keys.length)return a.mode==='jwt'?'<span class="quota-empty">额度未获取，点右上角刷新</span>':'<span class="quota-empty">—</span>';
-  return '<div class="quota-rows">'+keys.map(k=>{
+  let rows=keys.map(k=>{
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
     const color=rem<=0?'var(--ink-mute)':(pct<15?'var(--amber)':'var(--mint)');
+    const exp=Number(w.expires_at)||0;
     return `<div class="quota-row">
       <span class="quota-row-name" title="${esc(k)}">${esc(shortModel(k))}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
-      <span class="quota-row-val">${fmtNum(rem)} / ${fmtNum(tot)}</span>
+      <span class="quota-row-val"><span>${fmtNum(rem)} / ${fmtNum(tot)}</span>${exp?`<span class="quota-row-exp" title="本窗口额度到期时间">至 ${fmtDate(exp)}</span>`:''}</span>
     </div>`;
-  }).join('')+'</div>';
+  });
+  // 已领待生效的活动套餐（plan.entitlements 里 effective_at 在未来的项）：
+  // 尚未进 balance，quota 里看不到 —— 单独渲染斜纹待生效条
+  const now=Date.now()/1000;
+  const pending=(((a.plan||{}).entitlements)||[]).filter(e=>Number(e.effective_at)>now);
+  pending.forEach(e=>{
+    const eff=Number(e.effective_at)||0;
+    const tip=`${esc((a.plan||{}).name||'')} · ${fmtDate(eff)} 起生效${(a.plan||{}).ends_at?'，套餐 '+fmtDate(a.plan.ends_at)+' 结束':''}`;
+    rows.push(`<div class="quota-row is-pending">
+      <span class="quota-row-name" title="${tip}">${esc(shortModel(e.show_name||'待生效'))}</span>
+      <span class="quota-row-track"><span class="quota-row-fill" style="width:100%"></span></span>
+      <span class="quota-row-val"><span>+${fmtNum(e.grant_units)}</span><span class="quota-row-exp" title="${tip}">${e.period==='one_time'?'一次性':'每'+(e.period||'')} · ${fmtDate(eff)} 生效</span></span>
+    </div>`);
+  });
+  if(!rows.length)return a.mode==='jwt'?'<span class="quota-empty">额度未获取，点右上角刷新</span>':'<span class="quota-empty">—</span>';
+  return '<div class="quota-rows">'+rows.join('')+'</div>';
 }
 function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,12)||n;}
 /* 万/亿 缩写（zcode-switch 同款） */

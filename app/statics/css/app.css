@@ -148,7 +148,13 @@ select.input option{background:var(--panel);color:var(--ink)}
 .quota-row-name{font-size:11px;font-weight:600;color:var(--ink-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .quota-row-track{display:block;height:6px;border-radius:999px;background:var(--panel-2);border:1px solid var(--hairline-soft);overflow:hidden}
 .quota-row-fill{display:block;height:100%;border-radius:999px;transition:width .3s}
-.quota-row-val{font-size:11px;color:var(--ink-mute);white-space:nowrap;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+.quota-row-val{font-size:11px;color:var(--ink-mute);white-space:nowrap;font-variant-numeric:tabular-nums;font-family:var(--mono);display:flex;flex-direction:column;align-items:flex-end;line-height:1.35}
+.quota-row-exp{font-size:10px;color:var(--ink-mute);opacity:.7}
+/* 已领待生效额度：斜纹流动条，与实心实额度条区分 */
+.quota-row.is-pending .quota-row-name{color:var(--ink-mute);font-weight:500}
+.quota-row.is-pending .quota-row-fill{background-image:repeating-linear-gradient(45deg,var(--amber) 0,var(--amber) 4px,transparent 4px,transparent 8px);background-size:200% 100%;opacity:.75;animation:quotaFlow 1.1s linear infinite}
+.quota-row.is-pending .quota-row-exp{color:var(--amber);opacity:.9}
+@keyframes quotaFlow{from{background-position:0 0}to{background-position:22.6px 0}}
 .quota-empty{font-size:12px;color:var(--ink-mute)}
 .quota-cell{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .q-pill{height:20px;font-size:11px;font-weight:500;padding:0 8px;border-radius:999px;display:inline-flex;align-items:center;gap:4px}
