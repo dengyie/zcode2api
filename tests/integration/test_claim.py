@@ -86,6 +86,9 @@ class TestClaim:
         assert headers.get("x-aliyun-captcha-verify-param") == "stub-verify-param"
         assert headers.get("x-aliyun-captcha-verify-region") == "sgp"
         assert headers.get("x-device-mid")  # billing 全家桶必需（否则上游 3001）
+        # 客户端 claim 头形态：缺版本/平台头即使验证码有效也 3007（实测）
+        assert headers.get("x-zcode-app-version") == "3.10.2"
+        assert headers.get("x-platform") == "darwin-arm64"
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 1
         # 领取成功后触发额度刷新

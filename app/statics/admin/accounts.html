@@ -480,7 +480,8 @@ async function openClaimModal(id){
   const sel=document.getElementById('claim-account');
   sel.innerHTML=jwtAll.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
   if(id)sel.value=id;
-  sel.onchange=()=>loadClaimPlans();
+  // 切换账号 = 换了提交主体，旧 verifyParam 作废，重做验证
+  sel.onchange=()=>{claimVerifyParam='';claimStatus('账号已切换，请重新完成人机验证');initClaimCaptcha();loadClaimPlans();};
   document.getElementById('claim-plan-id').value='';
   claimVerifyParam='';
   claimStatus('');

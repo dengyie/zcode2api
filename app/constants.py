@@ -41,14 +41,16 @@ USAGE_PATH = "/usage"
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
-# ── 客户端配置（公开、免鉴权）─────────────────────────────────────────────────
+# ── 客户端版本（单一真相源：asar 客户端 gr="3.10.2"，3.0.x 已被上游拒绝）─────
+# 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
+CLIENT_APP_VERSION = "3.10.2"
+CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
-# 上游校验 app_version（3.0.0 已 400）；实测带 platform 参数直接 3001，只带版本号
-CLIENT_CONFIGS_QUERY = "app_version=3.10.2"
+CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 # 免登录额度口径（免费 Start Plan 日额度），仅作展示参考，不参与状态机
 FREE_QUOTA = {"GLM-5.3": 3_000_000, "GLM-5-Turbo": 2_000_000}
 
-# ── 验证码默认配置（client/configs 拉取失败时的兜底）──────────────────────────
+# ── 验证码默认配置（client/configs 拉取失败时的兜底；region 实测线上为 cn）────
 CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
 
 # ── 模型名 ───────────────────────────────────────────────────────────────────
@@ -65,8 +67,9 @@ AVAILABLE_MODELS = ["GLM-5.2", "GLM-5-Turbo"]
 
 # ── 请求头 ───────────────────────────────────────────────────────────────────
 ANTHROPIC_VERSION = "2023-06-01"
-USER_AGENT = "ZCode/3.0.1"
-X_ZCODE_APP_VERSION = "3.0.1"
+USER_AGENT = f"ZCode/{CLIENT_APP_VERSION}"
+X_ZCODE_APP_VERSION = CLIENT_APP_VERSION
+X_PLATFORM = CLIENT_PLATFORM
 X_ZCODE_AGENT = "glm"
 HTTP_REFERER = "https://zcode.z.ai/"
 CAPTCHA_HEADER = "X-Aliyun-Captcha-Verify-Param"

@@ -27,6 +27,15 @@ def test_client_configs():
     assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.10.2"
 
 
+def test_client_version_single_source():
+    # asar 客户端 gr="3.10.2"；3.0.x 已被上游拒绝（configs 400 / claim 3007）
+    # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
+    assert constants.CLIENT_APP_VERSION == "3.10.2"
+    assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
+    assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
+    assert constants.X_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
+
+
 def test_captcha_defaults_match_zcode2api():
     # 实测线上 captcha region=cn（非 zcode2api 的 sgp 兜底），以线上为准
     assert constants.CAPTCHA_DEFAULTS == {
@@ -50,9 +59,8 @@ def test_rejection_signals():
 
 
 def test_identity_headers():
+    # 版本值由 test_client_version_single_source 守护，这里只断言字面量口径
     assert constants.ANTHROPIC_VERSION == "2023-06-01"
-    assert constants.USER_AGENT == "ZCode/3.0.1"
-    assert constants.X_ZCODE_APP_VERSION == "3.0.1"
     assert constants.X_ZCODE_AGENT == "glm"
     assert constants.HTTP_REFERER == "https://zcode.z.ai/"
 

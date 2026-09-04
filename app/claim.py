@@ -101,6 +101,8 @@ async def preview_plans(account: Account) -> list[dict]:
     body = await _billing_request(
         account, "GET", "/billing/preview",
         headers=_auth_headers(account),
+        # 官方客户端 preview 用 TH()（darwin-arm64 等）；此参数上游宽容，历史上写 win32 一直有效。
+        # 实测 client/configs 才拒 platform 参数。
         params={"app_version": constants.X_ZCODE_APP_VERSION, "platform": "win32"},
     )
     code = _business_code(body)
@@ -110,6 +112,45 @@ async def preview_plans(account: Account) -> list[dict]:
     plans = [parsed for parsed in (parse_plan(p) for p in raw_plans) if parsed]
     plans.sort(key=lambda p: (-p["priority"], p["plan_id"]))
     return plans
+
+
+async def _auto_pick_plan(account: Account, plan_id: str | None) -> tuple[str, str, list]:
+    """plan_id 为空时 preview 自动选优先级最高套餐。返回 (plan_id, plan_name, grants)。"""
+    if plan_id:
+        return plan_id, "", []
+    plans = await preview_plans(account)
+    if not plans:
+        raise ClaimError("没有待领取的套餐")
+    best = plans[0]
+    return best["plan_id"], best["name"] or best["plan_id"], best["grants"]
+
+
+def _claim_headers(account: Account, verify_param: str, region: str | None) -> dict:
+    """billing/claim 客户端请求头形态（asar claimManualPlan）。
+
+    实测缺版本/平台头时即使验证码有效也 3007；X-Device-Mid 由 _auth_headers 提供。
+    """
+    from .quota import _auth_headers
+
+    headers = _auth_headers(account)
+    headers[constants.CAPTCHA_HEADER] = verify_param
+    if region and region.strip():
+        headers["X-Aliyun-Captcha-Verify-Region"] = region.strip()
+    headers["X-ZCode-App-Version"] = constants.X_ZCODE_APP_VERSION
+    headers["X-Platform"] = constants.X_PLATFORM
+    return headers
+
+
+async def _post_claim(account: Account, headers: dict, plan_id: str) -> dict:
+    """提交 billing/claim 并翻译业务码。"""
+    body = await _billing_request(
+        account, "POST", "/billing/claim",
+        headers=headers, json={"plan_id": plan_id},
+    )
+    code = _business_code(body)
+    if code != 0:
+        raise ClaimError(_fail_message(code, body))
+    return body
 
 
 async def claim_with_captcha(
@@ -122,38 +163,14 @@ async def claim_with_captcha(
 
     plan_id 缺省时先 preview 自动选优先级最高套餐（无需验证码）。
     """
-    from .quota import _auth_headers
-
     if not (account.mode == "jwt" and account.jwt_token):
         raise ClaimError("仅 Coding Plan (JWT) 账号支持领取")
     if not (verify_param or "").strip():
         raise ClaimError("缺少验证码参数，请先完成人机验证")
 
-    plan_name, grants = plan_id or "", []
-    if not plan_id:
-        plans = await preview_plans(account)
-        if not plans:
-            raise ClaimError("没有待领取的套餐")
-        best = plans[0]
-        plan_id = best["plan_id"]
-        plan_name = best["name"] or plan_id
-        grants = best["grants"]
-
-    headers = _auth_headers(account)
-    headers[constants.CAPTCHA_HEADER] = verify_param.strip()
-    if region and region.strip():
-        headers["X-Aliyun-Captcha-Verify-Region"] = region.strip()
-    # 客户端 claim 请求形态（asar claimManualPlan）：带版本 + 平台头
-    headers["X-ZCode-App-Version"] = "3.10.2"
-    headers["X-Platform"] = "darwin-arm64"
-
-    body = await _billing_request(
-        account, "POST", "/billing/claim",
-        headers=headers, json={"plan_id": plan_id},
-    )
-    code = _business_code(body)
-    if code != 0:
-        raise ClaimError(_fail_message(code, body))
+    plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id or None)
+    headers = _claim_headers(account, verify_param.strip(), region)
+    await _post_claim(account, headers, plan_id)
     return {"plan_id": plan_id, "plan_name": plan_name, "grants": grants}
 
 
@@ -162,31 +179,15 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
 
     返回 {"plan_id", "plan_name", "grants"}；3007（验证码失败）自动换码重试一次。
     """
-    from .quota import _auth_headers
-
     if not (account.mode == "jwt" and account.jwt_token):
         raise ClaimError("仅 Coding Plan (JWT) 账号支持领取")
 
-    plan_name, grants = plan_id or "", []
-    if not plan_id:
-        plans = await preview_plans(account)
-        if not plans:
-            raise ClaimError("没有待领取的套餐")
-        best = plans[0]
-        plan_id = best["plan_id"]
-        plan_name = best["name"] or plan_id
-        grants = best["grants"]
-
-    base_headers = _auth_headers(account)
+    plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
     last_err: ClaimError | None = None
     for attempt in (1, 2):
         verify_param = await captcha_manager.get_verify_param()
         config = await captcha_manager.fetch_config()
-        headers = dict(base_headers)
-        headers[constants.CAPTCHA_HEADER] = verify_param
-        region = str(config.get("region") or "").strip()
-        if region:
-            headers["X-Aliyun-Captcha-Verify-Region"] = region
+        headers = _claim_headers(account, verify_param, config.get("region"))
 
         body = await _billing_request(
             account, "POST", "/billing/claim",

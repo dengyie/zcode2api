@@ -23,6 +23,7 @@ class CaptchaManager:
         self._cached: str | None = None
         self._cached_at: float = 0.0
         self._lock = asyncio.Lock()
+        self._config_lock = asyncio.Lock()
         self._config_cache: dict | None = None
         self._config_cache_at: float = 0.0
 
@@ -31,20 +32,24 @@ class CaptchaManager:
         now = time.time() * 1000
         if self._config_cache and now - self._config_cache_at < settings.CAPTCHA_CONFIG_CACHE_TTL:
             return self._config_cache
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                res = await client.get(
-                    f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
-                )
-            res.raise_for_status()
-            captcha = ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
-            if captcha:
-                self._config_cache = captcha
-                self._config_cache_at = now
-                return captcha
-        except (httpx.HTTPError, ValueError) as err:
-            logs.warn("captcha", f"获取配置失败，使用默认: {err}")
-        return dict(constants.CAPTCHA_DEFAULTS)
+        async with self._config_lock:
+            # 双检：等锁期间可能已被其他请求填充
+            if self._config_cache and time.time() * 1000 - self._config_cache_at < settings.CAPTCHA_CONFIG_CACHE_TTL:
+                return self._config_cache
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    res = await client.get(
+                        f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
+                    )
+                res.raise_for_status()
+                captcha = ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
+                if captcha:
+                    self._config_cache = captcha
+                    self._config_cache_at = time.time() * 1000
+                    return captcha
+            except (httpx.HTTPError, ValueError) as err:
+                logs.warn("captcha", f"获取配置失败，使用默认: {err}")
+            return dict(constants.CAPTCHA_DEFAULTS)
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def get_verify_param(self, port: int | None = None) -> str:
