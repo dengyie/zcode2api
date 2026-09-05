@@ -233,8 +233,13 @@ class StreamConverter:
         self.chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.finish_reason: str | None = None
-        self.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # None = 上游未上报（未知），0 = 真实为零；两者语义不同
+        self.usage = {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
         self._tool_seq = 0
+
+    def _sync_usage_total(self) -> None:
+        p, c = self.usage["prompt_tokens"], self.usage["completion_tokens"]
+        self.usage["total_tokens"] = (p or 0) + (c or 0) if p is not None or c is not None else None
 
     def start(self) -> str:
         return self._chunk({"role": "assistant", "content": ""})
@@ -252,7 +257,7 @@ class StreamConverter:
             prompt = _as_int(u.get("input_tokens"))
             if prompt is not None:
                 self.usage["prompt_tokens"] = prompt
-                self.usage["total_tokens"] = prompt + self.usage["completion_tokens"]
+                self._sync_usage_total()
             return []
         if etype == "content_block_start":
             block = evt.get("content_block") or {}
@@ -282,7 +287,7 @@ class StreamConverter:
             out = _as_int((evt.get("usage") or {}).get("output_tokens"))
             if out is not None:
                 self.usage["completion_tokens"] = out
-                self.usage["total_tokens"] = self.usage["prompt_tokens"] + out
+                self._sync_usage_total()
             chunk = self._chunk({}, finish_reason=self.finish_reason)
             return [chunk]
         return []  # content_block_stop / message_stop / ping / error 等无需产出

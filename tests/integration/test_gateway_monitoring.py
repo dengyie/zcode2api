@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 _GOOD_JWT = "hM.eyJzdWIiOiJtIn0.sig"
+_STREAM_JWT = "hS.eyJzdWIiOiJzIn0.sig"      # 流式测试独立 JWT（mock 场景序列按凭证前缀绑定）
+_OAI_STREAM_JWT = "hT.eyJzdWIiOiJ0In0.sig"
 
 ADMIN_AUTH = {"Authorization": "Bearer zcode"}  # 默认后台密钥
 
@@ -86,6 +88,42 @@ class TestMonitoringRecording:
         assert res.status_code == 404
         e = (await client.get("/admin/api/monitoring", headers=ADMIN_AUTH)).json()["entries"][0]
         assert e["ok"] is False and e["status"] == 404
+
+    async def test_messages_stream_success_recorded(self, gateway_client, fresh_app):
+        """流式透传路径流结束后也要闭环（finish_ok），tokens 未知记 None。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _STREAM_JWT, name="mon-5")
+        res = await client.post("/v1/messages", json={
+            "model": "GLM-5.3-Flash", "stream": True, "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert res.status_code == 200
+        assert "message_stop" in res.text  # 流已完整消费
+
+        e = (await client.get("/admin/api/monitoring", headers=ADMIN_AUTH)).json()["entries"][0]
+        assert e["ok"] is True and e["stream"] is True
+        assert e["t_total"] is not None and e["t_first"] is not None
+        assert e["input_tokens"] is None  # 透传不解析 SSE，未知 ≠ 0
+
+    async def test_openai_stream_tokens_recorded(self, gateway_client, fresh_app):
+        """OpenAI 流式转换器带 usage（message_delta.output_tokens）→ 记录 completion tokens。"""
+        client, _ = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _OAI_STREAM_JWT, name="mon-6")
+        res = await client.post("/v1/chat/completions", json={
+            "model": "glm-5.3-flash", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert res.status_code == 200
+        assert res.text.rstrip().endswith("data: [DONE]")
+
+        e = (await client.get("/admin/api/monitoring", headers=ADMIN_AUTH)).json()["entries"][0]
+        assert e["ok"] is True and e["endpoint"] == "chat"
+        assert e["output_tokens"] == 5  # mock message_delta 固定 output_tokens=5
+        assert e["input_tokens"] is None  # mock 无 message_start usage → 未知
 
     async def test_clear_endpoint(self, gateway_client, fresh_app):
         client, mock = gateway_client

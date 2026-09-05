@@ -55,13 +55,14 @@ def mark_account(req_id: str, account_name: str, mode: str) -> None:
 
 
 def finish_ok(req_id: str, t_first: float | None = None,
-              input_tokens: int | None = None, output_tokens: int | None = None) -> None:
+              input_tokens: int | None = None, output_tokens: int | None = None,
+              status: int | None = None) -> None:
     with _lock:
         entry = _inflight.pop(req_id, None)
         if entry is None:
             return
         entry["ok"] = True
-        entry["status"] = 200
+        entry["status"] = status or 200
         entry["t_first"] = t_first
         entry["t_total"] = time.time() - entry["ts"]
         entry["input_tokens"] = input_tokens

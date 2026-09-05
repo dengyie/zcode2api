@@ -189,12 +189,18 @@ async def messages(request: Request):
     # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
     port = request.url.port or settings.PORT
 
-    req_id = secrets.token_hex(3)
+    req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
                  bool(body.get("stream")), _last_user_text(body))
 
-    result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    try:
+        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    except asyncio.CancelledError:
+        # 客户端在调度期间断开（429 重试/验证码等待可达数分钟）——CancelError
+        # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
+        reqlog.finish_error(req_id, "客户端断开", status=499)
+        raise
     if isinstance(result, _Upstream):
         return result.to_streaming(req_id)
     return result
@@ -218,12 +224,16 @@ async def chat_completions(request: Request):
     body = _normalize_body(body)
     port = request.url.port or settings.PORT
 
-    req_id = secrets.token_hex(3)
+    req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "chat", str(body.get("model") or "-"),
                  bool(payload.get("stream")), _last_user_text(body))
 
-    result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    try:
+        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499)
+        raise
     if not isinstance(result, _Upstream):
         return result
 
@@ -234,6 +244,9 @@ async def chat_completions(request: Request):
     try:
         raw = await result.resp.aread()
         logs.req_ok(req_id)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=result.t_first)
+        raise
     except Exception as err:  # noqa: BLE001
         logs.req_err(req_id, f"读取上游响应失败: {err}")
         reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502)
@@ -245,7 +258,7 @@ async def chat_completions(request: Request):
         reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first)
         return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
     usage = data.get("usage") or {}
-    reqlog.finish_ok(req_id, t_first=result.t_first,
+    reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
                      input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
     return JSONResponse(anthropic_to_openai(data, model))
 
@@ -269,7 +282,7 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
                         yield out
             yield conv.done()
             logs.req_ok(req_id)
-            reqlog.finish_ok(req_id, t_first=up.t_first,
+            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
                              input_tokens=conv.usage.get("prompt_tokens"),
                              output_tokens=conv.usage.get("completion_tokens"))
         except asyncio.CancelledError:
@@ -339,7 +352,7 @@ class _Upstream:
                 async for chunk in up.resp.aiter_bytes():
                     yield chunk
                 logs.req_ok(req_id)
-                reqlog.finish_ok(req_id, t_first=up.t_first)
+                reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
             except asyncio.CancelledError:
                 reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
                 raise

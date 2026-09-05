@@ -68,7 +68,7 @@
 <script>
 let entries = [];
 let tab = 'live';
-const state = { range: 'today', status: 'all', q: '' };
+const state = { range: 'today', status: 'all', q: '', keep: 500 };
 let pollTimer = null;
 
 const $ = id => document.getElementById(id);
@@ -128,7 +128,7 @@ function renderStats(list){
   const ttfb=ttfbs.length?ttfbs.reduce((a,b)=>a+b,0)/ttfbs.length:null;
 
   $('s-calls').textContent=total;
-  $('s-calls-sub').textContent=`进行中 ${inflight} · 内存保留 ${KEEP} 条`;
+  $('s-calls-sub').textContent=`进行中 ${inflight} · 内存保留 ${state.keep} 条`;
   $('s-rate').textContent=total?(ok/(ok+fail||1)*100).toFixed(1)+'%':'—';
   $('s-rate-sub').textContent=`成功 ${ok}`;
   $('s-fail').textContent=fail;
@@ -236,14 +236,18 @@ function onStatus(v){state.status=v;render();}
 async function load(){
   const res=await api('GET','/monitoring');
   entries=res.entries||[];
-  window.KEEP=res.keep||500;
+  state.keep=res.keep||500;
   render();
 }
 function doRefresh(){load().catch(()=>showToast('加载失败','error'));}
 async function doClear(){
-  await api('POST','/monitoring/clear');
-  showToast('已清空','success');
-  load();
+  try{
+    await api('POST','/monitoring/clear');
+    showToast('已清空','success');
+    await load();
+  }catch{
+    showToast('清空失败','error');
+  }
 }
 
 (async()=>{
