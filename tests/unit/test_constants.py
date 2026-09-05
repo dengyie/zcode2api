@@ -36,6 +36,17 @@ def test_client_version_single_source():
     assert constants.X_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
 
 
+def test_billing_version_and_activation():
+    # zcode-switch v1.5.4 实证（2026-09-06 移植）：billing 族用官方现行版 3.11.2，
+    # 与 messages 指纹 CLIENT_APP_VERSION（已真机验证）刻意分离
+    assert constants.BILLING_APP_VERSION == "3.11.2"
+    assert constants.BILLING_TITLE == "Z Code@electron"
+    assert constants.BILLING_RELEASE_CHANNEL == "stable"
+    assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"
+    assert constants.ACTIVATION_ELEMENTS == ("app_launch", "app_daily_active")
+    assert constants.ACTIVATION_SCREEN_RESOLUTION == "2560x1440"
+
+
 def test_captcha_defaults_match_zcode2api():
     # 实测线上 captcha region=cn（非 zcode2api 的 sgp 兜底），以线上为准
     assert constants.CAPTCHA_DEFAULTS == {

@@ -93,6 +93,8 @@ UPSTREAM = {
 
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
+# 激活事件上报（测试时指向 Mock 上游）
+ZCODE_EVENT_REPORT_URL = os.getenv("ZCODE_EVENT_REPORT_URL", constants.EVENT_REPORT_URL)
 
 # OAuth 与兑换链 origin（测试时指向 Mock 上游）
 OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/api/v1")

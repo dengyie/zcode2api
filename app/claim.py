@@ -12,6 +12,10 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import uuid
+
 import httpx
 
 from . import constants, logs, settings
@@ -94,6 +98,74 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
     return body
 
 
+def jwt_user_id(account: Account) -> str | None:
+    """JWT payload 的 user_id（zcode-switch telemetry_user_id 同源语义）。
+
+    官方客户端事件上报以 user_id 标识用户；hub 不存 user_info，直接从 JWT
+    解出（user_id 优先，sub 兜底，两者同为 36 位 uuid）。
+    """
+    token = (account.jwt_token or "").strip()
+    if not token:
+        return None
+    try:
+        seg = token.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)))
+    except (IndexError, ValueError):
+        return None
+    uid = payload.get("user_id") or payload.get("sub")
+    if not isinstance(uid, str) or not uid.strip():
+        return None
+    return uid.strip()
+
+
+async def report_activation_events(account: Account) -> str | None:
+    """上报官方客户端激活事件（app_launch + app_daily_active），返回错误或 None。
+
+    zcode-switch claim_refresh 同形：preview 前模拟桌面端当日活跃（疑似活动
+    套餐投放资格信号）。请求无 Authorization（上游事件端点不校验）；任何失败
+    仅返回文案，不阻断 preview。
+    """
+    from .quota import device_mid
+
+    user_id = jwt_user_id(account)
+    if not user_id:
+        return "JWT 无 user_id，跳过激活上报"
+    headers = {"Content-Type": "application/json"}
+    for element in constants.ACTIVATION_ELEMENTS:
+        body = {
+            "event_id": str(uuid.uuid4()),
+            "client_timezone": constants.IDENTITY_CLIENT_TIMEZONE,
+            "client_language": constants.IDENTITY_CLIENT_LANGUAGE,
+            "element_name": element,
+            "event_region": "app",
+            "event_type": "view",
+            "event_text": "",
+            "event_extra_detail": {},
+            "user_id": user_id,
+            "screen_resolution": constants.ACTIVATION_SCREEN_RESOLUTION,
+            "app_version": constants.BILLING_APP_VERSION,
+            "device_os_category": constants.IDENTITY_OS_CATEGORY,
+            "device_os_version": constants.IDENTITY_OS_VERSION,
+            "device_mid": device_mid(),
+            "mac_id": "",
+            "marketing_params": "{}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.post(settings.ZCODE_EVENT_REPORT_URL,
+                                        headers=headers, json=body)
+        except httpx.HTTPError as err:
+            return f"激活事件 {element} 请求失败: {err}"
+        if res.status_code >= 400:
+            return f"激活事件 {element} HTTP {res.status_code}"
+        try:
+            if int(res.json().get("code", -1)) != 0:
+                return f"激活事件 {element} 上游拒绝: {res.text[:120]}"
+        except ValueError:
+            return f"激活事件 {element} 响应非 JSON"
+    return None
+
+
 async def preview_plans(account: Account) -> list[dict]:
     """拉取账号当前可领取套餐，按优先级降序。"""
     from .quota import _auth_headers
@@ -101,9 +173,10 @@ async def preview_plans(account: Account) -> list[dict]:
     body = await _billing_request(
         account, "GET", "/billing/preview",
         headers=_auth_headers(account),
-        # 官方客户端 preview 用 TH()（darwin-arm64 等）；此参数上游宽容，历史上写 win32 一直有效。
+        # 官方客户端 preview 用 TH()（darwin-arm64 等）；platform 参数上游宽容。
         # 实测 client/configs 才拒 platform 参数。
-        params={"app_version": constants.X_ZCODE_APP_VERSION, "platform": "win32"},
+        params={"app_version": constants.BILLING_APP_VERSION,
+                "platform": constants.CLIENT_PLATFORM},
     )
     code = _business_code(body)
     if code != 0:
@@ -136,7 +209,9 @@ def _claim_headers(account: Account, verify_param: str, region: str | None) -> d
     headers[constants.CAPTCHA_HEADER] = verify_param
     if region and region.strip():
         headers["X-Aliyun-Captcha-Verify-Region"] = region.strip()
-    headers["X-ZCode-App-Version"] = constants.X_ZCODE_APP_VERSION
+    # 实测缺版本/平台头时即使验证码有效也 3007（_auth_headers 已带，此处显式
+    # 兜底防止基座头漂移）
+    headers["X-ZCode-App-Version"] = constants.BILLING_APP_VERSION
     headers["X-Platform"] = constants.X_PLATFORM
     return headers
 

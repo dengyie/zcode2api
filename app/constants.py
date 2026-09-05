@@ -48,6 +48,21 @@ CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务�
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 
+# ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
+# billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
+# 现行版 3.11.2（zcode-switch 会读本机真实客户端版本，兜底即此值）；与 messages
+# 指纹 CLIENT_APP_VERSION=3.10.2（已真机验证 200）刻意分离，不动对话指纹。
+BILLING_APP_VERSION = "3.11.2"
+BILLING_TITLE = "Z Code@electron"        # zcode-switch billing 头实证形态
+BILLING_RELEASE_CHANNEL = "stable"
+# 官方客户端每日活跃事件：POST /api/v1/event/report（不在 zcode-plan 下、无
+# Authorization）。zcode-switch claim_refresh 在 preview 前上报 app_launch +
+# app_daily_active —— 疑似活动套餐投放的资格信号（官方客户端可见活动而纯
+# billing 轮询号 preview 为空的差异点）。
+EVENT_REPORT_URL = f"{ZCODE_ORIGIN}/api/v1/event/report"
+ACTIVATION_ELEMENTS = ("app_launch", "app_daily_active")
+ACTIVATION_SCREEN_RESOLUTION = "2560x1440"
+
 # ── 验证码默认配置（client/configs 拉取失败时的兜底；region 实测线上为 cn）────
 CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
 

@@ -9,7 +9,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 
 from .. import reqlog
 from ..auth_admin import verify_admin_key
-from ..claim import ClaimError, claim_with_captcha, preview_plans
+from ..claim import ClaimError, claim_with_captcha, preview_plans, report_activation_events
 from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
@@ -264,21 +264,34 @@ def _jwt_accounts(account_ids: list[str] | None) -> list:
 
 @router.get("/claim/preview")
 async def claim_preview(account_id: str | None = None):
-    """立即拉取可领取套餐（全部/单个 JWT 账号）。"""
+    """立即拉取可领取套餐（全部/单个 JWT 账号）。
+
+    先上报激活事件（zcode-switch claim_refresh 同形，模拟官方客户端当日活跃；
+    疑似活动投放资格信号），上报失败不阻断 preview。
+    """
     ids = [account_id] if account_id else None
     out = []
     for acc in _jwt_accounts(ids):
         if acc.is_cooling():
             out.append({"account_id": acc.id, "account_name": acc.name,
-                        "plans": [], "error": "账号冷却中（风控/限流），已跳过上游查询"})
+                        "plans": [], "error": "账号冷却中（风控/限流），已跳过上游查询",
+                        "activated": False, "activation_error": None})
             continue
+        try:
+            activation_error = await report_activation_events(acc)
+        except Exception as err:  # noqa: BLE001 - 上报失败不阻断 preview
+            activation_error = str(err)
         try:
             plans = await preview_plans(acc)
             out.append({"account_id": acc.id, "account_name": acc.name,
-                        "plans": plans, "error": None})
+                        "plans": plans, "error": None,
+                        "activated": activation_error is None,
+                        "activation_error": activation_error})
         except ClaimError as err:
             out.append({"account_id": acc.id, "account_name": acc.name,
-                        "plans": [], "error": str(err)})
+                        "plans": [], "error": str(err),
+                        "activated": activation_error is None,
+                        "activation_error": activation_error})
     return {"preview": out}
 
 

@@ -87,7 +87,7 @@ class TestClaim:
         assert headers.get("x-aliyun-captcha-verify-region") == "sgp"
         assert headers.get("x-device-mid")  # billing 全家桶必需（否则上游 3001）
         # 客户端 claim 头形态：缺版本/平台头即使验证码有效也 3007（实测）
-        assert headers.get("x-zcode-app-version") == "3.10.2"
+        assert headers.get("x-zcode-app-version") == "3.11.2"  # BILLING_APP_VERSION
         assert headers.get("x-platform") == "darwin-arm64"
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 1
@@ -116,6 +116,63 @@ class TestClaim:
         assert stub.solve_count == 2
         assert stub.invalidated == 1
         assert res.json()["summary"] == {"ok": 0, "fail": 1}
+
+    async def test_preview_reports_activation_events(self, claim_env):
+        """preview 前上报 app_launch + app_daily_active（zcode-switch 同形）。"""
+        import json as _json
+
+        client, mock, _stub, _acc = claim_env
+        mock.state.calls.clear()  # session 级 mock，只看本用例的上游调用
+        res = await client.get("/admin/api/claim/preview",
+                               headers={"Authorization": "Bearer zcode"})
+        entry = res.json()["preview"][0]
+        assert entry["activated"] is True
+        assert entry["activation_error"] is None
+
+        events = [(h, b) for m, p, h, b in mock.state.calls if p == "/api/v1/event/report"]
+        assert len(events) == 2
+        names = [_json.loads(b)["element_name"] for _h, b in events]
+        assert names == ["app_launch", "app_daily_active"]
+        _h, body = events[0]
+        body = _json.loads(body)
+        # user_id 来自 JWT payload（GOOD_JWT sub="a" 兜底）；无 Authorization 头
+        assert body["user_id"] == "a"
+        assert body["app_version"] == "3.11.2"
+        assert body["device_mid"]
+        assert body["screen_resolution"] == "2560x1440"
+        assert body["event_region"] == "app" and body["event_type"] == "view"
+        assert events[0][0].get("authorization") is None
+
+    async def test_billing_headers_aligned_on_preview(self, claim_env):
+        """billing 请求头对齐 zcode-switch 实证形态（版本/标题/渠道/追踪头）。"""
+        client, mock, _stub, _acc = claim_env
+        mock.state.calls.clear()
+        await client.get("/admin/api/claim/preview",
+                         headers={"Authorization": "Bearer zcode"})
+        preview_calls = [c for c in mock.state.calls
+                         if c[1].endswith("/billing/preview")]
+        assert preview_calls
+        h = preview_calls[-1][2]
+        assert h.get("user-agent") == "ZCode/3.11.2"
+        assert h.get("x-zcode-app-version") == "3.11.2"
+        assert h.get("x-title") == "Z Code@electron"
+        assert h.get("x-release-channel") == "stable"
+        assert h.get("x-client-language") == "zh-CN"
+        assert h.get("x-os-category") == "macos"
+        assert h.get("x-request-id")
+
+    async def test_activation_failure_does_not_block_preview(self, claim_env):
+        """激活上报失败只标记 activated=False，preview 照常返回。"""
+        client, mock, _stub, _acc = claim_env
+        mock.state.calls.clear()
+        mock.state.event_report_fail = "down"
+        res = await client.get("/admin/api/claim/preview",
+                               headers={"Authorization": "Bearer zcode"})
+        entry = res.json()["preview"][0]
+        assert entry["activated"] is False
+        assert "HTTP 500" in entry["activation_error"]
+        assert entry["error"] is None
+        assert entry["plans"], "preview 未被激活上报失败阻断"
 
     async def test_claim_already_claimed_no_retry(self, claim_env):
         client, mock, stub, acc = claim_env
@@ -180,7 +237,7 @@ class TestManualClaim:
         assert headers.get("x-aliyun-captcha-verify-param") == "browser-slider-param"
         assert headers.get("x-aliyun-captcha-verify-region") == "cn"
         assert headers.get("x-device-mid")
-        assert headers.get("x-zcode-app-version") == "3.10.2"  # 客户端 claim 头形态
+        assert headers.get("x-zcode-app-version") == "3.11.2"  # 客户端 claim 头形态
         assert headers.get("x-platform") == "darwin-arm64"
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 0

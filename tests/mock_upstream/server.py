@@ -269,6 +269,15 @@ def build_app() -> FastAPI:
             }}},
         }), media_type="application/json")
 
+    async def _event_report(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        body = await request.body()
+        _record("POST", request.url.path, headers, body)
+        if getattr(app.state, "event_report_fail", None):
+            return Response(json.dumps({"code": -1, "msg": app.state.event_report_fail}),
+                            status=500, media_type="application/json")
+        return Response(json.dumps({"code": 0}), media_type="application/json")
+
     # ── 套餐领取（claim）───────────────────────────────────────────────────
     _CLAIM_PLAN = {
         "plan_id": "mock-claim-plan",
@@ -402,6 +411,7 @@ def build_app() -> FastAPI:
     app.post("/api/v1/zcode-plan/billing/claim")(_billing_claim)
     app.get("/api/v1/zcode-plan/usage")(_usage)
     app.get("/api/v1/client/configs")(_client_configs)
+    app.post("/api/v1/event/report")(_event_report)
 
     return app
 
