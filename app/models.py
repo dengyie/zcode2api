@@ -40,7 +40,8 @@ class Account:
 
     # 额度快照：{ model_show_name: {total, used, remaining, expires_at} }
     quota: dict = field(default_factory=dict)
-    plan: dict = field(default_factory=dict)        # 当前激活方案
+    plan: dict = field(default_factory=dict)        # 当前激活方案（billing/current plans[0]，兼容保留）
+    plans: list = field(default_factory=list)       # 全部方案（上游 plans 数组；多套餐时 entitlements 不丢）
     usage: dict = field(default_factory=dict)       # 近期用量原始数据
 
     use_count: int = 0
@@ -129,6 +130,7 @@ class Account:
             "status": self.effective_status(),
             "quota": self.quota,
             "plan": self.plan,
+            "plans": self.plans,
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "risk_strikes": self.risk_strikes,

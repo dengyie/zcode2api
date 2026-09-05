@@ -57,6 +57,21 @@ def _auth_headers(account: Account) -> dict:
     return headers
 
 
+def _bonus_active(plan: dict, now: float) -> bool:
+    """plan 是否带有已生效的一次性赠送授权（balance 不含这类额度）。
+
+    用于额度耗尽判定：日窗口用完但赠送池有效时，账号仍有真实可用额度。
+    """
+    for e in (plan or {}).get("entitlements") or []:
+        if e.get("period") != "one_time":
+            continue
+        eff = e.get("effective_at") or 0
+        ends = e.get("ends_at") or e.get("expires_at") or 0
+        if eff and eff <= now and (not ends or now <= ends):
+            return True
+    return False
+
+
 async def fetch_quota(account: Account) -> dict:
     """拉取单个账号的 方案 / 余额 / 用量，写回账号状态并持久化。
 
@@ -96,6 +111,8 @@ async def fetch_quota(account: Account) -> dict:
             data = billing_res.json()
             result["billing"] = data
             plans = (data.get("data") or {}).get("plans") or []
+            # 全量保留（多套餐时 entitlements 不丢）；plan 兼容保留首个
+            account.plans = plans
             account.plan = plans[0] if plans else {}
         except (ValueError, KeyError):
             pass
@@ -107,12 +124,21 @@ async def fetch_quota(account: Account) -> dict:
             result["balance"] = data
             for bal in (data.get("data") or {}).get("balances") or []:
                 name = bal.get("show_name") or bal.get("model") or "model"
-                quota_map[name] = {
+                window = {
                     "total": bal.get("total_units"),
                     "used": bal.get("used_units"),
                     "remaining": bal.get("remaining_units"),
                     "expires_at": bal.get("expires_at"),
                 }
+                prev = quota_map.get(name)
+                if prev:
+                    # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者
+                    for k in ("total", "used", "remaining"):
+                        prev[k] = (prev.get(k) or 0) + (window.get(k) or 0)
+                    prev["expires_at"] = max(prev.get("expires_at") or 0, window.get("expires_at") or 0)
+                    logs.warn("quota", f"balance 同名窗口 {name} 已合并")
+                else:
+                    quota_map[name] = window
         except (ValueError, KeyError):
             pass
 
@@ -125,16 +151,25 @@ async def fetch_quota(account: Account) -> dict:
 
     if quota_map:
         account.quota = quota_map
-        # 额度用完判定：所有模型剩余 <= 0
+        # 额度耗尽判定：所有日窗口剩余 <= 0。注意 balance 不含一次性赠送池——
+        # 赠送池有效时不判耗尽，否则账号会被路由跳过而实际仍有 3 亿级可用额度
+        now = time.time()
         remainings = [
             q.get("remaining") for q in quota_map.values() if q.get("remaining") is not None
         ]
-        if remainings and all((r or 0) <= 0 for r in remainings):
+        daily_exhausted = bool(remainings) and all((r or 0) <= 0 for r in remainings)
+        has_bonus = _bonus_active(account.plan, now) or any(
+            _bonus_active(p, now) for p in account.plans
+        )
+        has_daily = bool(remainings) and any((r or 0) > 0 for r in remainings)
+        if daily_exhausted and not has_bonus:
             account.status = Status.EXHAUSTED
             account.last_error = "额度已用完"
-        elif account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID):
-            # 额度恢复 → 重新激活。风控冷却例外：冷却期内不该有 billing 流量
-            # （monitor 已跳过），此处兜底不再提前解除，按 cooling_until 自然到期。
+        elif account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID) and (
+            has_daily or has_bonus
+        ):
+            # 额度恢复（窗口重置 / 赠送池生效）→ 重新激活。风控冷却例外：冷却期内
+            # 不该有 billing 流量（monitor 已跳过），此处兜底不再提前解除
             if not account.is_cooling():
                 account.status = Status.ACTIVE
                 account.last_error = None
