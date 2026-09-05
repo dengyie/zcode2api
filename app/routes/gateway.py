@@ -344,7 +344,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
     captcha_retries = 0
     retries_429 = 0
     retries_5xx = 0
+    model_name = str(body.get("model") or "-")
     while True:
+        attempt_t0 = time.time()
         verify_param = verify_region = None
         if needs_captcha:
             try:
@@ -359,6 +361,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         try:
             url, headers, payload = build_request(account, body, verify_param, incoming_headers, verify_region)
         except RuntimeError as err:
+            account.record_result(False, f"凭证无效: {err}")
             _mark(account, Status.INVALID, str(err))
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
@@ -369,7 +372,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             resp = await cm.__aenter__()
         except httpx.HTTPError as err:
             await client.aclose()
-            account.record_result(False)
+            account.record_result(False, f"连接失败: {err}")
             _mark(account, Status.COOLING, f"连接失败: {err}")
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
             return _NEXT_ACCOUNT
@@ -387,6 +390,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 captcha_manager.invalidate()
                 captcha_retries += 1
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
+                    account.record_result(False, "验证码挑战连续失败")
                     logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
                     return _NEXT_ACCOUNT
                 logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
@@ -395,6 +399,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             # 风控（3012「unusual activity」/ 405）：真封禁 → 禁用账号，人工恢复。
             # 必须先于 exhausted/其它错误判定，且不再重试（避免对封禁账号持续施压）。
             if _is_risk_control(status_code, text):
+                account.record_result(False, f"风控封禁 HTTP {status_code}（3012/unusual activity）")
                 account.ban_for_risk()
                 account.last_error = (
                     f"风控封禁 (3012/unusual activity) HTTP {status_code}，"
@@ -409,18 +414,21 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 return _NEXT_ACCOUNT
 
             if _is_exhausted(status_code, text):
+                account.record_result(False, f"额度用完 HTTP {status_code}")
                 _mark(account, Status.EXHAUSTED, "额度已用完")
                 logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
                 asyncio.create_task(_safe_refresh(account))
                 return _NEXT_ACCOUNT
 
             if status_code == 401:
+                account.record_result(False, "鉴权失败 HTTP 401")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切换下一个")
                 return _NEXT_ACCOUNT
 
             if status_code == 403:
                 # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
+                account.record_result(False, "鉴权失败 HTTP 403")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切换下一个")
                 return _NEXT_ACCOUNT
@@ -437,6 +445,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     )
                     await asyncio.sleep(wait)
                     continue
+                account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
                 logs.warn(
                     req_id,
                     f"账号 {account.name} 429 重试 {settings.RETRY_429_TIMES} 次耗尽，"
@@ -459,6 +468,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 account.status = Status.COOLING
                 account.cooling_until = time.time() + cool
                 account.last_error = f"上游 HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却"
+                account.record_result(False, f"HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却")
                 store.update_account(account)
                 logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，冷却 {cool}s，切换下一个")
                 return _NEXT_ACCOUNT
@@ -466,7 +476,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             # 其它 4xx：直接回传客户端；响应体全量落日志供排查
             # （错误 JSON 通常很小；防御性上限 4KB，超长按 HTML 类 WAF 页处理只留头部）
             account.fail_count += 1
-            account.record_result(False)
+            account.record_result(False, f"HTTP {status_code}: {text[:120]}".replace("\n", " "))
             store.update_account(account)
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
             body_log = text if len(text) <= 4000 else text[:4000] + f"...(共 {len(text)} 字节，疑似 WAF 页)"
@@ -479,7 +489,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # 成功：记录用量并把打开的上游流交给调用方
         account.use_count += 1
         account.last_used_at = time.time()
-        account.record_result(True)
+        account.record_result(True, f"HTTP 200 · {model_name} · {time.time() - attempt_t0:.1f}s")
         account.risk_strikes = 0  # 成功即清零封禁计数
         account.last_error = None
         account.cooling_until = None

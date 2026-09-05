@@ -274,7 +274,14 @@ function statusCell(a){
 function tickbarHtml(a){
   const r=(a.recent_results||[]).slice(-20);
   if(!r.length)return '<div class="tickbar-empty">—</div>';
-  return `<div class="tickbar" title="最近 ${r.length} 次请求结果（绿=成功 红=失败）">${r.map(ok=>`<i class="${ok?'ok':'bad'}"></i>`).join('')}</div>`;
+  // 条目兼容两种形态：明细对象 {ok,at,detail}（新）与纯布尔（历史遗留）
+  return `<div class="tickbar" title="最近 ${r.length} 次请求结果（悬停单格看明细）">${r.map(e=>{
+    const ok=typeof e==='object'?e.ok:!!e;
+    let tip;
+    if(typeof e==='object') tip=`${ok?'✓ 成功':'✗ 失败'} · ${fmtDateSec(e.at)}\n${e.detail||''}`;
+    else tip=ok?'✓ 成功（历史记录，无明细）':'✗ 失败（历史记录，无明细）';
+    return `<i class="${ok?'ok':'bad'}" title="${tip.replace(/"/g,'&quot;')}"></i>`;
+  }).join('')}</div>`;
 }
 
 function usageCell(a){

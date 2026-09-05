@@ -80,9 +80,14 @@ class Account:
         self.status = Status.DISABLED
         self.cooling_until = None
 
-    def record_result(self, ok: bool, keep: int = 20) -> None:
-        """记录单次请求结果（用于后台「最近请求」tick 可视化），只保留最近 keep 条。"""
-        self.recent_results = (self.recent_results + [bool(ok)])[-keep:]
+    def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
+        """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。
+
+        条目形如 {"ok": bool, "at": epoch 秒, "detail": 文案}；历史遗留的纯布尔条目
+        由前端兼容渲染。
+        """
+        entry = {"ok": bool(ok), "at": time.time(), "detail": str(detail or ("成功" if ok else "失败"))}
+        self.recent_results = (self.recent_results + [entry])[-keep:]
 
     def is_selectable(self, now: float | None = None) -> bool:
         """是否可被轮询选中。"""

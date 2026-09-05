@@ -32,6 +32,11 @@ class TestChatCompletions:
         assert data["choices"][0]["message"]["content"] == "Hello from mock upstream"
         assert data["choices"][0]["finish_reason"] == "stop"
         assert data["usage"]["prompt_tokens"] == 10
+        # 最近请求明细：{ok, at, detail} 形态，悬停 tooltip 数据源
+        acc = next(a for a in fresh_app.list_accounts("zai") if a.name == "oai")
+        last = acc.recent_results[-1]
+        assert isinstance(last, dict) and last["ok"] is True
+        assert "HTTP 200" in last["detail"] and last["at"] > 0
 
     async def test_system_message_reaches_upstream_as_system(self, gateway_client, fresh_app):
         client, mock = gateway_client
