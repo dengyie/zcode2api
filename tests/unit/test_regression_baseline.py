@@ -224,7 +224,7 @@ class TestGatewayHTTP:
         res = await client.get("/v1/models")
         assert res.status_code == 200
         ids = [m["id"] for m in res.json()["data"]]
-        assert ids == ["GLM-5.2", "GLM-5-Turbo"]
+        assert ids == ["GLM-5.3-Flash", "GLM-5.3"]
 
     async def test_messages_ok(self, gateway_client):
         client, upstream = gateway_client

@@ -48,7 +48,8 @@ CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务�
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 # 免登录额度口径（免费 Start Plan 日额度），仅作展示参考，不参与状态机
-FREE_QUOTA = {"GLM-5.3": 3_000_000, "GLM-5-Turbo": 2_000_000}
+# （2026-09-05 实测 start-plan-wk：GLM-5.3-Flash 日窗 500 万 + GLM-5.3 窗 300 万）
+FREE_QUOTA = {"GLM-5.3-Flash": 5_000_000, "GLM-5.3": 3_000_000}
 
 # ── 验证码默认配置（client/configs 拉取失败时的兜底；region 实测线上为 cn）────
 CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
@@ -56,14 +57,17 @@ CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneI
 # ── 模型名 ───────────────────────────────────────────────────────────────────
 # Z.AI 上游模型名大小写敏感；客户端传小写别名时映射到官方名（gateway.MODEL_NAME_MAP）
 MODEL_NAME_MAP = {
+    "glm-5.3-flash": "GLM-5.3-Flash",
+    "glm-5.3": "GLM-5.3",
     "glm-5.2": "GLM-5.2",
     "glm-5-turbo": "GLM-5-Turbo",
     "glm-turbo": "GLM-5-Turbo",
     "glm-5.1": "GLM-5.1",
     "glm-4.7": "GLM-4.7",
 }
-# /v1/models 对外公布
-AVAILABLE_MODELS = ["GLM-5.2", "GLM-5-Turbo"]
+# /v1/models 对外公布（2026-09-05 实测：当前账号套餐不含 GLM-5.2/5-Turbo，
+# 上游 3006 model not allowed；按账号实际余额窗口公布）
+AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
 
 # ── 请求头 ───────────────────────────────────────────────────────────────────
 ANTHROPIC_VERSION = "2023-06-01"
