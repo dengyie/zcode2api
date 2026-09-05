@@ -242,6 +242,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             resp = await cm.__aenter__()
         except httpx.HTTPError as err:
             await client.aclose()
+            account.record_result(False)
             _mark(account, Status.COOLING, f"连接失败: {err}")
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
             return _NEXT_ACCOUNT
@@ -337,6 +338,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
 
             # 其它 4xx：直接回传客户端
             account.fail_count += 1
+            account.record_result(False)
             store.update_account(account)
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
             return JSONResponse(
@@ -347,6 +349,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # 成功：记录用量并流式透传
         account.use_count += 1
         account.last_used_at = time.time()
+        account.record_result(True)
         account.risk_strikes = 0  # 成功即清零封禁计数
         account.last_error = None
         account.cooling_until = None

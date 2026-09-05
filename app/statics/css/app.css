@@ -104,24 +104,49 @@ select.input option{background:var(--panel);color:var(--ink)}
 .stat-icon svg{width:15px;height:15px;stroke:currentColor;fill:none}
 .stat-num{font-family:var(--mono);font-size:22px;font-weight:600;line-height:1;letter-spacing:-.02em;margin-top:auto}
 
-/* ── 账号行（Z·SWITCH 卡片行风格）── */
-.acct-list{display:flex;flex-direction:column;gap:10px}
-.acct-row{position:relative;overflow:hidden;border:1px solid var(--hairline-soft);border-radius:10px;background:var(--panel);transition:border-color .15s}
+/* ── 账号池列表（CPA-Manager-Plus 风格 6 列表格：凭证/状态/最近请求/用量/额度/操作）── */
+.acct-scroll{overflow-x:auto}
+.acct-table{display:flex;flex-direction:column;gap:8px;min-width:1020px}
+.acct-head,.acct-row{display:grid;grid-template-columns:minmax(180px,1.15fr) 150px 150px 150px minmax(240px,1.5fr) 176px;gap:14px;align-items:center}
+.acct-head{padding:0 16px;font-size:11px;font-weight:600;color:var(--ink-mute);letter-spacing:.03em}
+.acct-head .th-actions{text-align:right}
+.acct-row{border:1px solid var(--hairline-soft);border-radius:10px;background:var(--panel);padding:12px 16px;transition:border-color .15s}
 .acct-row:hover{border-color:#353943}
 .acct-row.is-disabled{opacity:.55}
-.acct-row-top{display:flex;align-items:flex-start;gap:12px;padding:13px 16px 11px 18px}
-.notch{flex:none;width:4px;height:38px;border-radius:4px;margin-top:3px}
-.acct-main{flex:1;min-width:0}
-.acct-name-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.acct-name{font-size:15px;font-weight:600;color:var(--ink)}
-.acct-meta{margin-top:2px;font-size:12px;color:var(--ink-mute);display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.acct-meta .warn-line{color:var(--amber)}
-.acct-meta .err-line{color:var(--red)}
-.acct-meta .cool-line{color:var(--amber);opacity:.85}
-.tok{font-family:var(--mono);font-size:11.5px;color:var(--ink-mute)}
+.notch{flex:none;width:8px;height:8px;border-radius:2px}
+.acct-name-line{display:flex;align-items:center;gap:8px;min-width:0}
+.acct-name{font-size:14px;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cred-sub{margin-top:2px;font-size:11.5px;color:var(--ink-mute);display:flex;align-items:center;gap:6px;min-width:0;overflow:hidden}
+.cell-sub{margin-top:4px;font-size:11px;color:var(--ink-mute);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cell-sub.err-line{color:var(--red)}
+.cell-sub.warn-line{color:var(--amber)}
+.cool-line{color:var(--amber);opacity:.9}
+.tok{font-family:var(--mono);font-size:11px;color:var(--ink-mute)}
 .no-cfg{color:var(--red);font-size:11px}
-.acct-actions{display:flex;align-items:center;gap:4px;flex:none}
-.acct-quota{padding:2px 18px 13px 34px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 22px}
+.recent-ts{font-family:var(--mono);font-size:11.5px;color:var(--ink-dim);font-variant-numeric:tabular-nums;margin-bottom:5px}
+/* 最近请求 tick 条：绿=成功 红=失败，最新在末尾 */
+.tickbar{display:flex;gap:3px;align-items:flex-end;height:14px}
+.tickbar i{display:block;width:4px;height:14px;border-radius:1.5px}
+.tickbar i.ok{background:var(--mint);opacity:.75}
+.tickbar i.bad{background:var(--red)}
+.tickbar-empty{font-size:11px;color:var(--ink-mute)}
+/* 历史用量两行小指标 */
+.usage-mini{display:flex;flex-direction:column;gap:3px}
+.usage-line{display:flex;align-items:center;gap:6px;font-size:11px;white-space:nowrap}
+.u-label{color:var(--ink-mute)}
+.u-val{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--ink-dim);font-variant-numeric:tabular-nums}
+.u-val.u-ok{color:var(--mint)}
+.u-val.u-warn{color:var(--amber)}
+.u-val.u-bad{color:var(--red)}
+/* 操作列：图标按钮 + 启停开关 */
+.acct-actions{display:flex;align-items:center;gap:2px;justify-content:flex-end;flex-wrap:wrap}
+.acct-actions .switch{margin-left:4px}
+.switch{position:relative;display:inline-block;width:34px;height:19px;cursor:pointer;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.switch-slider{position:absolute;inset:0;border-radius:999px;background:var(--panel-2);border:1px solid var(--hairline);transition:background .15s,border-color .15s}
+.switch-slider::before{content:"";position:absolute;width:13px;height:13px;left:2px;top:2px;border-radius:999px;background:var(--ink-mute);transition:transform .15s,background .15s}
+.switch input:checked+.switch-slider{background:rgba(98,195,112,.25);border-color:rgba(98,195,112,.4)}
+.switch input:checked+.switch-slider::before{transform:translateX(15px);background:var(--mint)}
 .tag-use{display:inline-flex;align-items:center;height:18px;padding:0 8px;border-radius:999px;font-size:10.5px;font-weight:600;background:rgba(232,163,61,.14);color:var(--amber);letter-spacing:.04em}
 
 /* Tier 徽章 */
@@ -143,11 +168,11 @@ select.input option{background:var(--panel);color:var(--ink)}
 .badge-jwt{color:#6da8e8;background:rgba(109,168,232,.12)}
 .badge-apiKey{color:var(--ink-dim);background:var(--panel-2)}
 
-/* Quota 行内条 */
-.quota-rows{display:flex;flex-direction:column;gap:7px;min-width:180px}
-.quota-row{display:grid;grid-template-columns:72px minmax(60px,1fr) auto;align-items:center;gap:10px}
+/* Quota 行内条（额度列内紧凑版） */
+.quota-rows{display:flex;flex-direction:column;gap:5px;min-width:0}
+.quota-row{display:grid;grid-template-columns:64px minmax(50px,1fr) auto;align-items:center;gap:8px}
 .quota-row-name{font-size:11px;font-weight:600;color:var(--ink-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.quota-row-track{display:block;height:6px;border-radius:999px;background:var(--panel-2);border:1px solid var(--hairline-soft);overflow:hidden}
+.quota-row-track{display:block;height:5px;border-radius:999px;background:var(--panel-2);border:1px solid var(--hairline-soft);overflow:hidden}
 .quota-row-fill{display:block;height:100%;border-radius:999px;transition:width .3s}
 .quota-row-val{font-size:11px;color:var(--ink-mute);white-space:nowrap;font-variant-numeric:tabular-nums;font-family:var(--mono);display:flex;flex-direction:column;align-items:flex-end;line-height:1.35}
 .quota-row-exp{font-size:10px;color:var(--ink-mute);opacity:.7}
@@ -224,6 +249,6 @@ select.input option{background:var(--panel);color:var(--ink)}
   .admin-header-inner{padding:0 14px}
   .admin-main{padding:74px 14px 24px}
   .admin-nav-link{padding:6px 10px;font-size:13px}
-  .acct-quota{padding:2px 14px 13px 26px;grid-template-columns:1fr}
-  .acct-row-top{flex-wrap:wrap}
+  .acct-row{grid-template-columns:minmax(150px,1fr) 130px;gap:10px}
+  .cell.quota{grid-column:1 / -1}
 }

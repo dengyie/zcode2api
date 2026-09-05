@@ -224,10 +224,13 @@ function renderList(){
   document.getElementById('tbl-count').textContent=items.length;
   const el=document.getElementById('acct-list');
   if(!items.length){el.innerHTML='<div class="empty-state">暂无账号，点击右上角「新增」添加</div>';return;}
-  el.innerHTML=items.map(rowHtml).join('');
+  el.innerHTML=`<div class="acct-scroll"><div class="acct-table">
+    <div class="acct-head"><span>凭证 / 账号</span><span>可用状态</span><span>最近请求</span><span>历史用量</span><span>额度信息</span><span class="th-actions">操作</span></div>
+    ${items.map(rowHtml).join('')}
+  </div></div>`;
 }
 
-/* ── Z·SWITCH 风格账号行 ── */
+/* ── CPA-Manager-Plus 风格 6 列表格行 ── */
 function notchColor(id){
   let h=0;for(const c of String(id))h=(h*31+c.charCodeAt(0))>>>0;
   return NOTCH_COLORS[h%NOTCH_COLORS.length];
@@ -242,49 +245,70 @@ function tierBadgeHtml(a){
   else if(s.includes('start')||s.includes('trial')||s.includes('体验')){label='Trial';cls='trial';}
   return label?`<span class="tier-b ${cls}">${label}</span>`:'';
 }
-function rowHtml(a){
+
+function credCell(a){
   const isJwt=a.mode==='jwt';
-  const isDisabled=a.status==='disabled';
-  const loading=refreshing.has(a.id);
-  const p=a.plan||{};
-  let meta=`<span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span>`;
-  // 套餐窗口：上游字段是 ends_at（unix 秒）；expires_at 为旧兼容。字符串/数字双形态都兜住
-  const planEnd=Number(p.ends_at)||Number(p.expires_at)||0;
-  if(planEnd){
-    const days=Math.ceil((planEnd*1000-Date.now())/86400000);
-    meta+=`<span class="${days<=7?'warn-line':''}" title="当前套餐有效期">有效期至 ${fmtDate(planEnd)}</span>`;
-  }
-  // 冷却倒计时：5xx 重试耗尽进入冷却的账号显示剩余恢复时间（风控封禁走 disabled 徽章 + err 文案）
+  return `<div class="acct-name-line"><span class="notch" style="background:${notchColor(a.id)}"></span><span class="acct-name">${esc(a.name)}</span>${tierBadgeHtml(a)}</div>
+    <div class="cred-sub"><span class="tok">${esc(a.token_masked)}</span><span>·</span><span>${esc(a.provider)} / ${isJwt?'JWT':'API Key'}</span></div>`;
+}
+
+function statusCell(a){
+  let sub='';
+  // 冷却倒计时（5xx 重试耗尽进入冷却；风控封禁走 disabled 徽章 + err 文案）
   if(a.status==='cooling'&&Number(a.cooling_until)){
     const left=Math.max(0,Math.round(Number(a.cooling_until)-Date.now()/1000));
-    if(left>0){
-      meta+=`<span class="cool-line" title="限流冷却，${fmtDur(left)}后自动恢复">❄ ${fmtDur(left)}恢复</span>`;
+    if(left>0)sub=`<div class="cell-sub"><span class="cool-line" title="限流冷却，${fmtDur(left)}后自动恢复">❄ ${fmtDur(left)}恢复</span></div>`;
+  }
+  if(!sub){
+    // 套餐窗口：上游字段是 ends_at（unix 秒）；expires_at 为旧兼容
+    const planEnd=Number((a.plan||{}).ends_at)||Number((a.plan||{}).expires_at)||0;
+    if(planEnd){
+      const days=Math.ceil((planEnd*1000-Date.now())/86400000);
+      sub=`<div class="cell-sub${days<=7?' warn-line':''}" title="当前套餐有效期">套餐至 ${fmtDate(planEnd)}</div>`;
     }
   }
-  if(a.last_error)meta+=`<span class="err-line" title="${esc(a.last_error)}">${esc(a.last_error.length>40?a.last_error.slice(0,40)+'…':a.last_error)}</span>`;
+  const err=a.last_error?`<div class="cell-sub err-line" title="${esc(a.last_error)}">${esc(a.last_error.length>26?a.last_error.slice(0,26)+'…':a.last_error)}</div>`:'';
+  return `<span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span>${sub}${err}`;
+}
+
+function tickbarHtml(a){
+  const r=(a.recent_results||[]).slice(-20);
+  if(!r.length)return '<div class="tickbar-empty">—</div>';
+  return `<div class="tickbar" title="最近 ${r.length} 次请求结果（绿=成功 红=失败）">${r.map(ok=>`<i class="${ok?'ok':'bad'}"></i>`).join('')}</div>`;
+}
+
+function usageCell(a){
+  const used=a.use_count||0, fail=a.fail_count||0, strikes=a.risk_strikes||0;
+  const rate=used>0?Math.round((used-fail)/used*100):null;
+  return `<div class="usage-mini">
+    <div class="usage-line"><span class="u-label">调用</span><span class="u-val">${used}</span><span class="u-label">成功率</span><span class="u-val ${rate===null?'':(rate>=90?'u-ok':'u-warn')}">${rate===null?'—':rate+'%'}</span></div>
+    <div class="usage-line"><span class="u-label">失败</span><span class="u-val ${fail>0?'u-bad':''}">${fail}</span><span class="u-label">风控</span><span class="u-val ${strikes>0?'u-bad':''}">${strikes}</span></div>
+  </div>`;
+}
+
+function actionsCell(a){
+  const isJwt=a.mode==='jwt';
+  const loading=refreshing.has(a.id);
+  const enabled=a.enabled!==false&&a.status!=='disabled';
+  return `<div class="acct-actions">
+    ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>
+    <button onclick="claimOne('${a.id}')" class="row-icon-btn${claiming.has(a.id)?' is-loading':''}" title="自动领取赠送额度"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg></button>
+    <button onclick="openClaimModal('${a.id}')" class="row-icon-btn" title="手动领取活动套餐（浏览器过验证码）"><svg viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="m9 12 2 2 4-4"/></svg></button>`:''}
+    <button onclick="openEdit('${a.id}')" class="row-icon-btn" title="编辑"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button>
+    <button onclick="doDelete('${a.id}')" class="row-icon-btn row-icon-danger" title="删除"><svg viewBox="0 0 24 24"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button>
+    <label class="switch" title="${enabled?'禁用账号':'启用账号'}"><input type="checkbox" ${enabled?'checked':''} onchange="toggleEnabled('${a.id}',${!enabled})"><span class="switch-slider"></span></label>
+  </div>`;
+}
+
+function rowHtml(a){
+  const isDisabled=a.status==='disabled';
   return `<div class="acct-row${isDisabled?' is-disabled':''}" data-id="${a.id}">
-    <div class="acct-row-top">
-      <span class="notch" style="background:${notchColor(a.id)}"></span>
-      <div class="acct-main">
-        <div class="acct-name-line">
-          <span class="acct-name">${esc(a.name)}</span>
-          ${tierBadgeHtml(a)}
-          <span class="badge badge-${a.status}">${STATUS_LABEL[a.status]||a.status}</span>
-        </div>
-        <div class="acct-meta">${meta}<span>·</span><span>调用 ${a.use_count||0}</span><span>失败 ${a.fail_count||0}</span><span>最近 ${fmtDate(a.last_used_at)}</span></div>
-      </div>
-      <div class="acct-actions row-actions">
-        ${isJwt?`<button onclick="refreshOne('${a.id}')" class="row-icon-btn${loading?' is-loading':''}" title="刷新额度"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg></button>
-        <button onclick="claimOne('${a.id}')" class="row-icon-btn${claiming.has(a.id)?' is-loading':''}" title="自动领取赠送额度"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/></svg></button>
-        <button onclick="openClaimModal('${a.id}')" class="row-icon-btn" title="手动领取活动套餐（浏览器过验证码）"><svg viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/><path d="m9 12 2 2 4-4"/></svg></button>`:''}
-        <button onclick="toggleEnabled('${a.id}',${isDisabled})" class="row-icon-btn" title="${isDisabled?'恢复':'禁用'}">
-          ${isDisabled?'<svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 4v5h5"/></svg>':'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M8.5 8.5 15.5 15.5"/></svg>'}
-        </button>
-        <button onclick="openEdit('${a.id}')" class="row-icon-btn" title="编辑"><svg viewBox="0 0 24 24"><path d="m4 20 4.5-1 9.5-9.5-3.5-3.5L5 15.5z"/><path d="m13.5 5.5 3.5 3.5"/></svg></button>
-        <button onclick="doDelete('${a.id}')" class="row-icon-btn row-icon-danger" title="删除"><svg viewBox="0 0 24 24"><path d="M5 7h14"/><path d="M9 7V4h6v3"/><path d="M8 10v7"/><path d="M12 10v7"/><path d="M16 10v7"/><path d="M7 7l1 13h8l1-13"/></svg></button>
-      </div>
-    </div>
-    <div class="acct-quota">${quotaCell(a)}</div>
+    <div class="cell cred">${credCell(a)}</div>
+    <div class="cell status">${statusCell(a)}</div>
+    <div class="cell recent"><div class="recent-ts">${fmtDateSec(a.last_used_at)}</div>${tickbarHtml(a)}</div>
+    <div class="cell usage">${usageCell(a)}</div>
+    <div class="cell quota">${quotaCell(a)}</div>
+    <div class="cell actions">${actionsCell(a)}</div>
   </div>`;
 }
 
@@ -628,6 +652,7 @@ async function onImportFile(ev){
 function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
+function fmtDateSec(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 function fmtDur(s){s=Math.max(0,Math.round(s));if(s<60)return s+'秒';const m=Math.floor(s/60);if(m<60)return m+'分';const h=Math.floor(m/60);return h+'小时'+(m%60?(m%60)+'分':'');}
 function openModal(id){document.getElementById(id).classList.add('open');}
 function closeModal(id){document.getElementById(id).classList.remove('open');}
