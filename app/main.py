@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="zcode-hub", version=settings.APP_VERSION, lifespan=lifespan)
 
-    app.mount("/static", StaticFiles(directory=str(settings.STATIC_DIR)), name="static")
+    app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
 
     app.include_router(pages.router)
     app.include_router(admin_api.router)

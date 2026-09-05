@@ -1,4 +1,8 @@
-"""页面路由：登录、账号管理、设置。"""
+"""页面路由：登录、账号管理、设置。
+
+前端文件来自独立部署目录（settings.FRONTEND_DIR，前后端分离）——
+改前端只需 rsync 该目录，无需重启后端。
+"""
 
 from __future__ import annotations
 
@@ -13,10 +17,10 @@ _TOKEN = "{{APP_VERSION}}"
 
 
 def _html(name: str) -> HTMLResponse:
-    path = settings.STATIC_DIR / "admin" / name
+    path = settings.FRONTEND_DIR / "admin" / name
     if not path.exists():
         raise HTTPException(404, "页面不存在")
-    body = path.read_text(encoding="utf-8").replace(_TOKEN, settings.APP_VERSION)
+    body = path.read_text(encoding="utf-8").replace(_TOKEN, settings.frontend_version())
     return HTMLResponse(body, headers={"Cache-Control": "no-store"})
 
 

@@ -37,7 +37,12 @@ def _int(env_name: str, default: int) -> int:
 DATA_DIR = _resolve_path("ZCODE_DATA_DIR", "data")
 # 账号与设置持久化到本地 SQLite（与 grok2api 的 local 后端一致）
 DB_PATH = DATA_DIR / "accounts.db"
-STATIC_DIR = Path(__file__).resolve().parent / "statics"
+# 前端目录（前后端分离）：默认仓库根 frontend/，可用 ZCODE_FRONTEND_DIR 指向
+# 独立部署目录（线上 /data/zcode-hub/frontend）；包内 statics 仅作兜底
+FRONTEND_DIR = _resolve_path(
+    "ZCODE_FRONTEND_DIR",
+    "frontend" if (ROOT_DIR / "frontend").is_dir() else str(Path(__file__).resolve().parent / "statics"),
+)
 
 # ── 服务 ─────────────────────────────────────────────────────────────────────
 PORT = _int("ZCODE_PORT", 3000)
@@ -94,4 +99,18 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.4.2"
+APP_VERSION = "2.5.0"
+
+_FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
+
+
+def frontend_version() -> str:
+    """前端版本号（frontend/version 文件，每次读取 → 前端独立发版即生效）。
+
+    文件缺失/为空时回退 APP_VERSION，保证本地开发与旧部署不破。
+    """
+    try:
+        v = _FRONTEND_VERSION_FILE.read_text("utf-8").strip()
+        return v or APP_VERSION
+    except OSError:
+        return APP_VERSION
