@@ -7,9 +7,15 @@ import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from .. import reqlog
+from .. import logs, reqlog
 from ..auth_admin import verify_admin_key
-from ..claim import ClaimError, claim_with_captcha, preview_plans, report_activation_events
+from ..claim import (
+    ClaimError,
+    auto_claim_all_plans,
+    claim_with_captcha,
+    preview_plans,
+    report_activation_events,
+)
 from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
@@ -68,6 +74,7 @@ async def add_accounts(payload: dict = Body(...)):
         raise HTTPException(400, "请输入至少一个 Token / API Key")
 
     added = []
+    existing = {a.id for a in store.list_accounts(provider)}  # 识别真新增（重复 token 跳过）
     for tok in dict.fromkeys(tokens):  # 去重保序
         name = payload.get("name") or f"{provider}-{len(store.list_accounts(provider)) + 1}"
         acc = store.add_account(provider, name, tok)
@@ -76,6 +83,9 @@ async def add_accounts(payload: dict = Body(...)):
     fresh = [a for a in store.list_accounts(provider) if a.id in added and a.mode == "jwt"]
     if fresh:
         await refresh_accounts(fresh)
+    for acc in fresh:
+        if acc.id not in existing:
+            _schedule_auto_claim(acc)
     return {"count": len(added), "ids": added}
 
 
@@ -250,10 +260,35 @@ async def login_poll(flow_id: str):
 
     if account.mode == "jwt":
         await refresh_accounts([account])
+        _schedule_auto_claim(account)  # 授权完成即激活+自动领取，入池即吃满活动
     return {"status": "ready", "account": account.public_view()}
 
 
 # ── 额度领取 ─────────────────────────────────────────────────────────────────
+_auto_claim_tasks: set[asyncio.Task] = set()  # 强引用防 GC
+
+
+def _schedule_auto_claim(account) -> None:
+    """入池后调度后台自动领取（激活上报 + 全量可领套餐）。
+
+    不阻塞入池响应（验证码求解可长达数十秒）；仅 JWT 账号。失败不影响入池。
+    """
+    if not (account.mode == "jwt" and account.jwt_token):
+        return
+
+    async def _job():
+        try:
+            outcomes = await auto_claim_all_plans(account)
+            if outcomes:
+                await refresh_accounts([account])  # 领到额度立即反映到 UI
+        except Exception as err:  # noqa: BLE001 - 兜底：绝不冒泡
+            logs.warn("claim", f"账号 {account.name} 自动领取任务异常: {err}")
+
+    task = asyncio.create_task(_job())
+    _auto_claim_tasks.add(task)
+    task.add_done_callback(_auto_claim_tasks.discard)
+
+
 def _jwt_accounts(account_ids: list[str] | None) -> list:
     accounts = store.list_accounts("zai")
     if account_ids:
@@ -412,7 +447,13 @@ async def export_accounts():
 
 @router.post("/import")
 async def import_accounts(payload: dict = Body(...)):
+    existing = {a.id for a in store.list_accounts("zai")}
     count = store.import_accounts(payload)
+    # 导入的 JWT 账号同样入池即激活+自动领取（幂等：重复 token 不会新增）
+    imported = [a for a in store.list_accounts("zai")
+                if a.id not in existing and a.mode == "jwt"]
+    for acc in imported:
+        _schedule_auto_claim(acc)
     return {"count": count}
 
 

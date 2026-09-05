@@ -19,10 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-import time
 
 from app import settings
-from app.models import Status
 from app.oauth import ZaiAuthFlow
 from app.quota import fetch_quota
 from app.store import store
@@ -90,6 +88,7 @@ async def cmd_login(args: list[str]) -> None:
             if zcode_jwt:
                 acc = store.add_account("zai", "oauth-login", zcode_jwt)
                 print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
+                await cli_auto_claim(acc)
             if access_token:
                 try:
                     key = await flow.exchange_api_key(access_token)
@@ -104,6 +103,21 @@ async def cmd_login(args: list[str]) -> None:
     print(c("❌ 登录超时，请重试。", "red"))
 
 
+async def cli_auto_claim(acc) -> None:
+    """入池自动领取（激活上报 + 全量可领套餐），失败仅提示不阻断。"""
+    from app.claim import auto_claim_all_plans
+
+    try:
+        outcomes = await auto_claim_all_plans(acc)
+        for o in outcomes:
+            if o["ok"]:
+                print(c(f"🎁 自动领取成功: {o.get('plan_name') or o.get('plan_id')}", "green"))
+            else:
+                print(c(f"⚠️ 自动领取失败: {o.get('message')}", "yellow"))
+    except Exception as err:  # noqa: BLE001
+        print(c(f"⚠️ 自动领取异常: {err}", "yellow"))
+
+
 # ── 账号管理 ─────────────────────────────────────────────────────────────────
 def cmd_add_account(args: list[str]) -> None:
     if len(args) < 3:
@@ -112,6 +126,8 @@ def cmd_add_account(args: list[str]) -> None:
     provider, name, secret = args[0], args[1], args[2]
     acc = store.add_account(provider, name, secret)
     print(c(f"✔ 已添加账号 {acc.name} ({acc.id}) 模式={acc.mode}", "green"))
+    if acc.mode == "jwt" and acc.jwt_token:
+        asyncio.run(cli_auto_claim(acc))
 
 
 def cmd_accounts(args: list[str]) -> None:

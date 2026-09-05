@@ -275,7 +275,7 @@ def build_app() -> FastAPI:
         _record("POST", request.url.path, headers, body)
         if getattr(app.state, "event_report_fail", None):
             return Response(json.dumps({"code": -1, "msg": app.state.event_report_fail}),
-                            status=500, media_type="application/json")
+                            status_code=500, media_type="application/json")
         return Response(json.dumps({"code": 0}), media_type="application/json")
 
     # ── 套餐领取（claim）───────────────────────────────────────────────────

@@ -166,6 +166,48 @@ async def report_activation_events(account: Account) -> str | None:
     return None
 
 
+async def auto_claim_all_plans(account: Account) -> list[dict]:
+    """新账号入池自动领取：激活上报 + 逐个领取全部可领套餐。
+
+    入池链路的 fire-and-forget 收尾：任何失败只记日志/返回 outcome，绝不抛出
+    （入池流程不受影响）。重复执行安全（上游 1003 已领取过幂等）。
+    """
+    if not (account.mode == "jwt" and account.jwt_token):
+        return []
+    outcomes: list[dict] = []
+
+    try:
+        err = await report_activation_events(account)
+        if err:
+            logs.warn("claim", f"账号 {account.name} 激活上报失败: {err}")
+    except Exception as err:  # noqa: BLE001 - 激活失败不阻断领取
+        logs.warn("claim", f"账号 {account.name} 激活上报异常: {err}")
+
+    try:
+        plans = await preview_plans(account)
+    except ClaimError as err:
+        logs.info("claim", f"账号 {account.name} 无可领套餐（{err}）")
+        return outcomes
+    except Exception as err:  # noqa: BLE001
+        logs.warn("claim", f"账号 {account.name} preview 异常: {err}")
+        return outcomes
+
+    for plan in plans:
+        try:
+            result = await claim(account, plan["plan_id"])
+            outcomes.append({"account_id": account.id, "account_name": account.name,
+                             "ok": True, **result})
+            logs.info("claim", f"账号 {account.name} 自动领取成功: "
+                               f"{result.get('plan_name') or plan['plan_id']}")
+        except ClaimError as err:
+            outcomes.append({"account_id": account.id, "account_name": account.name,
+                             "ok": False, "plan_id": plan["plan_id"], "message": str(err)})
+            logs.warn("claim", f"账号 {account.name} 自动领取 {plan['plan_id']} 失败: {err}")
+        except Exception as err:  # noqa: BLE001
+            logs.warn("claim", f"账号 {account.name} 自动领取异常: {err}")
+    return outcomes
+
+
 async def preview_plans(account: Account) -> list[dict]:
     """拉取账号当前可领取套餐，按优先级降序。"""
     from .quota import _auth_headers

@@ -166,13 +166,16 @@ class TestClaim:
         client, mock, _stub, _acc = claim_env
         mock.state.calls.clear()
         mock.state.event_report_fail = "down"
-        res = await client.get("/admin/api/claim/preview",
-                               headers={"Authorization": "Bearer zcode"})
-        entry = res.json()["preview"][0]
-        assert entry["activated"] is False
-        assert "HTTP 500" in entry["activation_error"]
-        assert entry["error"] is None
-        assert entry["plans"], "preview 未被激活上报失败阻断"
+        try:
+            res = await client.get("/admin/api/claim/preview",
+                                   headers={"Authorization": "Bearer zcode"})
+            entry = res.json()["preview"][0]
+            assert entry["activated"] is False
+            assert "HTTP 500" in entry["activation_error"]
+            assert entry["error"] is None
+            assert entry["plans"], "preview 未被激活上报失败阻断"
+        finally:
+            mock.state.event_report_fail = None  # session 级 mock，防止污染后续用例
 
     async def test_claim_already_claimed_no_retry(self, claim_env):
         client, mock, stub, acc = claim_env
@@ -301,3 +304,87 @@ class TestManualClaim:
         res = await client.post("/admin/api/claim/manual",
                                 json={"account_id": acc.id, "captcha_verify_param": "p"})
         assert res.status_code == 401
+
+
+@pytest.mark.integration
+class TestAutoClaimOnPoolEntry:
+    """入池即激活+自动领取（2026-09-06）：新 JWT 账号入池后台自动吃满活动。"""
+
+    async def test_auto_claim_all_plans_success(self, claim_env):
+        from app.claim import auto_claim_all_plans
+
+        client, mock, _stub, acc = claim_env
+        mock.state.calls.clear()
+        outcomes = await auto_claim_all_plans(acc)
+        assert len(outcomes) == 1
+        assert outcomes[0]["ok"] is True
+        assert outcomes[0]["plan_id"] == "mock-claim-plan"
+        # 激活 2 条 + preview 1 次 + claim 1 次
+        paths = [p for _m, p, _h, _b in mock.state.calls]
+        assert paths.count("/api/v1/event/report") == 2
+        assert sum(p.endswith("/billing/preview") for p in paths) == 1
+        assert sum(p.endswith("/billing/claim") for p in paths) == 1
+
+    async def test_auto_claim_preview_failure_is_safe(self, claim_env):
+        """preview 失败（如 1003）只记日志，不抛出。"""
+        from app.claim import auto_claim_all_plans
+
+        _client, mock, _stub, acc = claim_env
+        mock.state.claim_scenario = "claim_claimed"
+        assert await auto_claim_all_plans(acc) == []
+
+    async def test_auto_claim_skips_non_jwt(self, claim_env, fresh_app):
+        from app.claim import auto_claim_all_plans
+
+        client, _mock, _stub, _acc = claim_env
+        apikey_acc = seed_account(fresh_app, "sk-apikey-token", name="k")
+        assert await auto_claim_all_plans(apikey_acc) == []
+
+    async def test_add_account_schedules_auto_claim(self, claim_env, monkeypatch):
+        import asyncio
+
+        from app.routes import admin_api
+
+        client, mock, _stub, _acc = claim_env
+        called = []
+
+        async def _spy(account):
+            called.append(account.id)
+            return []
+
+        monkeypatch.setattr(admin_api, "auto_claim_all_plans", _spy)
+        res = await client.post("/admin/api/accounts",
+                                json={"provider": "zai", "tokens": [GOOD_JWT + "-new"]},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        await asyncio.sleep(0.05)
+        assert called, "新账号入池应调度自动领取"
+
+        # 重复 token（去重后非新增）不再触发
+        before = len(called)
+        await client.post("/admin/api/accounts",
+                          json={"provider": "zai", "tokens": [GOOD_JWT + "-new"]},
+                          headers={"Authorization": "Bearer zcode"})
+        await asyncio.sleep(0.05)
+        assert len(called) == before
+
+    async def test_import_schedules_auto_claim(self, claim_env, monkeypatch):
+        import asyncio
+
+        from app.routes import admin_api
+
+        client, mock, _stub, _acc = claim_env
+        called = []
+
+        async def _spy(account):
+            called.append(account.id)
+            return []
+
+        monkeypatch.setattr(admin_api, "auto_claim_all_plans", _spy)
+        res = await client.post("/admin/api/import",
+                                json={"providers": {"zai": [
+                                    {"name": "imp", "secret": GOOD_JWT + "-imp"}]}},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        await asyncio.sleep(0.05)
+        assert called, "导入的新 JWT 账号应调度自动领取"
