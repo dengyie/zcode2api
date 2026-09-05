@@ -88,16 +88,13 @@ class _StubCaptcha:
     """验证码桩：永不打真网。"""
 
     def __init__(self) -> None:
-        self.paused_seconds: list[int] = []
+        self.invalidated = 0
 
     async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
         return "mock-verify-param", None
 
     def invalidate(self) -> None:
-        pass
-
-    def pause_refill(self, seconds: int) -> None:
-        self.paused_seconds.append(seconds)
+        self.invalidated += 1
 
 
 @pytest.fixture

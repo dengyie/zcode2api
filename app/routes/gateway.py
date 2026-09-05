@@ -114,10 +114,9 @@ def _is_risk_control(status_code: int, text: str) -> bool:
 
 
 def _parse_retry_after(value: str | None) -> int | None:
-    """解析 Retry-After（仅秒数形态；HTTP-date 形态少见，放弃即回退默认冷却）。
+    """解析 Retry-After（仅秒数形态；HTTP-date 形态少见，放弃即用默认重试等待）。
 
-    非正数不采信；超长值封顶采信而非丢弃 —— 把合法的 2h Retry-After 丢掉会
-    5 分钟后就重试，形成 429 循环。封顶取风控上限同款 6h。
+    非正数不采信；超长值封顶采信 —— 尊重上游意图的同时防止把客户端吊死。
     """
     if not value:
         return None
@@ -125,7 +124,7 @@ def _parse_retry_after(value: str | None) -> int | None:
         secs = int(float(value.strip()))
     except (ValueError, AttributeError):
         return None
-    return min(secs, settings.RISK_COOLDOWN_MAX) if secs > 0 else None
+    return min(secs, settings.RETRY_429_WAIT_MAX) if secs > 0 else None
 
 
 def _mark(account: Account, status_value: str, error: str | None = None) -> None:
@@ -133,7 +132,6 @@ def _mark(account: Account, status_value: str, error: str | None = None) -> None
     account.last_error = error
     if status_value == Status.COOLING:
         account.cooling_until = time.time() + settings.COOLING_SECONDS
-        account.cooling_is_risk = False  # 连接失败类冷却，不掩盖后续真实风控命中
     store.update_account(account)
 
 
@@ -204,12 +202,22 @@ _NEXT_ACCOUNT = object()
 
 
 async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha):
-    """尝试用单个账号转发，含验证码续期。返回 Response 或 _NEXT_ACCOUNT。
+    """尝试用单个账号转发，含验证码续期与可配置重试。
 
-    挑战重试路径（对齐 zapi handler.ts）：检测到挑战 → 清空池 → 取新 token →
-    重建整个请求（body 变换幂等，重建安全）→ 重试，最多 MAX_CAPTCHA_RETRIES 次。
+    错误处理策略（参数见 settings，均可用环境变量调整）：
+      - 验证码挑战：清池换码重建请求，最多 MAX_CAPTCHA_RETRIES 次
+      - 429 频控：**不冷却账号**，按上游 Retry-After（封顶 RETRY_429_WAIT_MAX）
+        或 RETRY_429_WAIT 等待后原地重试，最多 RETRY_429_TIMES 次；
+        耗尽后换下一个账号，账号保持可用
+      - 5xx 等一般错误：重试最多 RETRY_5XX_TIMES 次；耗尽后账号冷却
+        COOLING_SECONDS 并换下一个账号
+      - 风控（3012/405「unusual activity」真封禁）：直接禁用账号（UI 展示），
+        人工确认恢复后手动启用，不做自动退避
     """
-    for _attempt in range(MAX_CAPTCHA_RETRIES):
+    captcha_retries = 0
+    retries_429 = 0
+    retries_5xx = 0
+    while True:
         verify_param = verify_region = None
         if needs_captcha:
             try:
@@ -249,25 +257,26 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
             if challenge:
                 captcha_manager.invalidate()
+                captcha_retries += 1
+                if captcha_retries >= MAX_CAPTCHA_RETRIES:
+                    logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
+                    return _NEXT_ACCOUNT
                 logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                 continue  # 同账号重建请求重试
 
-            # 风控（3012「unusual activity」/ 405）：账号指数退避冷却 + 暂停验证码池预热。
-            # 必须先于 exhausted/其它错误判定，且不再空转重打（否则升级为封号）。
+            # 风控（3012「unusual activity」/ 405）：真封禁 → 禁用账号，人工恢复。
+            # 必须先于 exhausted/其它错误判定，且不再重试（避免对封禁账号持续施压）。
             if _is_risk_control(status_code, text):
-                cooldown = account.begin_risk_cooldown(
-                    settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX
+                account.ban_for_risk()
+                account.last_error = (
+                    f"风控封禁 (3012/unusual activity) HTTP {status_code}，"
+                    f"确认恢复后请在后台手动启用（第 {account.risk_strikes} 次）"
                 )
-                account.last_error = f"风控冷却 (3012/unusual activity)，第 {account.risk_strikes} 次"
                 store.update_account(account)
-                # 预热验证码本身即上游流量，风控期暂停以免加剧
-                pause = getattr(captcha_manager, "pause_refill", None)
-                if callable(pause):
-                    pause(cooldown)
                 logs.warn(
                     req_id,
-                    f"账号 {account.name} 命中风控 HTTP {status_code}，"
-                    f"冷却 {cooldown}s（第 {account.risk_strikes} 次），切换下一个",
+                    f"账号 {account.name} 命中风控 HTTP {status_code}，已禁用"
+                    f"（累计第 {account.risk_strikes} 次），切换下一个",
                 )
                 return _NEXT_ACCOUNT
 
@@ -289,20 +298,44 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 return _NEXT_ACCOUNT
 
             if status_code == 429:
-                retry_after = _parse_retry_after(resp.headers.get("retry-after"))
-                cool = retry_after if retry_after is not None else settings.COOLING_SECONDS
-                account.status = Status.COOLING
-                account.cooling_until = time.time() + cool
-                account.cooling_is_risk = False  # 429 是频控不是风控，不计连击
-                account.last_error = (
-                    f"上游限流 429（Retry-After {retry_after}s）" if retry_after is not None
-                    else "上游限流 429"
+                # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用
+                if retries_429 < settings.RETRY_429_TIMES:
+                    retries_429 += 1
+                    wait = _parse_retry_after(resp.headers.get("retry-after")) or settings.RETRY_429_WAIT
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 被限流 429，{wait}s 后重试"
+                        f"（{retries_429}/{settings.RETRY_429_TIMES}）",
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logs.warn(
+                    req_id,
+                    f"账号 {account.name} 429 重试 {settings.RETRY_429_TIMES} 次耗尽，"
+                    f"切换下一个（账号保持可用）",
                 )
-                store.update_account(account)
-                logs.warn(req_id, f"账号 {account.name} 被限流 429（冷却 {cool}s），切换下一个")
                 return _NEXT_ACCOUNT
 
-            # 其它错误：直接回传客户端
+            if status_code >= 500:
+                # 一般性上游错误：重试，耗尽才冷却账号并换号
+                if retries_5xx < settings.RETRY_5XX_TIMES:
+                    retries_5xx += 1
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 上游 HTTP {status_code}，"
+                        f"{settings.RETRY_5XX_WAIT}s 后重试（{retries_5xx}/{settings.RETRY_5XX_TIMES}）",
+                    )
+                    await asyncio.sleep(settings.RETRY_5XX_WAIT)
+                    continue
+                cool = settings.COOLING_SECONDS
+                account.status = Status.COOLING
+                account.cooling_until = time.time() + cool
+                account.last_error = f"上游 HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却"
+                store.update_account(account)
+                logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，冷却 {cool}s，切换下一个")
+                return _NEXT_ACCOUNT
+
+            # 其它 4xx：直接回传客户端
             account.fail_count += 1
             store.update_account(account)
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
@@ -314,10 +347,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         # 成功：记录用量并流式透传
         account.use_count += 1
         account.last_used_at = time.time()
-        account.risk_strikes = 0  # 成功即清零风控计数（下次命中从 base 重新退避）
+        account.risk_strikes = 0  # 成功即清零封禁计数
         account.last_error = None
         account.cooling_until = None
-        account.cooling_is_risk = False
         if account.status in (Status.COOLING, Status.EXHAUSTED):
             account.status = Status.ACTIVE
         store.update_account(account)
@@ -339,10 +371,6 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         out_headers = {"Cache-Control": "no-cache"}
         return StreamingResponse(_body_iter(), status_code=status_code,
                                  media_type=content_type, headers=out_headers)
-
-    # 验证码连续失败
-    logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
-    return _NEXT_ACCOUNT
 
 
 def _safe_json(text: str):

@@ -67,15 +67,16 @@ QUOTA_REFRESH_INTERVAL = _int("ZCODE_QUOTA_REFRESH_INTERVAL", 60)
 # 成功对话后计费刷新的最小间隔（秒）：billing/* 连续查询易触发上游拦截，
 # 每条消息都刷是流量放大器，与 monitor 轮询共享 last_checked_at 去抖。
 BILLING_REFRESH_MIN_INTERVAL = _int("ZCODE_BILLING_REFRESH_MIN_INTERVAL", 60)
-# 限流（cooling）冷却时长（秒）
+# ── 上游错误重试 / 冷却（参数可设定）─────────────────────────────────────────
+# 429 频控：账号不冷却，原地等待后重试，耗尽后换下一个账号（账号保持可用）
+RETRY_429_TIMES = _int("ZCODE_RETRY_429_TIMES", 5)       # 429 重试次数
+RETRY_429_WAIT = _int("ZCODE_RETRY_429_WAIT", 60)        # 429 重试等待秒数（上游 Retry-After 优先）
+RETRY_429_WAIT_MAX = _int("ZCODE_RETRY_429_WAIT_MAX", 120)  # Retry-After 采信上限（防吊死客户端）
+# 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
+RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
+RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
+# 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽 / 连接失败使用
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
-
-# ── 风控冷却 ──────────────────────────────────────────────────────────────────
-# 3012/405「unusual activity」命中后的指数退避：第 n 次连续命中冷却
-# base * 2^(n-1) 秒，封顶 max。风控由高频请求触发，退避给上游解封留窗口，
-# 同时避免反复重打升级成封号（官方政策：3 次以上违规可能 ban）。
-RISK_COOLDOWN_BASE = _int("ZCODE_RISK_COOLDOWN_BASE", 900)      # 首次 15 分钟
-RISK_COOLDOWN_MAX = _int("ZCODE_RISK_COOLDOWN_MAX", 21_600)     # 封顶 6 小时
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 # 上游端点：默认值统一收口在 constants.py，环境变量仅作覆盖

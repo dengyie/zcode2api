@@ -46,7 +46,6 @@ class CaptchaManager:
         self._pool_size = 0          # Queue 无可信 len，自行维护
         self._refill_task: asyncio.Task | None = None
         self._refilling = False
-        self._paused_until = 0.0     # 风控暂停：monotonic 时刻前不预热（预热本身即上游流量）
         self._config_lock = asyncio.Lock()
         self._config_cache: dict | None = None
         self._config_cache_at: float = 0.0
@@ -104,8 +103,8 @@ class CaptchaManager:
     async def _refill_loop(self) -> None:
         while True:
             try:
-                # 风控暂停期 / 无可服务账号：只淘汰过期 token，不解新码（不产生上游流量）
-                if time.monotonic() < self._paused_until or not self._gate_open():
+                # 无可服务账号（全冷却/禁用/无号）：只淘汰过期 token，不解新码（不产生上游流量）
+                if not self._gate_open():
                     await self._evict_expired()
                     await asyncio.sleep(3)
                     continue
@@ -248,17 +247,6 @@ class CaptchaManager:
             drained += 1
         if drained:
             logs.warn("captcha", f"验证码失效，清空池 {drained} 枚")
-
-    def pause_refill(self, seconds: int) -> None:
-        """风控暂停预热：账号命中 3012/405 风控时调用。
-
-        求解验证码本身就是对上游的请求，风控期内继续预热只会加剧风控。
-        取更晚的暂停截止，多次命中顺延。
-        """
-        until = time.monotonic() + max(0, seconds)
-        if until > self._paused_until:
-            self._paused_until = until
-            logs.warn("captcha", f"风控冷却，验证码池预热暂停 {seconds}s")
 
 
 captcha_manager = CaptchaManager()

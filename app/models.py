@@ -45,8 +45,7 @@ class Account:
 
     use_count: int = 0
     fail_count: int = 0
-    risk_strikes: int = 0  # 连续风控（3012/405）命中次数，用于指数退避；成功即清零
-    cooling_is_risk: bool = False  # 当前 COOLING 是否由风控引起（区分 429/断连冷却，并发去重用）
+    risk_strikes: int = 0  # 累计风控封禁次数（3012/405）；成功即清零
     last_used_at: float | None = None
     last_checked_at: float | None = None
     cooling_until: float | None = None
@@ -70,24 +69,15 @@ class Account:
     def secret(self) -> str | None:
         return self.jwt_token if self.mode == "jwt" else self.api_key
 
-    def begin_risk_cooldown(self, base: int, cap: int, now: float | None = None) -> int:
-        """命中风控：累加连续计数并按指数退避设置冷却截止，返回冷却秒数。
+    def ban_for_risk(self) -> None:
+        """命中真风控（3012/405「unusual activity」）：禁用账号，UI 展示封禁文案。
 
-        第 n 次连续命中冷却 min(base * 2^(n-1), cap) 秒。
-        已处于风控冷却中（并发在途请求同批收到风控响应）视为同一事故：
-        不叠加连击、只顺延冷却截止 —— 否则几个并发请求就能把一次事故推到封顶。
+        风控由人工确认恢复后在后台手动启用（set_enabled）——不做自动退避恢复，
+        避免对真封禁的账号持续产生上游流量。
         """
-        now = now or time.time()
-        if self.is_cooling(now) and self.cooling_is_risk:
-            tier = min(base * (2 ** (self.risk_strikes - 1)), cap)
-            self.cooling_until = now + tier
-            return tier
         self.risk_strikes += 1
-        cooldown = min(base * (2 ** (self.risk_strikes - 1)), cap)
-        self.status = Status.COOLING
-        self.cooling_until = now + cooldown
-        self.cooling_is_risk = True
-        return cooldown
+        self.status = Status.DISABLED
+        self.cooling_until = None
 
     def is_selectable(self, now: float | None = None) -> bool:
         """是否可被轮询选中。"""

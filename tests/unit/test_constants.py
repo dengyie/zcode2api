@@ -97,7 +97,11 @@ def test_risk_control_signals():
     assert "unusual activity" in constants.RISK_CONTROL_MARKERS
 
 
-def test_risk_cooldown_settings_defaults():
+def test_retry_settings_defaults():
     from app import settings
-    assert settings.RISK_COOLDOWN_BASE == 900
-    assert settings.RISK_COOLDOWN_MAX == 21_600
+    assert settings.RETRY_429_TIMES == 5
+    assert settings.RETRY_429_WAIT == 60
+    assert settings.RETRY_429_WAIT_MAX == 120
+    assert settings.RETRY_5XX_TIMES == 3
+    assert settings.RETRY_5XX_WAIT == 5
+    assert settings.COOLING_SECONDS == 300
