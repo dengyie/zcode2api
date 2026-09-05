@@ -274,13 +274,14 @@ function statusCell(a){
 function tickbarHtml(a){
   const r=(a.recent_results||[]).slice(-20);
   if(!r.length)return '<div class="tickbar-empty">—</div>';
-  // 条目兼容两种形态：明细对象 {ok,at,detail}（新）与纯布尔（历史遗留）
-  return `<div class="tickbar" title="最近 ${r.length} 次请求结果（悬停单格看明细）">${r.map(e=>{
+  // 条目兼容两种形态：明细对象 {ok,at,detail}（新）与纯布尔（历史遗留）；
+  // 悬停明细用 data-tip 交给全局浮层渲染（即时、可贴边翻转），不用原生 title
+  return `<div class="tickbar" aria-label="最近 ${r.length} 次请求结果，悬停查看明细">${r.map(e=>{
     const ok=typeof e==='object'?e.ok:!!e;
-    let tip;
-    if(typeof e==='object') tip=`${ok?'✓ 成功':'✗ 失败'} · ${fmtDateSec(e.at)}\n${e.detail||''}`;
-    else tip=ok?'✓ 成功（历史记录，无明细）':'✗ 失败（历史记录，无明细）';
-    return `<i class="${ok?'ok':'bad'}" title="${tip.replace(/"/g,'&quot;')}"></i>`;
+    const head=`${ok?'✓ 成功':'✗ 失败'}`;
+    const time=typeof e==='object'?fmtDateSec(e.at):'历史记录';
+    const detail=typeof e==='object'?(e.detail||''):'无明细';
+    return `<i class="${ok?'ok':'bad'}" data-tip="${esc(`${head} · ${time}\n${detail}`)}"></i>`;
   }).join('')}</div>`;
 }
 
@@ -679,6 +680,32 @@ function openModal(id){document.getElementById(id).classList.add('open');}
 function closeModal(id){document.getElementById(id).classList.remove('open');}
 function openConfirm(title,body,cb){_cb=async()=>{closeModal('modal-confirm');await cb();};document.getElementById('confirm-title').textContent=title;document.getElementById('confirm-body').innerHTML=body;openModal('modal-confirm');}
 document.querySelectorAll('.modal-overlay').forEach(el=>el.addEventListener('click',e=>{if(e.target===el){el.classList.remove('open');if(el.id==='modal-add')stopLoginPoll();}}));
+
+/* 最近请求 tick 悬停明细浮层：全局单例、fixed 定位（不受 .acct-scroll 裁剪）、
+   视口内自动贴边与上下翻转，mouseover 委托（5s 轮询重渲染后新元素照常触发） */
+(function(){
+  let tip=document.getElementById('tickTip');
+  if(!tip){tip=document.createElement('div');tip.id='tickTip';tip.className='tick-tip';document.body.appendChild(tip);}
+  function hide(){tip.classList.remove('show');}
+  document.addEventListener('mouseover',e=>{
+    const t=e.target&&e.target.closest?e.target.closest('.tickbar i'):null;
+    if(!t){hide();return;}
+    const raw=t.dataset.tip||'';
+    const nl=raw.indexOf('\n');
+    const head=nl<0?raw:raw.slice(0,nl), body=nl<0?'':raw.slice(nl+1);
+    tip.innerHTML=`<span class="tt-head ${t.classList.contains('ok')?'is-ok':'is-bad'}">${esc(head)}</span>`+(body?`<span class="tt-body">${esc(body)}</span>`:'');
+    tip.classList.add('show');
+    tip.style.left='0px';tip.style.top='0px';
+    const r=t.getBoundingClientRect(), tw=tip.offsetWidth, th=tip.offsetHeight;
+    let x=r.left+r.width/2-tw/2;
+    x=Math.max(8,Math.min(x,window.innerWidth-tw-8));
+    let y=r.top-th-10;
+    if(y<8)y=r.bottom+10;
+    tip.style.left=x+'px';tip.style.top=y+'px';
+  });
+  window.addEventListener('scroll',hide,true);
+  window.addEventListener('blur',hide);
+})();
 </script>
 </body>
 </html>
