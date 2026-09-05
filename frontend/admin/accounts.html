@@ -204,9 +204,21 @@ function renderStats(s){
   set('s-total',s.total||0);
   set('s-active',s.active||0);
   set('s-exhausted',s.exhausted||0);
+  // 总额度（剩余）= 日窗口余额 + 已生效一次性活动赠送
+  // （上游不暴露赠送池实际剩余，按授权量计入；悬停有说明）
+  const now=Date.now()/1000;
   let totalRem=0;
-  allAccounts.forEach(a=>{const q=a.quota||{};Object.values(q).forEach(w=>{totalRem+=Number(w.remaining)||0;});});
+  allAccounts.forEach(a=>{
+    Object.values(a.quota||{}).forEach(w=>{totalRem+=Number(w.remaining)||0;});
+    ((a.plan||{}).entitlements||[]).forEach(e=>{
+      const eff=Number(e.effective_at)||0;
+      let ends=Number(e.ends_at||e.expires_at)||0;
+      if(!ends)ends=Number((a.plan||{}).ends_at)||0;
+      if(e.period==='one_time'&&eff>0&&eff<=now&&(!ends||now<=ends))totalRem+=Number(e.grant_units)||0;
+    });
+  });
   set('s-quota',fmtNum(totalRem));
+  document.getElementById('s-quota').title='日窗口余额 + 已生效一次性活动赠送（赠送池按授权量计入，上游不提供实际剩余）';
 }
 
 function renderFilters(){
@@ -344,12 +356,16 @@ function quotaCell(a){
     const eff=Number(e.effective_at)||0, ends=Number(e.ends_at||e.expires_at)||0;
     return e.period==='one_time'&&eff>0&&eff<=now&&(!ends||now<=ends);
   }).forEach(e=>{
-    const eff=Number(e.effective_at)||0, ends=Number(e.ends_at||e.expires_at)||0;
-    const tip=`活动赠送 ${fmtNum(e.grant_units)} · ${fmtDate(eff)} 生效${ends?'，'+fmtDate(ends)+' 结束':''} · 实际剩余以上游账单为准`;
+    const eff=Number(e.effective_at)||0;
+    // 上游 entitlement 不带结束时间：借用套餐有效期（赠送随套餐到期）
+    let ends=Number(e.ends_at||e.expires_at)||0;
+    if(!ends)ends=Number((a.plan||{}).ends_at)||0;
+    const endTxt=ends?`${fmtDate(eff)} ~ ${fmtDate(ends)}`:`${fmtDate(eff)} 起有效`;
+    const tip=`活动赠送 ${fmtNum(e.grant_units)} · ${fmtDate(eff)} 生效${ends?'，'+fmtDate(ends)+' 结束（按套餐有效期）':''} · 实际剩余以上游账单为准`;
     rows.push(`<div class="quota-row is-bonus">
-      <span class="quota-row-name" title="${tip}">🎁 ${esc(shortModel(e.show_name||'活动额度'))}</span>
+      <span class="quota-row-name" title="${tip}">${esc(shortModel(e.show_name||'活动额度'))}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:100%"></span></span>
-      <span class="quota-row-val"><span>+${fmtNum(e.grant_units)}</span><span class="quota-row-exp" title="${tip}">${ends?fmtDate(eff)+' ~ '+fmtDate(ends):fmtDate(eff)+' 起有效'}</span></span>
+      <span class="quota-row-val"><span>+${fmtNum(e.grant_units)}</span><span class="quota-row-exp" title="${tip}">${endTxt}</span></span>
     </div>`);
   });
   ents.filter(e=>Number(e.effective_at)>now).forEach(e=>{
@@ -364,7 +380,7 @@ function quotaCell(a){
   if(!rows.length)return a.mode==='jwt'?'<span class="quota-empty">额度未获取，点右上角刷新</span>':'<span class="quota-empty">—</span>';
   return '<div class="quota-rows">'+rows.join('')+'</div>';
 }
-function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-').slice(0,12)||n;}
+function shortModel(n){return String(n).replace(/^GLM[- ]?/i,'GLM-')||n;}
 /* 万/亿 缩写（zcode-switch 同款） */
 function fmtNum(v){
   const n=Number(v);if(!isFinite(n))return '—';
