@@ -279,7 +279,8 @@ function tickbarHtml(a){
 
 function usageCell(a){
   const used=a.use_count||0, fail=a.fail_count||0, strikes=a.risk_strikes||0;
-  const rate=used>0?Math.round((used-fail)/used*100):null;
+  // 成功率=成功/(成功+失败)：fail_count 是历史累计（可能大于 use_count），不能用差值公式
+  const rate=used>0||fail>0?Math.round(used/(used+fail)*100):null;
   return `<div class="usage-mini">
     <div class="usage-line"><span class="u-label">调用</span><span class="u-val">${used}</span><span class="u-label">成功率</span><span class="u-val ${rate===null?'':(rate>=90?'u-ok':'u-warn')}">${rate===null?'—':rate+'%'}</span></div>
     <div class="usage-line"><span class="u-label">失败</span><span class="u-val ${fail>0?'u-bad':''}">${fail}</span><span class="u-label">风控</span><span class="u-val ${strikes>0?'u-bad':''}">${strikes}</span></div>
