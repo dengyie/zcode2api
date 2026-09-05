@@ -52,7 +52,6 @@ DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
 CAPTCHA_POOL_MIN = _int("CAPTCHA_POOL_MIN", 3)        # 目标库存（低于则补）
 CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 10)       # 池上限
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
-CAPTCHA_CACHE_TTL = _int("CAPTCHA_CACHE_TTL", 45_000)          # 兼容旧配置，已不再使用
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
 # 验证码求解（无浏览器：Node + jsdom 模拟浏览器环境，运行阿里云无痕 SDK）
@@ -65,6 +64,9 @@ CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 40)  # 每次求解超时�
 # ── 用量监控 ─────────────────────────────────────────────────────────────────
 # 后台自动刷新账号额度的间隔（秒）。0 表示关闭后台轮询，仅按需刷新。
 QUOTA_REFRESH_INTERVAL = _int("ZCODE_QUOTA_REFRESH_INTERVAL", 60)
+# 成功对话后计费刷新的最小间隔（秒）：billing/* 连续查询易触发上游拦截，
+# 每条消息都刷是流量放大器，与 monitor 轮询共享 last_checked_at 去抖。
+BILLING_REFRESH_MIN_INTERVAL = _int("ZCODE_BILLING_REFRESH_MIN_INTERVAL", 60)
 # 限流（cooling）冷却时长（秒）
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
 

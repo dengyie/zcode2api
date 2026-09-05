@@ -628,7 +628,7 @@ async function onImportFile(ev){
 
 /* ── Helpers ── */
 function set(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
-function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function fmtDate(d){if(!d)return'—';const dt=new Date(d*1000);return isNaN(dt)?'—':dt.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
 function fmtDur(s){s=Math.max(0,Math.round(s));if(s<60)return s+'秒';const m=Math.floor(s/60);if(m<60)return m+'分';const h=Math.floor(m/60);return h+'小时'+(m%60?(m%60)+'分':'');}
 function openModal(id){document.getElementById(id).classList.add('open');}

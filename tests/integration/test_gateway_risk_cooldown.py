@@ -200,6 +200,40 @@ def test_parse_retry_after():
 
 
 @pytest.mark.integration
+class TestBillingRefreshDebounce:
+    """成功对话后的计费刷新去抖：每条消息都刷 billing 是流量放大器（review P2）。"""
+
+    async def test_success_refresh_debounced(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="a-deb")
+        body = {"model": "GLM-5.2", "messages": [{"role": "user", "content": "hi"}]}
+
+        before = len(mock.state.calls)
+        res1 = await client.post("/v1/messages", json=body)
+        assert res1.status_code == 200
+        await asyncio.sleep(0.3)  # 等 _safe_refresh 后台任务跑完
+        first = len([c for c in mock.state.calls[before:] if "/billing" in c[1]])
+        assert first >= 2  # 首刷发生（current+balance；usage 路径不含 /billing）
+
+        res2 = await client.post("/v1/messages", json=body)
+        assert res2.status_code == 200
+        await asyncio.sleep(0.3)
+        second = len([c for c in mock.state.calls[before:] if "/billing" in c[1]])
+        assert second == first  # 60s 去抖窗口内不重刷
+
+        # 去抖窗口过后（模拟时间流逝）恢复刷新
+        for a in fresh_app.list_accounts("zai"):
+            a.last_checked_at = time.time() - settings.BILLING_REFRESH_MIN_INTERVAL - 1
+        res3 = await client.post("/v1/messages", json=body)
+        assert res3.status_code == 200
+        await asyncio.sleep(0.3)
+        third = len([c for c in mock.state.calls[before:] if "/billing" in c[1]])
+        assert third >= first + 2
+
+
+@pytest.mark.integration
 class TestAdminEndpointsRespectCooldown:
     """后台手动路径与 QuotaMonitor 同一不变量：冷却期零上游流量。"""
 

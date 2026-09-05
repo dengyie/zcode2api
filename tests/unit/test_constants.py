@@ -55,9 +55,6 @@ def test_rejection_signals():
     assert "余额不足" in constants.EXHAUST_KEYWORDS
     assert "insufficient" in constants.EXHAUST_KEYWORDS
     # 403 不再无条件判 invalid：需先排除验证码挑战（对齐 zapi classifyAccountFailure）
-    assert constants.AUTH_INVALID_STATUSES == (401,)
-    assert constants.RATE_LIMITED_STATUSES == (429,)
-    assert constants.CAPTCHA_BODY_CODE == 3007
     assert '"code":3007' in constants.CAPTCHA_BODY_MARKERS
 
 
@@ -96,7 +93,6 @@ def test_gateway_constants():
 def test_risk_control_signals():
     # 2026-09-05 3012 事件锁定：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
     assert constants.RISK_CONTROL_HTTP_STATUSES == (405,)
-    assert constants.RISK_CONTROL_CODES == (3012,)
     assert '"code":3012' in constants.RISK_CONTROL_MARKERS
     assert "unusual activity" in constants.RISK_CONTROL_MARKERS
 

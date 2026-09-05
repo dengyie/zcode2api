@@ -63,7 +63,7 @@ CREATE TABLE claim_history (
 | `CLAIM_ENABLED` / `CLAIM_AUTO` | false / true | 领取开关 / 后台自动 |
 | `CLAIM_POLL_INTERVAL` / `CLAIM_COOLDOWN` | 300s / 600s | 领取轮询 / 失败退避 |
 | `ZAI_UPSTREAM_URL` / `ZAI_FALLBACK_URL` / `BIGMODEL_UPSTREAM_URL` | 官方端点 | 上游可覆写（测试注入用） |
-| `ZCODE_NODE_PATH` / `ZCODE_CAPTCHA_TIMEOUT` / `ZCODE_CAPTCHA_RETRIES` / `CAPTCHA_CACHE_TTL` | node / 40s / 4 / 45000ms | 验证码求解 |
+| `ZCODE_NODE_PATH` / `ZCODE_CAPTCHA_TIMEOUT` / `ZCODE_CAPTCHA_RETRIES` | node / 40s / 4 | 验证码求解 |
 
 ## 3. enc:v1 编解码（ZCode 客户端凭证格式，zsw zcrypto.rs）
 

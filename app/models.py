@@ -18,8 +18,6 @@ class Status:
     INVALID = "invalid"      # 凭证失效 / 鉴权失败
     DISABLED = "disabled"    # 手动禁用
 
-    MANAGEABLE = (ACTIVE, COOLING, EXHAUSTED)
-
 
 def _account_id(name: str) -> str:
     safe = "".join(c if c.isalnum() else "-" for c in (name or "account").lower())

@@ -9,8 +9,8 @@ coding-plan 通道（本服务 JWT 通道）应用三项：
      "finalizeLatestNonSystemCacheControl"）。Anthropic API 对低于缓存门槛的
      请求静默忽略 cache_control，因此无条件追加是安全的。
   3. metadata.user_id：JWT 账号存在 user_id 时注入（镜像 bundle 的
-     `user_id: B.metadata.userId`）。user_id 从 JWT payload 解出（sub 字段），
-     进程内缓存，token 刷新后自动跟随。
+     `user_id: B.metadata.userId`）。user_id 每次从 JWT payload（sub / user_id
+     字段）实时解出，token 刷新后自动跟随。
 
 所有变换对畸形输入保持 no-op：解析失败返回原样，坏 body 永远不会被这里放大。
 """

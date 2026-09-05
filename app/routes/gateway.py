@@ -355,6 +355,11 @@ def _safe_json(text: str):
 async def _safe_refresh(account: Account) -> None:
     try:
         if account.provider == "zai" and account.mode == "jwt":
+            # 去抖：每条消息都刷 billing 是流量放大器（会加剧风控），与 monitor 共享
+            # last_checked_at，最小间隔内的刷新直接跳过
+            last = account.last_checked_at
+            if last and time.time() - last < settings.BILLING_REFRESH_MIN_INTERVAL:
+                return
             await fetch_quota(account)
     except Exception:  # noqa: BLE001
         pass
