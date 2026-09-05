@@ -66,6 +66,11 @@ MODEL_NAME_MAP = {
 # 上游 3006 model not allowed；按账号实际余额窗口公布）
 AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
 
+# 上游 max_tokens 合法范围（2026-09-06 实测：超限报 400 code 1210
+# 「max_tokens参数非法：限制数值范围[1,131072]」，客户端（如 auto-compact 续传）
+# 可能带更大的值，网关统一钳制）
+MAX_TOKENS_LIMIT = 131072
+
 # ── 请求头 ───────────────────────────────────────────────────────────────────
 ANTHROPIC_VERSION = "2023-06-01"
 USER_AGENT = f"ZCode/{CLIENT_APP_VERSION}"

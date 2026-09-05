@@ -48,6 +48,35 @@ class TestChatCompletions:
         payload = json.loads(mock.state.calls[-1][3])
         assert payload["system"][-1]["text"] == "守则"  # 用户 system 位于官方身份块之后
 
+    async def test_max_tokens_clamped_to_upstream_limit(self, gateway_client, fresh_app):
+        """上游 400 code 1210：max_tokens 上限 131072，网关钳制（GW-012）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="oai-mt")
+        res = await client.post(
+            "/v1/messages",
+            json={"model": "GLM-5.3", "max_tokens": 999999,
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert res.status_code == 200
+        payload = json.loads(mock.state.calls[-1][3])
+        assert payload["max_tokens"] == 131072
+
+    async def test_max_tokens_floor_and_passthrough(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="oai-mt2")
+        res = await client.post(
+            "/v1/messages",
+            json={"model": "GLM-5.3", "max_tokens": 1024,
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert res.status_code == 200
+        payload = json.loads(mock.state.calls[-1][3])
+        assert payload["max_tokens"] == 1024  # 合法值原样透传
+
     async def test_stream_returns_openai_chunks(self, gateway_client, fresh_app):
         client, mock = gateway_client
         from tests.conftest import seed_account

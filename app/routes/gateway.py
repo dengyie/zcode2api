@@ -50,6 +50,11 @@ def _normalize_body(body: dict) -> dict:
         model = MODEL_NAME_MAP.get(model.lower(), model)
         body["model"] = model
 
+    # 上游对 max_tokens 有硬校验（400 code 1210），钳制到合法区间
+    max_tokens = body.get("max_tokens")
+    if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool):
+        body["max_tokens"] = max(1, min(int(max_tokens), constants.MAX_TOKENS_LIMIT))
+
     messages = body.get("messages")
     if isinstance(messages, list):
         bridged = []
@@ -450,11 +455,12 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，冷却 {cool}s，切换下一个")
                 return _NEXT_ACCOUNT
 
-            # 其它 4xx：直接回传客户端
+            # 其它 4xx：直接回传客户端（响应体截断落日志，供排查上游拒绝原因）
             account.fail_count += 1
             account.record_result(False)
             store.update_account(account)
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
+            logs.warn(req_id, f"上游 {status_code} 响应体: {text[:200]!r}")
             return JSONResponse(
                 _safe_json(text) or {"error": {"message": text[:500], "type": "upstream_error"}},
                 status_code=status_code,
