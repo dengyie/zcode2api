@@ -176,6 +176,10 @@ select.input option{background:var(--panel);color:var(--ink)}
 .quota-row-fill{display:block;height:100%;border-radius:999px;transition:width .3s}
 .quota-row-val{font-size:11px;color:var(--ink-mute);white-space:nowrap;font-variant-numeric:tabular-nums;font-family:var(--mono);display:flex;flex-direction:column;align-items:flex-end;line-height:1.35}
 .quota-row-exp{font-size:10px;color:var(--ink-mute);opacity:.7}
+/* 活动赠送额度：薄荷色斜纹流动条，区别于实心实额度条与琥珀待生效条 */
+.quota-row.is-bonus .quota-row-name{color:var(--ink-dim)}
+.quota-row.is-bonus .quota-row-fill{background-image:repeating-linear-gradient(45deg,var(--mint) 0,var(--mint) 4px,transparent 4px,transparent 8px);background-size:200% 100%;opacity:.6;animation:quotaFlow 1.1s linear infinite}
+.quota-row.is-bonus .quota-row-exp{color:var(--mint);opacity:.9}
 /* 已领待生效额度：斜纹流动条，与实心实额度条区分 */
 .quota-row.is-pending .quota-row-name{color:var(--ink-mute);font-weight:500}
 .quota-row.is-pending .quota-row-fill{background-image:repeating-linear-gradient(45deg,var(--amber) 0,var(--amber) 4px,transparent 4px,transparent 8px);background-size:200% 100%;opacity:.75;animation:quotaFlow 1.1s linear infinite}

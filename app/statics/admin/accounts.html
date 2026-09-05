@@ -327,11 +327,24 @@ function quotaCell(a){
       <span class="quota-row-val"><span>${fmtNum(rem)} / ${fmtNum(tot)}</span>${exp?`<span class="quota-row-exp" title="本窗口额度到期时间">至 ${fmtDate(exp)}</span>`:''}</span>
     </div>`;
   });
-  // 已领待生效的活动套餐（plan.entitlements 里 effective_at 在未来的项）：
-  // 尚未进 balance，quota 里看不到 —— 单独渲染斜纹待生效条
+  // 活动额度（plan.entitlements）：
+  // ① one_time 已生效 —— billing/balance 不体现这类一次性赠送，单独渲染「活动赠送」行
+  // ② 待生效（effective_at 在未来）—— 斜纹流动条，过点自动转正
   const now=Date.now()/1000;
-  const pending=(((a.plan||{}).entitlements)||[]).filter(e=>Number(e.effective_at)>now);
-  pending.forEach(e=>{
+  const ents=(((a.plan||{}).entitlements)||[]);
+  ents.filter(e=>{
+    const eff=Number(e.effective_at)||0, ends=Number(e.ends_at||e.expires_at)||0;
+    return e.period==='one_time'&&eff>0&&eff<=now&&(!ends||now<=ends);
+  }).forEach(e=>{
+    const eff=Number(e.effective_at)||0, ends=Number(e.ends_at||e.expires_at)||0;
+    const tip=`活动赠送 ${fmtNum(e.grant_units)} · ${fmtDate(eff)} 生效${ends?'，'+fmtDate(ends)+' 结束':''} · 实际剩余以上游账单为准`;
+    rows.push(`<div class="quota-row is-bonus">
+      <span class="quota-row-name" title="${tip}">🎁 ${esc(shortModel(e.show_name||'活动额度'))}</span>
+      <span class="quota-row-track"><span class="quota-row-fill" style="width:100%"></span></span>
+      <span class="quota-row-val"><span>+${fmtNum(e.grant_units)}</span><span class="quota-row-exp" title="${tip}">${ends?fmtDate(eff)+' ~ '+fmtDate(ends):fmtDate(eff)+' 起有效'}</span></span>
+    </div>`);
+  });
+  ents.filter(e=>Number(e.effective_at)>now).forEach(e=>{
     const eff=Number(e.effective_at)||0;
     const tip=`${esc((a.plan||{}).name||'')} · ${fmtDate(eff)} 起生效${(a.plan||{}).ends_at?'，套餐 '+fmtDate(a.plan.ends_at)+' 结束':''}`;
     rows.push(`<div class="quota-row is-pending">
