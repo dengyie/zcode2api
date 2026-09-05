@@ -15,7 +15,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, logs, settings
+from .. import constants, logs, reqlog, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -191,6 +191,8 @@ async def messages(request: Request):
 
     req_id = secrets.token_hex(3)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
+    reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
+                 bool(body.get("stream")), _last_user_text(body))
 
     result = await _dispatch(req_id, body, incoming_headers, port, provider)
     if isinstance(result, _Upstream):
@@ -218,6 +220,8 @@ async def chat_completions(request: Request):
 
     req_id = secrets.token_hex(3)
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
+    reqlog.begin(req_id, "chat", str(body.get("model") or "-"),
+                 bool(payload.get("stream")), _last_user_text(body))
 
     result = await _dispatch(req_id, body, incoming_headers, port, provider)
     if not isinstance(result, _Upstream):
@@ -232,12 +236,17 @@ async def chat_completions(request: Request):
         logs.req_ok(req_id)
     except Exception as err:  # noqa: BLE001
         logs.req_err(req_id, f"读取上游响应失败: {err}")
+        reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502)
         return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
     finally:
         await result.close()
     data = _safe_json(raw.decode("utf-8", "ignore"))
     if not isinstance(data, dict) or data.get("type") != "message":
+        reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first)
         return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
+    usage = data.get("usage") or {}
+    reqlog.finish_ok(req_id, t_first=result.t_first,
+                     input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
     return JSONResponse(anthropic_to_openai(data, model))
 
 
@@ -260,8 +269,15 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
                         yield out
             yield conv.done()
             logs.req_ok(req_id)
+            reqlog.finish_ok(req_id, t_first=up.t_first,
+                             input_tokens=conv.usage.get("prompt_tokens"),
+                             output_tokens=conv.usage.get("completion_tokens"))
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            raise
         except Exception as err:  # noqa: BLE001
             logs.req_err(req_id, f"流传输中断: {err}")
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
         finally:
             await up.close()
 
@@ -286,6 +302,7 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
         return result
 
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽")
+    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽", status=503)
     return JSONResponse(
         {"error": {"message": "所有账号均不可用或额度已用完，请在后台检查账号状态", "type": "no_available_account"}},
         status_code=503,
@@ -298,12 +315,16 @@ _NEXT_ACCOUNT = object()
 class _Upstream:
     """已建立的上游成功流：由调用方消费并负责关闭。"""
 
-    __slots__ = ("resp", "cm", "client")
+    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode")
 
-    def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient) -> None:
+    def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
+                 t_first: float | None = None, account_name: str = "", mode: str = "") -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
+        self.t_first = t_first
+        self.account_name = account_name
+        self.mode = mode
 
     async def close(self) -> None:
         await self.cm.__aexit__(None, None, None)
@@ -318,8 +339,13 @@ class _Upstream:
                 async for chunk in up.resp.aiter_bytes():
                     yield chunk
                 logs.req_ok(req_id)
+                reqlog.finish_ok(req_id, t_first=up.t_first)
+            except asyncio.CancelledError:
+                reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+                raise
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"流传输中断: {err}")
+                reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
             finally:
                 await up.close()
 
@@ -347,12 +373,14 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
     model_name = str(body.get("model") or "-")
     while True:
         attempt_t0 = time.time()
+        reqlog.mark_account(req_id, account.name, account.mode)
         verify_param = verify_region = None
         if needs_captcha:
             try:
                 verify_param, verify_region = await captcha_manager.get_verify_param(port)
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"人机校验失败: {err}")
+                reqlog.finish_error(req_id, f"人机校验失败: {err}", status=500)
                 return JSONResponse(
                     {"error": {"message": f"无法完成人机校验: {err}", "type": "captcha_error"}},
                     status_code=500,
@@ -481,6 +509,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
             body_log = text if len(text) <= 4000 else text[:4000] + f"...(共 {len(text)} 字节，疑似 WAF 页)"
             logs.warn(req_id, f"上游 {status_code} 完整响应体: {body_log}")
+            reqlog.finish_error(req_id, f"HTTP {status_code}: {text[:120]}".replace("\n", " "),
+                                status=status_code, t_first=time.time() - attempt_t0)
             return JSONResponse(
                 _safe_json(text) or {"error": {"message": text[:500], "type": "upstream_error"}},
                 status_code=status_code,
@@ -498,7 +528,8 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         store.update_account(account)
         asyncio.create_task(_safe_refresh(account))
 
-        return _Upstream(resp, cm, client)
+        return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
+                         account_name=account.name, mode=account.mode)
 
 
 def _safe_json(text: str):

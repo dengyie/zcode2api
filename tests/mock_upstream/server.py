@@ -210,6 +210,8 @@ def build_app() -> FastAPI:
             return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
         if scenario == "server_error":
             return 500, {"error": "internal"}, {}
+        if scenario == "not_found":
+            return 404, _error_body("no such route", type="invalid_request_error"), {}
         if scenario == "garbage_body":
             return 200, "<html>not json</html>", {}
         return 200, ok_body, {}

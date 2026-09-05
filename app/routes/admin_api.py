@@ -7,6 +7,7 @@ import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
+from .. import reqlog
 from ..auth_admin import verify_admin_key
 from ..claim import ClaimError, claim_with_captcha, preview_plans
 from ..claim import claim as do_claim
@@ -400,3 +401,16 @@ async def export_accounts():
 async def import_accounts(payload: dict = Body(...)):
     count = store.import_accounts(payload)
     return {"count": count}
+
+
+# ── 请求监控 ─────────────────────────────────────────────────────────────────
+@router.get("/monitoring")
+async def monitoring():
+    """网关请求环形日志（内存态，重启清零）。前端自行聚合统计。"""
+    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP}
+
+
+@router.post("/monitoring/clear")
+async def monitoring_clear():
+    reqlog.clear()
+    return {"ok": True}

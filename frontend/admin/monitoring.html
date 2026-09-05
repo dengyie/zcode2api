@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zcode-hub · 请求监控</title>
+  <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
+  <link href="/static/css/app.css?v={{APP_VERSION}}" rel="stylesheet">
+</head>
+<body>
+<div id="admin-header" data-active="/admin/monitoring"></div>
+
+<main class="admin-main">
+  <div class="page-hd">
+    <div>
+      <div class="page-title">请求监控</div>
+      <div class="page-sub">网关请求实时观测 · 内存环形日志（保留最近 500 条，重启清零）</div>
+    </div>
+    <div class="page-actions">
+      <span class="live-dot" id="live-dot">实时监控中</span>
+      <button onclick="doRefresh()" class="page-action-btn">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M20 11a8 8 0 0 0-14.6-4.6"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.6 4.6"/><path d="M20 20v-5h-5"/></svg>
+        刷新
+      </button>
+      <button onclick="doClear()" class="page-action-btn" id="btn-clear">
+        <svg width="14" height="14" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+        清空
+      </button>
+    </div>
+  </div>
+
+  <div class="filter-bar" id="filter-bar">
+    <div class="filter-chips" id="range-chips"></div>
+    <input class="input mon-search" id="search" placeholder="搜索账号、模型、内容、错误…" oninput="onSearch(this.value)">
+    <select class="input mon-select" id="status-sel" onchange="onStatus(this.value)">
+      <option value="all">全部状态</option>
+      <option value="ok">成功</option>
+      <option value="fail">失败</option>
+      <option value="inflight">进行中</option>
+    </select>
+  </div>
+
+  <div class="stat-grid" id="stat-grid">
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">调用</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg></span></div><div class="stat-num" id="s-calls">0</div><div class="stat-sub" id="s-calls-sub"></div><div id="s-calls-spark"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">成功率</div><span class="stat-icon" style="color:var(--mint)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="m8.5 12 2.4 2.4 4.8-4.8"/></svg></span></div><div class="stat-num" id="s-rate" style="color:var(--mint)">—</div><div class="stat-sub" id="s-rate-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">失败</div><span class="stat-icon" style="color:var(--red)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="12" cy="12" r="8"/><path d="M15 9l-6 6"/><path d="M9 9l6 6"/></svg></span></div><div class="stat-num" id="s-fail" style="color:var(--red)">0</div><div class="stat-sub" id="s-fail-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">Token 总量</div><span class="stat-icon" style="color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M21 8a9 3 0 0 1-18 0 9 3 0 0 1 18 0Z"/><path d="M3 8v8a9 3 0 0 0 18 0V8"/></svg></span></div><div class="stat-num" id="s-tok" style="color:var(--amber)">—</div><div class="stat-sub" id="s-tok-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">输入</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></span></div><div class="stat-num" id="s-in">—</div><div class="stat-sub" id="s-in-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">输出</div><span class="stat-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/></svg></span></div><div class="stat-num" id="s-out">—</div><div class="stat-sub" id="s-out-sub"></div></div>
+    <div class="stat-cell"><div class="stat-top"><div class="stat-label">平均首字</div><span class="stat-icon" style="color:#6da8e8"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5"/><path d="M9 2h6"/></svg></span></div><div class="stat-num" id="s-ttfb" style="color:#6da8e8">—</div><div class="stat-sub" id="s-ttfb-sub"></div></div>
+  </div>
+
+  <div class="section-head">
+    <div class="mon-tabs" id="mon-tabs">
+      <button class="mon-tab" data-tab="account" onclick="setTab('account')">账号</button>
+      <button class="mon-tab" data-tab="model" onclick="setTab('model')">模型</button>
+      <button class="mon-tab active" data-tab="live" onclick="setTab('live')">实时 <span class="mon-tab-count" id="live-count">0</span></button>
+    </div>
+    <div class="section-meta" id="last-updated"></div>
+  </div>
+
+  <div class="acct-list" id="list"></div>
+</main>
+
+<script src="/static/js/auth.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/toast.js?v={{APP_VERSION}}"></script>
+<script src="/static/js/header.js?v={{APP_VERSION}}"></script>
+<script>
+let entries = [];
+let tab = 'live';
+const state = { range: 'today', status: 'all', q: '' };
+let pollTimer = null;
+
+const $ = id => document.getElementById(id);
+
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function pad(n){return String(n).padStart(2,'0');}
+function fmtTs(ts){
+  if(!ts)return '—';
+  const d=new Date(ts*1000);
+  return `${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function fmtTok(n){
+  if(n==null||isNaN(n))return '—';
+  if(n>=1e8)return (n/1e8).toFixed(2)+' 亿';
+  if(n>=1e4)return (n/1e4).toFixed(1)+' 万';
+  if(n>=1e3)return (n/1e3).toFixed(1)+'K';
+  return String(Math.round(n));
+}
+function fmtSec(v){
+  if(v==null||isNaN(v))return '—';
+  return v<1?Math.round(v*1000)+'ms':v.toFixed(2)+'s';
+}
+function spark(vals,color){
+  const w=110,h=26;
+  if(!vals.length)return '';
+  const max=Math.max(...vals,1);
+  const pts=vals.map((v,i)=>`${(i/Math.max(vals.length-1,1))*w},${h-2-(v/max)*(h-5)}`).join(' ');
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
+}
+
+function filtered(){
+  const now=Date.now()/1000;
+  const midnight=new Date(); midnight.setHours(0,0,0,0);  // 本地零点
+  const minTs = state.range==='1h' ? now-3600 : state.range==='today' ? midnight.getTime()/1000 : 0;
+  const q=state.q.trim().toLowerCase();
+  return entries.filter(e=>{
+    if(e.ts<minTs)return false;
+    if(state.status==='ok'&&e.ok!==true)return false;
+    if(state.status==='fail'&&e.ok!==false)return false;
+    if(state.status==='inflight'&&e.ok!==null)return false;
+    if(q){
+      const hay=`${e.account} ${e.model} ${e.preview} ${e.error} ${e.endpoint}`.toLowerCase();
+      if(!hay.includes(q))return false;
+    }
+    return true;
+  });
+}
+
+function renderStats(list){
+  const total=list.length;
+  const ok=list.filter(e=>e.ok===true).length;
+  const fail=list.filter(e=>e.ok===false).length;
+  const inflight=list.filter(e=>e.ok===null).length;
+  const tin=list.reduce((a,e)=>a+(e.input_tokens||0),0);
+  const tout=list.reduce((a,e)=>a+(e.output_tokens||0),0);
+  const ttfbs=list.filter(e=>e.t_first!=null).map(e=>e.t_first);
+  const ttfb=ttfbs.length?ttfbs.reduce((a,b)=>a+b,0)/ttfbs.length:null;
+
+  $('s-calls').textContent=total;
+  $('s-calls-sub').textContent=`进行中 ${inflight} · 内存保留 ${KEEP} 条`;
+  $('s-rate').textContent=total?(ok/(ok+fail||1)*100).toFixed(1)+'%':'—';
+  $('s-rate-sub').textContent=`成功 ${ok}`;
+  $('s-fail').textContent=fail;
+  $('s-fail-sub').textContent=fail?'点击「失败」筛选查看':'';
+  $('s-tok').textContent=(tin||tout)?fmtTok(tin+tout):'—';
+  $('s-tok-sub').textContent='仅非流式与 OpenAI 流可统计';
+  $('s-in').textContent=fmtTok(tin);
+  $('s-in-sub').textContent=`占比 ${tin+tout?Math.round(tin/(tin+tout)*100):0}%`;
+  $('s-out').textContent=fmtTok(tout);
+  $('s-out-sub').textContent=`占比 ${tin+tout?Math.round(tout/(tin+tout)*100):0}%`;
+  $('s-ttfb').textContent=ttfb!=null?fmtSec(ttfb):'—';
+  $('s-ttfb-sub').textContent=ttfbs.length?`样本 ${ttfbs.length}`:'';
+
+  // 近 30 分钟每分钟调用量走势
+  const now=Math.floor(Date.now()/1000/60);
+  const buckets=new Array(30).fill(0);
+  for(const e of list){
+    const m=Math.floor(e.ts/60);
+    const idx=30-(now-m);
+    if(idx>=0&&idx<30)buckets[idx]++;
+  }
+  $('s-calls-spark').innerHTML=spark(buckets,'var(--amber)');
+  $('live-count').textContent=total;
+}
+
+function statusCell(e){
+  if(e.ok===true)return `<span class="badge badge-active">成功</span>`;
+  if(e.ok===null)return `<span class="badge badge-cooling">进行中</span>`;
+  const label=e.status===499?'客户端断开':`失败${e.status?` · HTTP ${e.status}`:''}`;
+  return `<span class="badge badge-invalid" title="${esc(e.error||'')}">${label}</span>`;
+}
+
+function tickbarHtml(items){
+  if(!items.length)return '<span class="tickbar-empty">—</span>';
+  return `<span class="tickbar">${items.map(e=>`<i class="${e.ok===true?'ok':e.ok===false?'bad':''}" title="${esc(fmtTs(e.ts))} ${e.ok===true?'成功':e.ok===false?esc(e.error||'失败'):'进行中'}"></i>`).join('')}</span>`;
+}
+
+function renderAgg(key){
+  const map=new Map();
+  for(const e of filtered()){
+    const k=e[key]||'—';
+    if(!map.has(k))map.set(k,{name:k,items:[],ok:0,fail:0,inflight:0,tin:0,tout:0,ttfbs:[],last:null});
+    const g=map.get(k);
+    g.items.push(e);
+    if(e.ok===true)g.ok++;else if(e.ok===false)g.fail++;else g.inflight++;
+    g.tin+=e.input_tokens||0;g.tout+=e.output_tokens||0;
+    if(e.t_first!=null)g.ttfbs.push(e.t_first);
+    if(!g.last||e.ts>g.last)g.last=e.ts;
+  }
+  const rows=[...map.values()].sort((a,b)=>(b.ok+b.fail+b.inflight)-(a.ok+a.fail+a.inflight));
+  const head=`<div class="mon-head mon-grid-agg"><span>${key==='account'?'账号':'模型'}</span><span>最近状态</span><span>成功率</span><span>调用</span><span>输入</span><span>输出</span><span>平均首字</span><span>最近请求</span></div>`;
+  const body=rows.map(g=>{
+    const done=g.ok+g.fail;
+    const rate=done?Math.round(g.ok/done*100)+'%':'—';
+    const ttfb=g.ttfbs.length?fmtSec(g.ttfbs.reduce((a,b)=>a+b,0)/g.ttfbs.length):'—';
+    return `<div class="mon-row mon-grid-agg">
+      <span class="mon-name">${esc(g.name)}</span>
+      <span>${tickbarHtml(g.items.slice(-20))}</span>
+      <span class="mon-num">${rate}</span>
+      <span class="mon-num">${g.ok+g.fail+g.inflight}</span>
+      <span class="mon-num">${fmtTok(g.tin)}</span>
+      <span class="mon-num">${fmtTok(g.tout)}</span>
+      <span class="mon-num">${ttfb}</span>
+      <span class="mon-time">${fmtTs(g.last)}</span>
+    </div>`;
+  }).join('');
+  $('list').innerHTML=rows.length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">所选时间范围内没有请求</div>`;
+}
+
+function renderLive(){
+  const head=`<div class="mon-head mon-grid-live"><span>时间</span><span>账号</span><span>模型</span><span>状态</span><span>首字</span><span>总耗时</span><span>输入</span><span>输出</span><span>内容 / 错误</span></div>`;
+  const body=filtered().slice(0,200).map(e=>`
+    <div class="mon-row mon-grid-live">
+      <span class="mon-time">${fmtTs(e.ts)}</span>
+      <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}</span>
+      <span class="mon-model" title="${esc(e.model||'')}">${esc(e.model||'—')}</span>
+      <span>${statusCell(e)}</span>
+      <span class="mon-num">${fmtSec(e.t_first)}</span>
+      <span class="mon-num">${fmtSec(e.t_total)}</span>
+      <span class="mon-num">${fmtTok(e.input_tokens)}</span>
+      <span class="mon-num">${fmtTok(e.output_tokens)}</span>
+      <span class="mon-preview" title="${esc(e.error||e.preview||'')}">${e.ok===false&&e.error?`<span class="err-line">${esc(e.error)}</span>`:esc(e.preview||'—')}${e.stream?' <span class="mon-stream">流</span>':''}</span>
+    </div>`).join('');
+  $('list').innerHTML=filtered().length?`<div class="acct-table">${head}${body}</div>`:`<div class="empty-state">所选时间范围内没有请求</div>`;
+}
+
+function render(){
+  const list=filtered();
+  renderStats(list);
+  if(tab==='live')renderLive();else renderAgg(tab);
+  $('last-updated').textContent=`更新于 ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
+}
+
+function renderChips(){
+  const defs=[['1h','1 小时'],['today','今天'],['all','全部']];
+  $('range-chips').innerHTML=defs.map(([v,label])=>
+    `<button class="filter-chip${state.range===v?' active':''}" onclick="setRange('${v}')">${label}</button>`).join('');
+}
+
+function setRange(v){state.range=v;renderChips();render();}
+function setTab(t){tab=t;document.querySelectorAll('.mon-tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));render();}
+function onSearch(v){state.q=v;render();}
+function onStatus(v){state.status=v;render();}
+
+async function load(){
+  const res=await api('GET','/monitoring');
+  entries=res.entries||[];
+  window.KEEP=res.keep||500;
+  render();
+}
+function doRefresh(){load().catch(()=>showToast('加载失败','error'));}
+async function doClear(){
+  await api('POST','/monitoring/clear');
+  showToast('已清空','success');
+  load();
+}
+
+(async()=>{
+  const key=await adminKey.get();
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  renderChips();
+  await renderAdminHeader();
+  await load();
+  pollTimer=setInterval(()=>{if(!document.hidden)load().catch(()=>{});},5000);
+})();
+</script>
+</body>
+</html>
