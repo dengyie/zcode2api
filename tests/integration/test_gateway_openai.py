@@ -63,6 +63,21 @@ class TestChatCompletions:
         payload = json.loads(mock.state.calls[-1][3])
         assert payload["max_tokens"] == 131072
 
+    async def test_max_tokens_string_form_clamped(self, gateway_client, fresh_app):
+        """字符串型 max_tokens 也要钳制，防止绕过类型检查打到上游 1210。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="oai-mt-str")
+        res = await client.post(
+            "/v1/messages",
+            json={"model": "GLM-5.3", "max_tokens": "999999",
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert res.status_code == 200
+        payload = json.loads(mock.state.calls[-1][3])
+        assert payload["max_tokens"] == 131072
+
     async def test_max_tokens_floor_and_passthrough(self, gateway_client, fresh_app):
         client, mock = gateway_client
         from tests.conftest import seed_account

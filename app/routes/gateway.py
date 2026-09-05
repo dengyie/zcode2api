@@ -50,10 +50,18 @@ def _normalize_body(body: dict) -> dict:
         model = MODEL_NAME_MAP.get(model.lower(), model)
         body["model"] = model
 
-    # 上游对 max_tokens 有硬校验（400 code 1210），钳制到合法区间
-    max_tokens = body.get("max_tokens")
-    if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool):
-        body["max_tokens"] = max(1, min(int(max_tokens), constants.MAX_TOKENS_LIMIT))
+    # 上游对 max_tokens 有硬校验（400 code 1210），钳制到合法区间并记录钳制动作
+    raw = body.get("max_tokens")
+    if raw is not None and not isinstance(raw, bool):
+        try:
+            mt = int(float(raw))
+        except (TypeError, ValueError):
+            mt = None
+        if mt is not None:
+            clamped = max(1, min(mt, constants.MAX_TOKENS_LIMIT))
+            if clamped != mt:
+                logs.warn("gateway", f"max_tokens {mt} 超出上游范围 [1,{constants.MAX_TOKENS_LIMIT}]，钳制为 {clamped}")
+            body["max_tokens"] = clamped
 
     messages = body.get("messages")
     if isinstance(messages, list):
@@ -455,12 +463,14 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，冷却 {cool}s，切换下一个")
                 return _NEXT_ACCOUNT
 
-            # 其它 4xx：直接回传客户端（响应体截断落日志，供排查上游拒绝原因）
+            # 其它 4xx：直接回传客户端；响应体全量落日志供排查
+            # （错误 JSON 通常很小；防御性上限 4KB，超长按 HTML 类 WAF 页处理只留头部）
             account.fail_count += 1
             account.record_result(False)
             store.update_account(account)
             logs.req_err(req_id, f"上游错误 HTTP {status_code}（账号 {account.name}）")
-            logs.warn(req_id, f"上游 {status_code} 响应体: {text[:200]!r}")
+            body_log = text if len(text) <= 4000 else text[:4000] + f"...(共 {len(text)} 字节，疑似 WAF 页)"
+            logs.warn(req_id, f"上游 {status_code} 完整响应体: {body_log}")
             return JSONResponse(
                 _safe_json(text) or {"error": {"message": text[:500], "type": "upstream_error"}},
                 status_code=status_code,
