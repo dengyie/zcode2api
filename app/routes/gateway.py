@@ -114,15 +114,18 @@ def _is_risk_control(status_code: int, text: str) -> bool:
 
 
 def _parse_retry_after(value: str | None) -> int | None:
-    """解析 Retry-After（仅秒数形态；HTTP-date 形态少见，放弃即回退默认冷却）。"""
+    """解析 Retry-After（仅秒数形态；HTTP-date 形态少见，放弃即回退默认冷却）。
+
+    非正数不采信；超长值封顶采信而非丢弃 —— 把合法的 2h Retry-After 丢掉会
+    5 分钟后就重试，形成 429 循环。封顶取风控上限同款 6h。
+    """
     if not value:
         return None
     try:
         secs = int(float(value.strip()))
     except (ValueError, AttributeError):
         return None
-    # 上游异常值防御：非正数不采信，过长封顶 1h（防呆标记把账号冻结到天外）
-    return secs if 0 < secs <= 3600 else None
+    return min(secs, settings.RISK_COOLDOWN_MAX) if secs > 0 else None
 
 
 def _mark(account: Account, status_value: str, error: str | None = None) -> None:
@@ -130,6 +133,7 @@ def _mark(account: Account, status_value: str, error: str | None = None) -> None
     account.last_error = error
     if status_value == Status.COOLING:
         account.cooling_until = time.time() + settings.COOLING_SECONDS
+        account.cooling_is_risk = False  # 连接失败类冷却，不掩盖后续真实风控命中
     store.update_account(account)
 
 
@@ -289,6 +293,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 cool = retry_after if retry_after is not None else settings.COOLING_SECONDS
                 account.status = Status.COOLING
                 account.cooling_until = time.time() + cool
+                account.cooling_is_risk = False  # 429 是频控不是风控，不计连击
                 account.last_error = (
                     f"上游限流 429（Retry-After {retry_after}s）" if retry_after is not None
                     else "上游限流 429"
@@ -310,6 +315,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         account.use_count += 1
         account.last_used_at = time.time()
         account.risk_strikes = 0  # 成功即清零风控计数（下次命中从 base 重新退避）
+        account.last_error = None
+        account.cooling_until = None
+        account.cooling_is_risk = False
         if account.status in (Status.COOLING, Status.EXHAUSTED):
             account.status = Status.ACTIVE
         store.update_account(account)

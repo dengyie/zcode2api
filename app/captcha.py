@@ -20,6 +20,7 @@ import time
 import httpx
 
 from . import constants, logs, settings
+from .store import store
 
 # 池参数（对齐 zapi：min 20-40 / max 120 过重，单账号网关用小池足矣）
 POOL_MIN = settings.CAPTCHA_POOL_MIN
@@ -92,11 +93,19 @@ class CaptchaManager:
                 pass
         self._refill_task = None
 
+    def _gate_open(self) -> bool:
+        """是否允许预热：存在可服务的 jwt 账号才预热（apiKey 账号不需要验证码）。
+
+        账号冷却状态随 store 落库，重启后全冷却期间此门保持关闭 ——
+        覆盖 _paused_until（monotonic，进程内）不持久化的重启场景。
+        """
+        return any(a.mode == "jwt" and a.is_selectable() for a in store.list_accounts("zai"))
+
     async def _refill_loop(self) -> None:
         while True:
             try:
-                # 风控暂停期：只淘汰过期 token，不解新码（不产生上游流量）
-                if time.monotonic() < self._paused_until:
+                # 风控暂停期 / 无可服务账号：只淘汰过期 token，不解新码（不产生上游流量）
+                if time.monotonic() < self._paused_until or not self._gate_open():
                     await self._evict_expired()
                     await asyncio.sleep(3)
                     continue

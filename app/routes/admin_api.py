@@ -125,12 +125,18 @@ async def set_enabled(account_id: str, payload: dict = Body(...)):
 async def refresh(payload: dict = Body(default=None)):
     payload = payload or {}
     if payload.get("all"):
-        targets = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
+        pool = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
     else:
         ids = set(payload.get("ids") or [])
-        targets = [a for a in store.list_accounts() if a.id in ids and a.mode == "jwt"]
+        pool = [a for a in store.list_accounts() if a.id in ids and a.mode == "jwt"]
+    # 冷却中账号不打 billing（与 QuotaMonitor 同一不变量：冷却期零上游流量）
+    targets = [a for a in pool if not a.is_cooling()]
     summary = await refresh_accounts(targets)
-    return {"summary": summary, "count": len(targets)}
+    return {
+        "summary": summary,
+        "count": len(targets),
+        "skipped_cooling": len(pool) - len(targets),
+    }
 
 
 @router.post("/accounts/{account_id}/refresh")
@@ -140,6 +146,9 @@ async def refresh_one(account_id: str):
         raise HTTPException(404, "账号不存在")
     if acc.mode != "jwt":
         return {"ok": False, "message": "仅 Coding Plan (JWT) 账号支持额度查询"}
+    if acc.is_cooling():
+        return {"ok": False, "message": "账号冷却中（风控/限流），已跳过上游刷新",
+                "account": acc.public_view()}
     res = await fetch_quota(acc)
     return {"ok": "error" not in res, "result": res, "account": acc.public_view()}
 
@@ -258,6 +267,10 @@ async def claim_preview(account_id: str | None = None):
     ids = [account_id] if account_id else None
     out = []
     for acc in _jwt_accounts(ids):
+        if acc.is_cooling():
+            out.append({"account_id": acc.id, "account_name": acc.name,
+                        "plans": [], "error": "账号冷却中（风控/限流），已跳过上游查询"})
+            continue
         try:
             plans = await preview_plans(acc)
             out.append({"account_id": acc.id, "account_name": acc.name,
@@ -277,12 +290,19 @@ async def claim(payload: dict = Body(default=None)):
     payload = payload or {}
     account_ids = payload.get("account_ids") or None
     plan_id = (payload.get("plan_id") or "").strip() or None
-    targets = _jwt_accounts(account_ids)
-    if not targets:
+    candidates = _jwt_accounts(account_ids)
+    if not candidates:
         return {"outcomes": [], "summary": {"ok": 0, "fail": 0}}
 
-    outcomes = []
-    for acc in targets:
+    # 冷却中账号不领取（billing/claim 是上游写流量，风控期打上去只会加剧）
+    outcomes = [
+        {"account_id": a.id, "account_name": a.name, "ok": False,
+         "message": "账号冷却中（风控/限流），已跳过领取"}
+        for a in candidates if a.is_cooling()
+    ]
+    for acc in candidates:
+        if acc.is_cooling():
+            continue
         try:
             result = await do_claim(acc, plan_id)
             await refresh_accounts([acc])
@@ -325,6 +345,10 @@ async def claim_manual(payload: dict = Body(...)):
     acc = store.find("zai", account_id)
     if not acc or acc.mode != "jwt" or not acc.jwt_token:
         raise HTTPException(404, "JWT 账号不存在")
+    if acc.is_cooling():
+        return {"outcomes": [{"account_id": acc.id, "account_name": acc.name,
+                              "ok": False, "message": "账号冷却中（风控/限流），已跳过领取"}],
+                "summary": {"ok": 0, "fail": 1}}
 
     try:
         result = await claim_with_captcha(acc, verify_param, region, plan_id)

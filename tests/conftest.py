@@ -32,6 +32,7 @@ os.environ.setdefault("no_proxy", "*")
 # 底座中绑定了 store 名字的全部模块 —— 新增导入点时必须同步加入
 _STORE_BINDING_MODULES = (
     "app.store",
+    "app.captcha",
     "app.routes.gateway",
     "app.routes.admin_api",
     "app.quota",

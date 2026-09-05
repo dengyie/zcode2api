@@ -48,6 +48,7 @@ class Account:
     use_count: int = 0
     fail_count: int = 0
     risk_strikes: int = 0  # 连续风控（3012/405）命中次数，用于指数退避；成功即清零
+    cooling_is_risk: bool = False  # 当前 COOLING 是否由风控引起（区分 429/断连冷却，并发去重用）
     last_used_at: float | None = None
     last_checked_at: float | None = None
     cooling_until: float | None = None
@@ -72,15 +73,22 @@ class Account:
         return self.jwt_token if self.mode == "jwt" else self.api_key
 
     def begin_risk_cooldown(self, base: int, cap: int, now: float | None = None) -> int:
-        """命中风控：累加连续计数并按指数退避设置冷却截止，返回新冷却秒数。
+        """命中风控：累加连续计数并按指数退避设置冷却截止，返回冷却秒数。
 
         第 n 次连续命中冷却 min(base * 2^(n-1), cap) 秒。
+        已处于风控冷却中（并发在途请求同批收到风控响应）视为同一事故：
+        不叠加连击、只顺延冷却截止 —— 否则几个并发请求就能把一次事故推到封顶。
         """
+        now = now or time.time()
+        if self.is_cooling(now) and self.cooling_is_risk:
+            tier = min(base * (2 ** (self.risk_strikes - 1)), cap)
+            self.cooling_until = now + tier
+            return tier
         self.risk_strikes += 1
         cooldown = min(base * (2 ** (self.risk_strikes - 1)), cap)
-        now = now or time.time()
         self.status = Status.COOLING
         self.cooling_until = now + cooldown
+        self.cooling_is_risk = True
         return cooldown
 
     def is_selectable(self, now: float | None = None) -> bool:
