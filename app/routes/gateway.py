@@ -1,6 +1,7 @@
-"""核心网关：兼容 Anthropic Messages 协议的 /v1/messages。
+"""核心网关：/v1/messages（Anthropic 风格）与 /v1/chat/completions（OpenAI 风格）。
 
-实现多账号轮询 + 额度用完自动换号 + 阿里无痕验证自动续期。
+共用多账号轮询 + 额度用完自动换号 + 阿里无痕验证自动续期；OpenAI 端点由
+openai_compat 做双向格式转换，调度与错误处理策略完全一致。
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..models import Account, Status
+from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
 from ..quota import fetch_quota
 from ..store import store
 
@@ -177,6 +179,85 @@ async def messages(request: Request):
     req_id = secrets.token_hex(3)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
 
+    result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    if isinstance(result, _Upstream):
+        return result.to_streaming(req_id)
+    return result
+
+
+@router.post("/v1/chat/completions", dependencies=[Depends(verify_gateway_key)])
+async def chat_completions(request: Request):
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}, status_code=400)
+
+    body, err = openai_to_anthropic(payload)
+    if err or body is None:
+        return JSONResponse({"error": {"message": err or "请求体不合法", "type": "invalid_request_error"}}, status_code=400)
+
+    incoming_headers = dict(request.headers)
+    provider = _detect_provider(body, request.headers)
+    body = _normalize_body(body)
+    port = request.url.port or settings.PORT
+
+    req_id = secrets.token_hex(3)
+    logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
+
+    result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    if not isinstance(result, _Upstream):
+        return result
+
+    model = str(body.get("model") or "")
+    if payload.get("stream"):
+        return _openai_stream_response(result, model, req_id)
+
+    try:
+        raw = await result.resp.aread()
+        logs.req_ok(req_id)
+    except Exception as err:  # noqa: BLE001
+        logs.req_err(req_id, f"读取上游响应失败: {err}")
+        return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
+    finally:
+        await result.close()
+    data = _safe_json(raw.decode("utf-8", "ignore"))
+    if not isinstance(data, dict) or data.get("type") != "message":
+        return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
+    return JSONResponse(anthropic_to_openai(data, model))
+
+
+def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:
+    """把上游 Anthropic SSE 事件流转换为 OpenAI chunk 流。"""
+    conv = StreamConverter(model)
+
+    async def _iter():
+        try:
+            yield conv.start()
+            async for line in up.resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str:
+                    continue
+                evt = _safe_json(data_str)
+                if isinstance(evt, dict):
+                    for out in conv.feed(evt):
+                        yield out
+            yield conv.done()
+            logs.req_ok(req_id)
+        except Exception as err:  # noqa: BLE001
+            logs.req_err(req_id, f"流传输中断: {err}")
+        finally:
+            await up.close()
+
+    return StreamingResponse(_iter(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
+async def _dispatch(req_id, body, incoming_headers, port, provider):
+    """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。"""
     tried: set[str] = set()
 
     for _ in range(MAX_ACCOUNT_ATTEMPTS):
@@ -199,6 +280,39 @@ async def messages(request: Request):
 
 
 _NEXT_ACCOUNT = object()
+
+
+class _Upstream:
+    """已建立的上游成功流：由调用方消费并负责关闭。"""
+
+    __slots__ = ("resp", "cm", "client")
+
+    def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient) -> None:
+        self.resp = resp
+        self.cm = cm
+        self.client = client
+
+    async def close(self) -> None:
+        await self.cm.__aexit__(None, None, None)
+        await self.client.aclose()
+
+    def to_streaming(self, req_id: str) -> StreamingResponse:
+        """原样透传（/v1/messages 直通路径）。"""
+        up = self
+
+        async def _body_iter():
+            try:
+                async for chunk in up.resp.aiter_bytes():
+                    yield chunk
+                logs.req_ok(req_id)
+            except Exception as err:  # noqa: BLE001
+                logs.req_err(req_id, f"流传输中断: {err}")
+            finally:
+                await up.close()
+
+        return StreamingResponse(_body_iter(), status_code=up.resp.status_code,
+                                 media_type=up.resp.headers.get("content-type", "application/json"),
+                                 headers={"Cache-Control": "no-cache"})
 
 
 async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha):
@@ -346,7 +460,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 status_code=status_code,
             )
 
-        # 成功：记录用量并流式透传
+        # 成功：记录用量并把打开的上游流交给调用方
         account.use_count += 1
         account.last_used_at = time.time()
         account.record_result(True)
@@ -358,22 +472,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         store.update_account(account)
         asyncio.create_task(_safe_refresh(account))
 
-        content_type = resp.headers.get("content-type", "application/json")
-
-        async def _body_iter():
-            try:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
-                logs.req_ok(req_id)
-            except Exception as err:  # noqa: BLE001
-                logs.req_err(req_id, f"流传输中断: {err}")
-            finally:
-                await cm.__aexit__(None, None, None)
-                await client.aclose()
-
-        out_headers = {"Cache-Control": "no-cache"}
-        return StreamingResponse(_body_iter(), status_code=status_code,
-                                 media_type=content_type, headers=out_headers)
+        return _Upstream(resp, cm, client)
 
 
 def _safe_json(text: str):

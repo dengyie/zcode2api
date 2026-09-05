@@ -32,7 +32,11 @@ SSE_EVENT = (
     'event: content_block_delta\ndata: {{"type":"content_block_delta",'
     '"index":0,"delta":{{"type":"text_delta","text":"{text}"}}}}\n\n'
 )
-SSE_DONE = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+SSE_DONE = (
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}'
+    ',"usage":{"output_tokens":5}}\n\n'
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
 
 
 _MESSAGES_PATHS = {
