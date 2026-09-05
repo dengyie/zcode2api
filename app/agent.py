@@ -38,6 +38,12 @@ _DROP_HEADERS = {
     "x-os-version",
 }
 
+# 前缀剔除：本服务仿真的头族 + 客户端 SDK 特征头族。
+# x-stainless-* 是 Anthropic SDK 自动附加的运行环境指纹（lang/runtime/package 版本），
+# 值来自真实调用客户端而非官方 ZCode 桌面端 —— 与 ZCode/3.10.2 的 UA 组成矛盾信号，
+# 且 zapi（Node fetch 直发、无 stainless 头）长期被上游正常接受，剔除后同为已验证形状。
+_DROP_HEADER_PREFIXES = ("x-zcode", "x-stainless")
+
 
 def build_request(
     account: Account,
@@ -100,7 +106,7 @@ def build_request(
 
     for key, value in (incoming_headers or {}).items():
         lower = key.lower()
-        if lower in _DROP_HEADERS or lower.startswith("x-zcode"):
+        if lower in _DROP_HEADERS or lower.startswith(_DROP_HEADER_PREFIXES):
             continue
         headers[key] = value
 

@@ -19,7 +19,6 @@ start-plan，只发 x-request-id / x-zcode-session-type / x-zcode-trace-id
 from __future__ import annotations
 
 import os
-import platform
 import re
 import uuid
 
@@ -38,24 +37,26 @@ def _clean(value: str | None) -> str | None:
 
 
 def _os_category(sys_platform: str) -> str:
-    if sys_platform == "darwin":
+    # 兼容两种形态：platform.system() 产出 darwin/windows/linux，伪装平台用 win32
+    if sys_platform in ("darwin", "macos"):
         return "macos"
-    if sys_platform == "win32":
+    if sys_platform in ("win32", "windows"):
         return "windows"
     return "linux"
 
 
-def _os_version() -> str:
-    # darwin release() 是内核版本（25.5.0 = macOS 15.x），直接用作伪装值
-    return platform.release()
-
-
 def build_identity_headers() -> dict[str, str]:
-    """构建完整身份头（保持 pio 的字段顺序；条件性缺失语义同样镜像）。"""
+    """构建完整身份头（保持 pio 的字段顺序；条件性缺失语义同样镜像）。
+
+    平台指纹默认固定伪装（constants.CLIENT_PLATFORM，与 zapi identity.ts 同策略）：
+    服务端部署在 Linux 时 platform.* 会暴露云服务器特征（如阿里云 Lifsea 内核版本），
+    与官方 ZCode 桌面端形状不符。env 覆盖仅用于指纹实验。
+    """
     app_version = _clean(constants.CLIENT_APP_VERSION)
-    plat = _clean(os.getenv("ZCODE_IDENTITY_PLATFORM", platform.system().lower())) or "darwin"
-    arch = _clean(os.getenv("ZCODE_IDENTITY_ARCH", platform.machine())) or "arm64"
-    release = _clean(os.getenv("ZCODE_IDENTITY_RELEASE", _os_version()))
+    _plat_arch = constants.CLIENT_PLATFORM.split("-")  # "darwin-arm64"
+    plat = _clean(os.getenv("ZCODE_IDENTITY_PLATFORM", _plat_arch[0])) or "darwin"
+    arch = _clean(os.getenv("ZCODE_IDENTITY_ARCH", _plat_arch[1] if len(_plat_arch) > 1 else "arm64")) or "arm64"
+    release = _clean(os.getenv("ZCODE_IDENTITY_RELEASE", constants.IDENTITY_OS_VERSION))
     channel = _clean(os.getenv("ZCODE_IDENTITY_RELEASE_CHANNEL", constants.IDENTITY_RELEASE_CHANNEL))
     language = _clean(os.getenv("ZCODE_IDENTITY_CLIENT_LANGUAGE", constants.IDENTITY_CLIENT_LANGUAGE))
     timezone = _clean(os.getenv("ZCODE_IDENTITY_CLIENT_TIMEZONE", constants.IDENTITY_CLIENT_TIMEZONE))
