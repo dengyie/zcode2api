@@ -358,6 +358,12 @@ async def claim(payload: dict = Body(default=None)):
             outcomes.append({"account_id": acc.id, "account_name": acc.name,
                              "ok": True, **result})
         except ClaimError as err:
+            logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
+            outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                             "ok": False, "message": str(err)})
+        except RuntimeError as err:
+            # 验证码求解失败（get_verify_param）等运行时故障：明确记回执而非裸 500
+            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
             outcomes.append({"account_id": acc.id, "account_name": acc.name,
                              "ok": False, "message": str(err)})
     ok = sum(1 for o in outcomes if o["ok"])

@@ -192,13 +192,17 @@ async def auto_claim_all_plans(account: Account) -> list[dict]:
         logs.warn("claim", f"账号 {account.name} preview 异常: {err}")
         return outcomes
 
+    if not plans:
+        logs.info("claim", f"账号 {account.name} 上游无投放套餐，跳过领取")
+        return outcomes
+
     for plan in plans:
         try:
             result = await claim(account, plan["plan_id"])
             outcomes.append({"account_id": account.id, "account_name": account.name,
                              "ok": True, **result})
-            logs.info("claim", f"账号 {account.name} 自动领取成功: "
-                               f"{result.get('plan_name') or plan['plan_id']}")
+            logs.ok("claim", f"账号 {account.name} 自动领取成功: "
+                             f"{result.get('plan_name') or plan['plan_id']}")
         except ClaimError as err:
             outcomes.append({"account_id": account.id, "account_name": account.name,
                              "ok": False, "plan_id": plan["plan_id"], "message": str(err)})
