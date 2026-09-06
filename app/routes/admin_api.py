@@ -132,6 +132,27 @@ async def set_enabled(account_id: str, payload: dict = Body(...)):
     return {"ok": True}
 
 
+# ── 客户端指纹（每账号独立设备档案）──────────────────────────────────────────
+@router.post("/accounts/{account_id}/fingerprint/rotate")
+async def rotate_fingerprint(account_id: str):
+    """换发账号客户端指纹（下一套设备模板 + 全新 device_mid）。
+
+    场景：账号被风控后换设备重生；或怀疑指纹污染时手动更换。
+    """
+    from ..fingerprint import profile_for, rotate
+
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    old = profile_for(acc)
+    profile = rotate(acc)
+    store.update_account(acc)
+    logs.info("fingerprint", f"账号 {acc.name} 指纹换发: "
+                             f"{old.platform_full}/{old.device_mid[:8]} → "
+                             f"{profile.platform_full}/{profile.device_mid[:8]}")
+    return {"ok": True, "fingerprint": acc.fingerprint}
+
+
 # ── 刷新额度（实时用量监控）─────────────────────────────────────────────────
 @router.post("/accounts/refresh")
 async def refresh(payload: dict = Body(default=None)):

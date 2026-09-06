@@ -53,6 +53,8 @@ class Account:
     cooling_until: float | None = None
     last_error: str | None = None
     created_at: float = field(default_factory=time.time)
+    # 每账号客户端指纹（fingerprint.DeviceProfile；dataclass 存 dict，取用时还原）
+    fingerprint: dict | object | None = None
 
     @staticmethod
     def create(provider: str, name: str, secret: str) -> Account:
@@ -116,6 +118,22 @@ class Account:
         known = {f for f in Account.__dataclass_fields__}  # type: ignore[attr-defined]
         return Account(**{k: v for k, v in data.items() if k in known})
 
+    def fingerprint_view(self) -> dict | None:
+        """指纹的对外形态（dict）；未分配/半初始化返回 None。"""
+        from .fingerprint import DeviceProfile
+
+        fp = self.fingerprint
+        if isinstance(fp, DeviceProfile):
+            return {
+                "platform": fp.platform, "arch": fp.arch,
+                "os_version": fp.os_version, "language": fp.language,
+                "timezone": fp.timezone, "screen": fp.screen,
+                "device_mid": fp.device_mid,
+            }
+        if isinstance(fp, dict) and fp.get("device_mid"):
+            return fp
+        return None
+
     def public_view(self) -> dict:
         """返回给前端的视图（脱敏 token）。"""
         secret = self.secret or ""
@@ -140,6 +158,7 @@ class Account:
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
             "created_at": self.created_at,
+            "fingerprint": self.fingerprint_view(),
         }
 
     def effective_status(self, now: float | None = None) -> str:

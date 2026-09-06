@@ -49,21 +49,25 @@ def _auth_headers(account: Account) -> dict:
     """billing 族请求头（对齐 zcode-switch zai_billing_headers 实证形态）。
 
     UA/版本走 BILLING_APP_VERSION（官方桌面端现行版，与 messages 指纹刻意
-    分离）；platform/os 伪装复用 messages 同一套常量；每请求全新 x-request-id。
+    分离）；平台/os/语言/时区/设备 ID 按账号指纹档案出值（每账号独立设备，
+    见 fingerprint.py）；每请求全新 x-request-id。
     """
+    from .fingerprint import profile_for
+
+    profile = profile_for(account)
     headers = {
         "Content-Type": "application/json",
         "User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}",
         "HTTP-Referer": constants.ZCODE_ORIGIN,
         "X-Title": constants.BILLING_TITLE,
         "X-ZCode-App-Version": constants.BILLING_APP_VERSION,
-        "X-Platform": constants.CLIENT_PLATFORM,
+        "X-Platform": profile.platform_full,
         "X-Release-Channel": constants.BILLING_RELEASE_CHANNEL,
-        "X-Client-Language": constants.IDENTITY_CLIENT_LANGUAGE,
-        "X-Client-Timezone": constants.IDENTITY_CLIENT_TIMEZONE,
-        "X-Os-Category": constants.IDENTITY_OS_CATEGORY,
-        "X-Os-Version": constants.IDENTITY_OS_VERSION,
-        "X-Device-Mid": device_mid(),
+        "X-Client-Language": profile.language,
+        "X-Client-Timezone": profile.timezone,
+        "X-Os-Category": profile.os_category,
+        "X-Os-Version": profile.os_version,
+        "X-Device-Mid": profile.device_mid,
         "x-request-id": str(uuid.uuid4()),
     }
     if account.mode == "jwt" and account.jwt_token:

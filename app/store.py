@@ -188,9 +188,23 @@ class Store:
             for a in self._accounts[provider]:
                 if a.secret and a.secret == account.secret:
                     return a  # 跳过重复 token
+            self._assign_fingerprint(account)  # 入池即分配独立设备指纹
             self._accounts[provider].append(account)
             self._persist_account(account)
         return account
+
+    @staticmethod
+    def _assign_fingerprint(account: Account) -> None:
+        """给账号分配客户端指纹并固化为 dict（随 asdict 落库，取用时还原）。"""
+        from .fingerprint import profile_for
+
+        profile = profile_for(account)
+        account.fingerprint = {
+            "platform": profile.platform, "arch": profile.arch,
+            "os_version": profile.os_version, "language": profile.language,
+            "timezone": profile.timezone, "screen": profile.screen,
+            "device_mid": profile.device_mid,
+        }
 
     def remove_account(self, provider: str, id_or_name: str) -> bool:
         with self._lock:

@@ -27,8 +27,26 @@ def _display_host() -> str:
     return "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
 
 
+def _backfill_fingerprints() -> int:
+    """启动时给无指纹的存量账号补配（入池于旧版本）并落库。返回补配数。"""
+    from .fingerprint import profile_for
+    from .store import store
+
+    backfilled = 0
+    for account in store.list_accounts():
+        if not isinstance(account.fingerprint, dict) or not account.fingerprint.get("device_mid"):
+            profile_for(account)  # 懒分配（内存态为 DeviceProfile）
+            store._assign_fingerprint(account)  # 固化为 dict 形态，与 add_account 一致
+            store.update_account(account)
+            backfilled += 1
+    return backfilled
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    backfilled = _backfill_fingerprints()
+    if backfilled:
+        logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{backfilled}")
     monitor.start()
     captcha_manager.start()   # 验证码预解池后台补充
     base = f"http://{_display_host()}:{settings.PORT}"

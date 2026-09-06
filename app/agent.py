@@ -85,7 +85,7 @@ def build_request(
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
-            **build_identity_headers(),
+            **build_identity_headers(account),
             **build_trace_headers(),
         }
     else:

@@ -53,21 +53,37 @@ class TestJwtUserId:
 
 class TestAuthHeaders:
     def test_jwt_mode_full_shape(self, acc):
+        from app.fingerprint import profile_for
+
+        profile = profile_for(acc)  # 头值按账号指纹档案出值（每账号独立设备）
         h = _auth_headers(acc)
         assert h["User-Agent"] == f"ZCode/{constants.BILLING_APP_VERSION}"
         assert h["X-ZCode-App-Version"] == constants.BILLING_APP_VERSION
         assert h["HTTP-Referer"] == constants.ZCODE_ORIGIN
         assert h["X-Title"] == constants.BILLING_TITLE
-        assert h["X-Platform"] == constants.CLIENT_PLATFORM
+        assert h["X-Platform"] == profile.platform_full
         assert h["X-Release-Channel"] == constants.BILLING_RELEASE_CHANNEL
-        assert h["X-Client-Language"] == constants.IDENTITY_CLIENT_LANGUAGE
-        assert h["X-Client-Timezone"] == constants.IDENTITY_CLIENT_TIMEZONE
-        assert h["X-Os-Category"] == constants.IDENTITY_OS_CATEGORY
-        assert h["X-Os-Version"] == constants.IDENTITY_OS_VERSION
-        assert h["X-Device-Mid"]
+        assert h["X-Client-Language"] == profile.language
+        assert h["X-Client-Timezone"] == profile.timezone
+        assert h["X-Os-Category"] == profile.os_category
+        assert h["X-Os-Version"] == profile.os_version
+        assert h["X-Device-Mid"] == profile.device_mid
         assert h["Authorization"] == f"Bearer {acc.jwt_token}"
         # 每请求全新 uuid
         assert _auth_headers(acc)["x-request-id"] != h["x-request-id"]
+
+    def test_fingerprint_stable_and_distinct(self, monkeypatch, tmp_path):
+        """同账号指纹稳定（幂等），不同账号 device_mid 互异（2026-09-07 指纹池）。"""
+        monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
+        acc_a = Account(id="fa", name="a", provider="zai", mode="jwt",
+                        jwt_token=_make_jwt({"user_id": "ua"}))
+        acc_b = Account(id="fb", name="b", provider="zai", mode="jwt",
+                        jwt_token=_make_jwt({"user_id": "ub"}))
+        ha1, ha2 = _auth_headers(acc_a), _auth_headers(acc_a)
+        hb = _auth_headers(acc_b)
+        assert ha1["X-Device-Mid"] == ha2["X-Device-Mid"]  # 同账号稳定
+        assert ha1["X-Device-Mid"] != hb["X-Device-Mid"]   # 跨账号互异
+        assert (ha1["X-Platform"], ha1["X-Os-Version"]) == (ha2["X-Platform"], ha2["X-Os-Version"])
 
     def test_api_key_mode(self, monkeypatch, tmp_path):
         monkeypatch.setattr(settings, "DATA_DIR", tmp_path)

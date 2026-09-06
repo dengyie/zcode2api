@@ -139,7 +139,14 @@ class TestClaim:
         assert body["user_id"] == "a"
         assert body["app_version"] == "3.11.2"
         assert body["device_mid"]
-        assert body["screen_resolution"] == "2560x1440"
+        # 指纹档案（2026-09-07）：事件字段按账号指纹出值，与 billing 头同源
+        from app.fingerprint import profile_for
+
+        profile = profile_for(_acc)
+        assert body["screen_resolution"] == profile.screen
+        assert body["device_mid"] == profile.device_mid
+        assert body["device_os_category"] == profile.os_category
+        assert body["client_timezone"] == profile.timezone
         assert body["event_region"] == "app" and body["event_type"] == "view"
         assert events[0][0].get("authorization") is None
 
@@ -429,3 +436,45 @@ class TestAutoClaimOnPoolEntry:
         assert res.status_code == 200
         await asyncio.sleep(0.05)
         assert called, "导入的新 JWT 账号应调度自动领取"
+
+    async def test_add_account_assigns_distinct_fingerprints(self, claim_env):
+        """入池即分配独立设备指纹：跨账号 device_mid 互异，且 public_view 可见。"""
+        client, _mock, _stub, _acc = claim_env
+        res = await client.post("/admin/api/accounts",
+                                json={"provider": "zai",
+                                      "tokens": [GOOD_JWT + "-fp1", GOOD_JWT + "-fp2"],
+                                      "name": "fp"},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        listing = await client.get("/admin/api/accounts",
+                                   headers={"Authorization": "Bearer zcode"})
+        fps = [a["fingerprint"] for a in listing.json()["accounts"]
+               if a["name"] == "fp"]
+        assert len(fps) == 2
+        assert all(fp and fp.get("device_mid") for fp in fps)
+        assert fps[0]["device_mid"] != fps[1]["device_mid"]
+
+    async def test_rotate_fingerprint_endpoint(self, claim_env):
+        """POST /accounts/{id}/fingerprint/rotate：换发新指纹并落库。"""
+        client, _mock, _stub, acc = claim_env
+        before = (await client.get("/admin/api/accounts",
+                                   headers={"Authorization": "Bearer zcode"})).json()
+        old_mid = next(a["fingerprint"]["device_mid"] for a in before["accounts"]
+                       if a["id"] == acc.id)
+        res = await client.post(f"/admin/api/accounts/{acc.id}/fingerprint/rotate",
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        new_fp = res.json()["fingerprint"]
+        assert new_fp["device_mid"] != old_mid
+        # 落库验证：重新拉取仍是新指纹
+        after = (await client.get("/admin/api/accounts",
+                                  headers={"Authorization": "Bearer zcode"})).json()
+        cur = next(a["fingerprint"]["device_mid"] for a in after["accounts"]
+                   if a["id"] == acc.id)
+        assert cur == new_fp["device_mid"]
+
+    async def test_rotate_fingerprint_unknown_account_404(self, claim_env):
+        client, _mock, _stub, _acc = claim_env
+        res = await client.post("/admin/api/accounts/nonexistent/fingerprint/rotate",
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 404

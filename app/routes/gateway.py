@@ -24,6 +24,8 @@ from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anth
 from ..quota import fetch_quota
 from ..store import store
 
+_sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
+
 router = APIRouter()
 
 MAX_CAPTCHA_RETRIES = 3
@@ -484,7 +486,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         f"账号 {account.name} 被限流 429，{wait}s 后重试"
                         f"（{retries_429}/{settings.RETRY_429_TIMES}）",
                     )
-                    await asyncio.sleep(wait)
+                    await _sleep(wait)
                     continue
                 account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
                 logs.warn(
@@ -503,7 +505,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         f"账号 {account.name} 上游 HTTP {status_code}，"
                         f"{settings.RETRY_5XX_WAIT}s 后重试（{retries_5xx}/{settings.RETRY_5XX_TIMES}）",
                     )
-                    await asyncio.sleep(settings.RETRY_5XX_WAIT)
+                    await _sleep(settings.RETRY_5XX_WAIT)
                     continue
                 cool = settings.COOLING_SECONDS
                 account.status = Status.COOLING

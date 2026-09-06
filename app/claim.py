@@ -129,8 +129,9 @@ async def report_activation_events(account: Account) -> str | None:
     套餐投放资格信号）。请求无 Authorization（上游事件端点不校验）；任何失败
     仅返回文案，不阻断 preview。
     """
-    from .quota import device_mid
+    from .fingerprint import profile_for
 
+    profile = profile_for(account)
     user_id = jwt_user_id(account)
     if not user_id:
         return "JWT 无 user_id，跳过激活上报"
@@ -138,19 +139,19 @@ async def report_activation_events(account: Account) -> str | None:
     for element in constants.ACTIVATION_ELEMENTS:
         body = {
             "event_id": str(uuid.uuid4()),
-            "client_timezone": constants.IDENTITY_CLIENT_TIMEZONE,
-            "client_language": constants.IDENTITY_CLIENT_LANGUAGE,
+            "client_timezone": profile.timezone,
+            "client_language": profile.language,
             "element_name": element,
             "event_region": "app",
             "event_type": "view",
             "event_text": "",
             "event_extra_detail": {},
             "user_id": user_id,
-            "screen_resolution": constants.ACTIVATION_SCREEN_RESOLUTION,
+            "screen_resolution": profile.screen,
             "app_version": constants.BILLING_APP_VERSION,
-            "device_os_category": constants.IDENTITY_OS_CATEGORY,
-            "device_os_version": constants.IDENTITY_OS_VERSION,
-            "device_mid": device_mid(),
+            "device_os_category": profile.os_category,
+            "device_os_version": profile.os_version,
+            "device_mid": profile.device_mid,
             "mac_id": "",
             "marketing_params": "{}",
         }

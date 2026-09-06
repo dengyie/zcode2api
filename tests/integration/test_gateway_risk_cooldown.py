@@ -144,7 +144,7 @@ class Test429Retry:
         async def fake_sleep(seconds: float) -> None:
             slept.append(seconds)
 
-        monkeypatch.setattr(gw.asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(gw, "_sleep", fake_sleep)
         seed_account(fresh_app, _RISK_JWT, name="a-429")
         mock.state.sequences[_RISK_JWT[:16]] = ["rate_limited"]
 
