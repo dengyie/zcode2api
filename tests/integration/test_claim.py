@@ -152,7 +152,10 @@ class TestClaim:
 
     async def test_billing_headers_aligned_on_preview(self, claim_env):
         """billing 请求头对齐 zcode-switch 实证形态（版本/标题/渠道/追踪头）。"""
-        client, mock, _stub, _acc = claim_env
+        from app.fingerprint import profile_for
+
+        client, mock, _stub, acc = claim_env
+        profile = profile_for(acc)
         mock.state.calls.clear()
         await client.get("/admin/api/claim/preview",
                          headers={"Authorization": "Bearer zcode"})
@@ -164,8 +167,13 @@ class TestClaim:
         assert h.get("x-zcode-app-version") == "3.11.2"
         assert h.get("x-title") == "Z Code@electron"
         assert h.get("x-release-channel") == "stable"
-        assert h.get("x-client-language") == "zh-CN"
-        assert h.get("x-os-category") == "macos"
+        # 平台/语言/设备按账号指纹档案出值（2026-09-07 随机指纹池）
+        assert h.get("x-client-language") == profile.language
+        assert h.get("x-client-timezone") == profile.timezone
+        assert h.get("x-platform") == profile.platform_full
+        assert h.get("x-os-version") == profile.os_version
+        assert h.get("x-device-mid") == profile.device_mid
+        assert h.get("x-os-category") == profile.os_category
         assert h.get("x-request-id")
 
     async def test_activation_failure_does_not_block_preview(self, claim_env):
