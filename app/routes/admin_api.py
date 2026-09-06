@@ -9,6 +9,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 
 from .. import logs, reqlog
 from ..auth_admin import verify_admin_key
+from ..captcha import CaptchaSolveError
 from ..claim import (
     ClaimError,
     auto_claim_all_plans,
@@ -354,18 +355,26 @@ async def claim(payload: dict = Body(default=None)):
             continue
         try:
             result = await do_claim(acc, plan_id)
-            await refresh_accounts([acc])
-            outcomes.append({"account_id": acc.id, "account_name": acc.name,
-                             "ok": True, **result})
         except ClaimError as err:
             logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
             outcomes.append({"account_id": acc.id, "account_name": acc.name,
                              "ok": False, "message": str(err)})
-        except RuntimeError as err:
-            # 验证码求解失败（get_verify_param）等运行时故障：明确记回执而非裸 500
+            continue
+        except CaptchaSolveError as err:
+            # 验证码求解失败（get_verify_param）：明确业务回执而非裸 500
             logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
             outcomes.append({"account_id": acc.id, "account_name": acc.name,
                              "ok": False, "message": str(err)})
+            continue
+        except RuntimeError as err:
+            # 兜底：captcha 层历史语义的运行时故障，防回归裸 500
+            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
+            outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                             "ok": False, "message": str(err)})
+            continue
+        await refresh_accounts([acc])
+        outcomes.append({"account_id": acc.id, "account_name": acc.name,
+                         "ok": True, **result})
     ok = sum(1 for o in outcomes if o["ok"])
     return {"outcomes": outcomes, "summary": {"ok": ok, "fail": len(outcomes) - ok}}
 

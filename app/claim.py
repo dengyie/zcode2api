@@ -82,11 +82,15 @@ def parse_plan(raw: dict) -> dict | None:
 
 async def _billing_request(account: Account, method: str, path: str, **kwargs) -> dict:
     headers = dict(kwargs.pop("headers"))
-    async with httpx.AsyncClient(timeout=25) as client:
-        res = await client.request(
-            method, f"{settings.ZCODE_BILLING_BASE}{path}",
-            headers=headers, **kwargs,
-        )
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            res = await client.request(
+                method, f"{settings.ZCODE_BILLING_BASE}{path}",
+                headers=headers, **kwargs,
+            )
+    except httpx.HTTPError as err:
+        # 连接/超时等网络故障统一转业务错误：路由层只需面对 ClaimError 一种失败
+        raise ClaimError(f"上游网络错误: {err}") from err
     if res.status_code in (401, 403):
         text = (res.text or "").lower()
         if "captcha" not in text and "verify" not in text:

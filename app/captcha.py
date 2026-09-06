@@ -28,6 +28,13 @@ POOL_MAX = settings.CAPTCHA_POOL_MAX
 TOKEN_TTL_MS = settings.CAPTCHA_TOKEN_TTL  # 单枚 token 的最大可用时长（ms）
 
 
+class CaptchaSolveError(Exception):
+    """验证码求解最终失败（重试耗尽/求解器不可用）。
+
+    独立于 ClaimError 体系（验证码先于领域层使用），路由层按兜底回执处理。
+    """
+
+
 class _Token:
     __slots__ = ("param", "region", "born_at")
 
@@ -179,7 +186,7 @@ class CaptchaManager:
         config = await self.fetch_config()
         token = await self._solve_one(config)
         if token is None:
-            raise RuntimeError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
+            raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
         return token.param, token.region
 
     # ── 求解 ─────────────────────────────────────────────────────────────────

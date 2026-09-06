@@ -189,6 +189,47 @@ class TestClaim:
         assert "已经领取过" in outcome["message"]
         assert stub.solve_count == 1  # 非 3007 不重试
 
+    async def test_claim_captcha_solve_failure_business_receipt(self, claim_env, monkeypatch):
+        """验证码求解最终失败（CaptchaSolveError）→ 200 业务回执，而非 500（2026-09-07）。"""
+        from app.captcha import CaptchaSolveError
+
+        client, _mock, stub, acc = claim_env
+
+        async def _exhausted(port=None):
+            raise CaptchaSolveError("验证码求解失败: 多次重试无结果")
+
+        monkeypatch.setattr(type(stub), "get_verify_param", _exhausted)
+        res = await client.post("/admin/api/claim",
+                                json={"account_ids": [acc.id], "plan_id": "mock-claim-plan"},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert "验证码求解失败" in outcome["message"]
+
+    async def test_claim_upstream_network_error_business_receipt(self, claim_env, monkeypatch):
+        """billing 上游网络故障 → ClaimError 回执（200），不再裸 500（2026-09-07）。"""
+        import httpx
+
+        client, mock, _stub, acc = claim_env
+
+        class _DeadClient(httpx.AsyncClient):
+            async def request(self, *args, **kwargs):
+                raise httpx.ConnectError("connection refused")
+
+        # 仅替换 claim 模块视角的 AsyncClient（测试自身传输不受影响）
+        monkeypatch.setattr(httpx, "AsyncClient", _DeadClient)
+        before = sum(c[1].endswith("/billing/claim") for c in mock.state.calls)
+        res = await client.post("/admin/api/claim",
+                                json={"account_ids": [acc.id], "plan_id": "mock-claim-plan"},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert "上游网络错误" in outcome["message"]
+        after = sum(c[1].endswith("/billing/claim") for c in mock.state.calls)
+        assert after == before  # 请求未到达上游
+
     async def test_claim_skips_api_key_accounts(self, claim_env, fresh_app):
         client, _mock, _stub, _acc = claim_env
         seed_account(fresh_app, "sk-big-1234567890abcdef", name="key-b")
