@@ -12,8 +12,9 @@
               /usr/share/zoneinfo 字节比对；都失败退 UTC
   language    $LANG（zh_CN.UTF-8 → zh-CN；缺失退 en-US）
   screen      本机无显示器（服务器形态）→ 官方桌面端必有屏幕，取 HOST_FALLBACK
-  device_mid  不在本模块生成 —— 复用 quota.device_mid() 的「首装生成、持久化、
-              永久复用」语义，与官方客户端 telemetry deviceMid 完全一致
+  device_mid  本模块不生成 —— DeviceProfile 缺省工厂给每次采集全新 UUID；
+              MID 归属（全局持久化 / 每账号新装）由调用方决定
+              （见 fingerprint.host_profile 的两种传参语义）
 
 所有值仍过 fingerprint._validate 合规门：真机数据天然合规（Linux 内核版本
 不在预置池时，_validate 按「版本形态」放行本机采集值，见 fingerprint 备注）。
@@ -29,7 +30,8 @@ from pathlib import Path
 # 服务器无显示器时的兜底分辨率（官方桌面端激活事件必有 screen_resolution）
 FALLBACK_SCREEN = "1920x1080"
 
-_TZ_LANG_RE = re.compile(r"^([a-z]{2,3})(?:[_-]([A-Za-z]{2,4}))?")
+# $LANG 形态解析：语言主码（2-3 位小写）+ 可选地区码
+_LANG_RE = re.compile(r"^([a-z]{2,3})(?:[_-]([A-Za-z]{2,4}))?")
 
 
 def _resolve_timezone() -> str:
@@ -85,7 +87,7 @@ def _resolve_language() -> str:
     此时与官方常见默认 en-US 对齐（真实安装于裸 Locale 主机时同样如此）。
     """
     raw = (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").strip()
-    m = _TZ_LANG_RE.match(raw)
+    m = _LANG_RE.match(raw)
     if not m:
         return "en-US"
     lang, region = m.group(1), m.group(2)

@@ -89,8 +89,8 @@ class TestAssign:
         assert (p.platform, p.arch, p.os_version) == (host.platform, host.arch, host.os_version)
         assert p.device_mid != host.device_mid  # 每账号一台「本机新装设备」
 
-    def test_assign_fallback_to_random_when_host_invalid(self, monkeypatch):
-        """宿主机数据不合规时退随机池（保证总能给出合规档案）。"""
+    def test_assign_fallback_to_random_when_host_invalid(self, monkeypatch, capsys):
+        """宿主机数据不合规时退随机池（保证总能给出合规档案），且降级必须留痕。"""
         import app.hostinfo as hostinfo
         from app import fingerprint
 
@@ -99,6 +99,7 @@ class TestAssign:
         acc = _acc("fallback")
         p = fingerprint.assign(acc)
         assert p.platform in {plat for plat, _ in fingerprint._PLATFORM_ARCHS}
+        assert "退随机池" in capsys.readouterr().out  # 静默降级 = 功能无声丢失
 
     def test_distinct_accounts_usually_differ(self):
         """随机池下两账号档案全同概率极低（组合空间 >10^4）。"""
@@ -132,6 +133,24 @@ class TestHostProfile:
         import pytest
         with pytest.raises(ValueError):
             fingerprint._validate(broken, host_real=True)
+
+    def test_host_real_accepts_real_host_shapes(self):
+        """host_real 平台按形态放行：linux/arm64 云主机是真机事实，不再被预置池拒绝。"""
+        from app import fingerprint
+
+        arm = fingerprint.DeviceProfile(
+            platform="linux", arch="arm64", os_version="5.10.134-18.0.11.an8_arm64",
+            language="en-US", timezone="UTC", screen="1920x1080",
+        )
+        fingerprint._validate(arm, host_real=True)  # 不抛即合规
+
+        # 形态门仍在：非法取值照样拒绝（防止采集污染）
+        bogus = fingerprint.DeviceProfile(
+            platform="sunos", arch="mips", os_version="5.10", language="en-US",
+            timezone="UTC", screen="1920x1080",
+        )
+        with pytest.raises(ValueError):
+            fingerprint._validate(bogus, host_real=True)
 
 
 class TestPersistRoundTrip:

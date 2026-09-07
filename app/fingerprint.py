@@ -11,8 +11,9 @@ device_mid 走官方 telemetry 语义（首装生成一次、持久化、永久�
   2. 宿主机数据不合规时的兜底（如容器内缺失信息）。
 
 合规 = 官方客户端真实会出现的组合：
-  - X-Platform  = {platform}-{arch}，仅取真实主流组合
-    （darwin×arm64/x64、win32×x64、linux×x64；win-arm64 桌面占有率可忽略）
+  - X-Platform  = {platform}-{arch}，随机池仅取真实主流组合
+    （darwin×arm64/x64、win32×x64、linux×x64；win-arm64 桌面占有率可忽略）；
+    host_real 不受预置组合约束 —— 宿主机实际形态即真机事实（linux/arm64 等）
   - X-Os-Version = os.release() 语义，按平台从各自版本池取（darwin 2x.x 内核
     ↔ macOS 13–26；win32 = 10.0.{build}；linux = 发行版内核包版本）
     —— 例外：host_profile 采到的真实 Linux 内核版本（如 pxed 的 5.10.134-…）
@@ -29,6 +30,8 @@ import re
 import secrets
 import uuid
 from dataclasses import dataclass, field, replace
+
+from . import logs
 
 # 平台×架构：官方 process.platform-process.arch 的真实主流组合
 _PLATFORM_ARCHS = (
@@ -95,11 +98,17 @@ class DeviceProfile:
 def _validate(profile: DeviceProfile, host_real: bool = False) -> None:
     """合规校验：档案内部自洽（平台↔版本↔分类、地区对、分辨率、UUID）。
 
-    host_real=True（宿主机真实档案）时 os_version 放宽为「内核版本形态」——
-    真机事实（如 pxed 的 5.10.134-18.0.11.lifsea8.x86_64）优先于预置池，
-    但仍必须长得像 os.release() 输出，防采集污染。
+    host_real=True（宿主机真实档案）时按「真机事实优先于预置池」放宽两处：
+    平台组合按取值形态放行（linux/arm64 云主机等真实形态，报别的反而是伪装），
+    os_version 放宽为「内核版本形态」——真机事实（如 pxed 的
+    5.10.134-18.0.11.lifsea8.x86_64）优先于预置池，但仍必须长得像
+    os.release() 输出，防采集污染。随机池不受放宽，仍走严格组合门。
     """
-    if (profile.platform, profile.arch) not in _PLATFORM_ARCHS:
+    if host_real:
+        if profile.platform not in ("darwin", "win32", "linux") or \
+                profile.arch not in ("arm64", "x64"):
+            raise ValueError(f"非法平台形态: {profile.platform_full}")
+    elif (profile.platform, profile.arch) not in _PLATFORM_ARCHS:
         raise ValueError(f"非法平台组合: {profile.platform_full}")
     if profile.os_version not in _OS_VERSIONS.get(profile.platform, ()):
         if not (host_real and _RELEASE_SHAPE.match(profile.os_version)):
@@ -148,8 +157,12 @@ def profile_for(account) -> DeviceProfile:
 
 
 def host_profile(device_mid: str | None = None):
-    """宿主机真实档案（默认指纹源）。device_mid 缺省复用全局持久化 MID
-    （官方语义：一台机器一个 deviceMid）；传入新 UUID 则为「本机新装」语义。"""
+    """宿主机真实档案（默认指纹源）。
+
+    device_mid 缺省 = DeviceProfile 缺省工厂的全新 UUID（collect 每次重采，
+    MID 归属由调用方定）：传入 quota.device_mid() 即「这台机器」语义，
+    传入新 UUID 即「本机新装设备」语义（assign 的用法）。
+    """
     from . import hostinfo
 
     profile = hostinfo.collect_host_profile()
@@ -161,10 +174,12 @@ def host_profile(device_mid: str | None = None):
 
 def assign(account) -> DeviceProfile:
     """入池分配档案：默认宿主机真实形态 + 全新 device_mid（每账号一台
-    「本机新装设备」）。宿主机采集失败（异常平台/数据）时退随机池兜底。"""
+    「本机新装设备」）。宿主机采集失败（异常平台/数据）时退随机池兜底 ——
+    降级必须留痕（用户决策默认真机数据，静默失效等于功能丢失）。"""
     try:
         account.fingerprint = host_profile(device_mid=str(uuid.uuid4()))
-    except (ValueError, OSError):  # 真机数据不合规/采集异常 → 随机合规档案
+    except (ValueError, OSError) as err:
+        logs.warn("fingerprint", f"宿主机档案不合规，退随机池: {err}")
         account.fingerprint = random_profile()
     return account.fingerprint
 

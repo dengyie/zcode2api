@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import base64
 import json
-import uuid
 
 import httpx
 
@@ -126,48 +125,22 @@ async def report_activation_events(account: Account) -> str | None:
     """上报官方客户端激活事件（app_launch + app_daily_active），返回错误或 None。
 
     zcode-switch claim_refresh 同形：preview 前模拟桌面端当日活跃（疑似活动
-    套餐投放资格信号）。请求无 Authorization（上游事件端点不校验）；任何失败
-    仅返回文案，不阻断 preview。
+    套餐投放资格信号）。事件体/端点/业务码判定收敛在 telemetry 单一事实源；
+    请求无 Authorization（上游事件端点不校验）；任何失败仅返回文案，不阻断
+    preview，首个失败即中止（日活键在上游按 device_mid+日期去重，重试无意义）。
     """
     from .fingerprint import profile_for
+    from .telemetry import post_activation_event
 
     profile = profile_for(account)
     user_id = jwt_user_id(account)
     if not user_id:
         return "JWT 无 user_id，跳过激活上报"
-    headers = {"Content-Type": "application/json"}
     for element in constants.ACTIVATION_ELEMENTS:
-        body = {
-            "event_id": str(uuid.uuid4()),
-            "client_timezone": profile.timezone,
-            "client_language": profile.language,
-            "element_name": element,
-            "event_region": "app",
-            "event_type": "view",
-            "event_text": "",
-            "event_extra_detail": {},
-            "user_id": user_id,
-            "screen_resolution": profile.screen,
-            "app_version": constants.BILLING_APP_VERSION,
-            "device_os_category": profile.os_category,
-            "device_os_version": profile.os_version,
-            "device_mid": profile.device_mid,
-            "mac_id": "",
-            "marketing_params": "{}",
-        }
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                res = await client.post(settings.ZCODE_EVENT_REPORT_URL,
-                                        headers=headers, json=body)
-        except httpx.HTTPError as err:
-            return f"激活事件 {element} 请求失败: {err}"
-        if res.status_code >= 400:
-            return f"激活事件 {element} HTTP {res.status_code}"
-        try:
-            if int(res.json().get("code", -1)) != 0:
-                return f"激活事件 {element} 上游拒绝: {res.text[:120]}"
-        except ValueError:
-            return f"激活事件 {element} 响应非 JSON"
+            await post_activation_event(profile, user_id, element)
+        except (httpx.HTTPError, RuntimeError) as err:
+            return f"激活事件 {element} 上报失败: {err}"
     return None
 
 

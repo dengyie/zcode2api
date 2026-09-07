@@ -42,6 +42,22 @@ def _backfill_fingerprints() -> int:
     return backfilled
 
 
+def _run_install_sequence_on_start() -> None:
+    """启动后台执行一次安装序（官方客户端每次启动都拉 configs + 发 app_launch，
+    日活去重在上游按 device_mid+日期）。失败只留痕，绝不影响启动。"""
+    import asyncio
+
+    from . import install
+
+    async def _run() -> None:
+        try:
+            await install.run_install_sequence()
+        except Exception as err:  # noqa: BLE001 —— create_task 里的异常无人接收，必须自兜
+            logs.err("install", f"安装序意外异常: {err}")
+
+    asyncio.create_task(_run())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     backfilled = _backfill_fingerprints()
@@ -49,6 +65,7 @@ async def lifespan(app: FastAPI):
         logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{backfilled}")
     monitor.start()
     captcha_manager.start()   # 验证码预解池后台补充
+    _run_install_sequence_on_start()
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
         f"{logs._B}{logs._MAG}zcode-hub{logs._R} {logs._DIM}v{settings.APP_VERSION} · Python{logs._R}",
