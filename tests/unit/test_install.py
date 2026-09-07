@@ -150,3 +150,23 @@ async def test_run_install_sequence_event_json_null(monkeypatch):
     result = await install.run_install_sequence()
     assert result["events_reported"] == []
     assert all("业务码异常" in e for e in result["errors"])
+
+
+async def test_startup_install_task_keeps_reference(monkeypatch):
+    """启动接线：task 引用必须被持有（事件循环只持弱引用，丢弃会被 GC 半途消失）。"""
+    import app.install as install_module
+    from app import main as main_module
+
+    calls: list[int] = []
+
+    async def _fake_run_install_sequence() -> dict:
+        calls.append(1)
+        return {"errors": []}
+
+    monkeypatch.setattr(install_module, "run_install_sequence", _fake_run_install_sequence)
+    monkeypatch.setattr(main_module, "_install_task", None)
+    main_module._run_install_sequence_on_start()
+    task = main_module._install_task
+    assert task is not None  # 引用被持有，而非裸 create_task
+    await task
+    assert calls == [1]

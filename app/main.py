@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 
@@ -42,20 +43,25 @@ def _backfill_fingerprints() -> int:
     return backfilled
 
 
+# 启动安装序的后台任务引用：事件循环对 task 只持弱引用（asyncio 官方文档），
+# 不保存引用任务可能被 GC 中途丢弃且无日志 —— 与 captcha._refill_task 同一模式
+_install_task: asyncio.Task | None = None
+
+
 def _run_install_sequence_on_start() -> None:
     """启动后台执行一次安装序（官方客户端每次启动都拉 configs + 发 app_launch，
     日活去重在上游按 device_mid+日期）。失败只留痕，绝不影响启动。"""
-    import asyncio
+    global _install_task
 
     from . import install
 
     async def _run() -> None:
         try:
             await install.run_install_sequence()
-        except Exception as err:  # noqa: BLE001 —— create_task 里的异常无人接收，必须自兜
+        except Exception as err:  # noqa: BLE001 —— 后台任务异常无人接收，必须自兜
             logs.err("install", f"安装序意外异常: {err}")
 
-    asyncio.create_task(_run())
+    _install_task = asyncio.create_task(_run())
 
 
 @asynccontextmanager
