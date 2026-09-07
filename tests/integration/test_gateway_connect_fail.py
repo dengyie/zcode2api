@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-# 与 tests/unit/test_regression_baseline.py 同款 JWT 形态（两段 .，3 segments）
-_FAILING_JWT = "h1.eyJzdWIiOiJhIn0.sig"
-_GOOD_JWT = "h2.eyJzdWIiOiJiIn0.sig"
+# JWT 形态同 tests/unit/test_regression_baseline.py（两段 .，3 segments）。
+# 注意 h1 前缀已被 baseline 的 test_messages_ok 用作 mock bind（session 级计数器
+# 跨用例累加），此处必须用独立前缀 —— connect_fail_first 依赖 n==0 判定。
+_FAILING_JWT = "f1.eyJzdWIiOiJhIn0.sig"
+_GOOD_JWT = "f2.eyJzdWIiOiJiIn0.sig"
 
 
 @pytest.mark.integration

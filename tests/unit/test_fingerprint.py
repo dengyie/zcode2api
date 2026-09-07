@@ -79,10 +79,59 @@ class TestAssign:
         mids = {profile_for(_acc(f"acc-{i}")).device_mid for i in range(20)}
         assert len(mids) == 20  # device_mid 永不复用
 
+    def test_assign_defaults_to_host_real_shape(self):
+        """默认分配 = 宿主机真实形态 + 全新 device_mid（2026-09-07 用户决策）。"""
+        from app import hostinfo
+
+        acc = _acc("host")
+        p = profile_for(acc)
+        host = hostinfo.collect_host_profile()
+        assert (p.platform, p.arch, p.os_version) == (host.platform, host.arch, host.os_version)
+        assert p.device_mid != host.device_mid  # 每账号一台「本机新装设备」
+
+    def test_assign_fallback_to_random_when_host_invalid(self, monkeypatch):
+        """宿主机数据不合规时退随机池（保证总能给出合规档案）。"""
+        import app.hostinfo as hostinfo
+        from app import fingerprint
+
+        bad = DeviceProfile("plan9", "mips", "1.0", "xx-XX", "Nowhere", "1x1")
+        monkeypatch.setattr(hostinfo, "collect_host_profile", lambda: bad)
+        acc = _acc("fallback")
+        p = fingerprint.assign(acc)
+        assert p.platform in {plat for plat, _ in fingerprint._PLATFORM_ARCHS}
+
     def test_distinct_accounts_usually_differ(self):
         """随机池下两账号档案全同概率极低（组合空间 >10^4）。"""
         a, b = profile_for(_acc("x")), profile_for(_acc("y"))
         assert (a.platform, a.os_version, a.device_mid) != (b.platform, b.os_version, b.device_mid)
+
+
+class TestHostProfile:
+    def test_host_profile_valid_and_uses_given_mid(self):
+        from app.fingerprint import host_profile
+
+        mid = "12345678-1234-4123-8123-123456789abc"
+        p = host_profile(device_mid=mid)
+        assert p.device_mid == mid
+        assert p.platform in ("darwin", "win32", "linux")
+
+    def test_host_profile_default_mid_is_uuid(self):
+        from app.fingerprint import host_profile
+
+        p = host_profile()
+        import uuid as _uuid
+        _uuid.UUID(p.device_mid)  # 不抛即合法
+
+    def test_host_profile_rejects_bad_shape(self):
+        from app import fingerprint
+
+        broken = fingerprint.DeviceProfile(
+            platform="darwin", arch="arm64", os_version="not a release",
+            language="zh-CN", timezone="Asia/Shanghai", screen="1920x1080",
+        )
+        import pytest
+        with pytest.raises(ValueError):
+            fingerprint._validate(broken, host_real=True)
 
 
 class TestPersistRoundTrip:
