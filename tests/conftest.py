@@ -81,6 +81,9 @@ def fresh_app(tmp_path, monkeypatch):
         if hasattr(mod, "store"):
             monkeypatch.setattr(mod, "store", fresh)
     assert store_module.store is fresh
+    from app import auth_admin as auth_admin_module
+    if hasattr(auth_admin_module, "reset_failures"):
+        auth_admin_module.reset_failures()
     return fresh
 
 

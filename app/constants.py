@@ -41,17 +41,16 @@ USAGE_PATH = "/usage"
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
-# ── 客户端版本（单一真相源：asar 客户端 gr="3.10.2"，3.0.x 已被上游拒绝）─────
+# ── 客户端版本（单一真相源：asar 客户端 3.11.2，旧版 3.10.2 已随官方升级）────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
-CLIENT_APP_VERSION = "3.10.2"
+CLIENT_APP_VERSION = "3.11.2"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
-# 现行版 3.11.2（zcode-switch 会读本机真实客户端版本，兜底即此值）；与 messages
-# 指纹 CLIENT_APP_VERSION=3.10.2（已真机验证 200）刻意分离，不动对话指纹。
+# 现行版 3.11.2（对齐官方客户端现行版本）
 BILLING_APP_VERSION = "3.11.2"
 BILLING_TITLE = "Z Code@electron"        # zcode-switch billing 头实证形态
 BILLING_RELEASE_CHANNEL = "stable"
@@ -90,7 +89,6 @@ MAX_TOKENS_LIMIT = 131072
 ANTHROPIC_VERSION = "2023-06-01"
 USER_AGENT = f"ZCode/{CLIENT_APP_VERSION}"
 X_ZCODE_APP_VERSION = CLIENT_APP_VERSION
-X_PLATFORM = CLIENT_PLATFORM
 X_ZCODE_AGENT = "glm"
 HTTP_REFERER = "https://zcode.z.ai/"
 CAPTCHA_HEADER = "X-Aliyun-Captcha-Verify-Param"
@@ -100,8 +98,8 @@ CAPTCHA_REGION_HEADER = "X-Aliyun-Captcha-Verify-Region"
 # ── 身份头仿真（对齐 zapi identity.ts 的 pio；顺序、取值逐字段镜像官方客户端）──
 # 官方客户端 companion 头集合，让代理在指纹层与官方 ZCode 桌面端不可区分。
 # darwin-arm64 桌面身份。X-Device-Mid 走 quota.device_mid() 持久化复用。
-IDENTITY_TITLE = "Z Code@cli"           # X-Title = "Z Code@{sourceTitle}"
-IDENTITY_RELEASE_CHANNEL = "production"
+IDENTITY_TITLE = "Z Code@electron"      # X-Title = "Z Code@{sourceTitle}"；桌面端账号走 electron
+IDENTITY_RELEASE_CHANNEL = "stable"
 IDENTITY_CLIENT_LANGUAGE = "zh-CN"
 IDENTITY_CLIENT_TIMEZONE = "Asia/Shanghai"
 # X-Os-Category：darwin→macos / win32→windows / 其它→linux

@@ -13,6 +13,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import closing
 
 from . import settings
@@ -76,6 +77,10 @@ class Store:
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('quota_refresh_interval', ?)",
                 (str(settings.QUOTA_REFRESH_INTERVAL),),
             )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('account_concurrency', ?)",
+                (str(settings.ACCOUNT_CONCURRENCY),),
+            )
             conn.commit()
 
     def _load(self) -> None:
@@ -85,6 +90,7 @@ class Store:
             self._settings.setdefault("admin_key", settings.DEFAULT_ADMIN_KEY)
             self._settings.setdefault("gateway_key", "")
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
+            self._settings.setdefault("account_concurrency", str(settings.ACCOUNT_CONCURRENCY))
 
             self._accounts = {p: [] for p in PROVIDERS}
             rows = conn.execute(
@@ -154,6 +160,13 @@ class Store:
         except (TypeError, ValueError):
             return settings.QUOTA_REFRESH_INTERVAL
 
+    def account_concurrency(self) -> int:
+        """单账号并发上限（0 = 不限）。运行时可改（meta 表），改后即生效。"""
+        try:
+            return max(0, int(self.get_setting("account_concurrency", settings.ACCOUNT_CONCURRENCY)))
+        except (TypeError, ValueError):
+            return settings.ACCOUNT_CONCURRENCY
+
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:
         with self._lock:
@@ -189,6 +202,7 @@ class Store:
                 if a.secret and a.secret == account.secret:
                     return a  # 跳过重复 token
             self._assign_fingerprint(account)  # 入池即分配独立设备指纹
+            account.install_id = str(uuid.uuid4())  # 安装身份：稳定安装令牌
             self._accounts[provider].append(account)
             self._persist_account(account)
         return account
@@ -216,10 +230,16 @@ class Store:
             self._delete_account(target.id)
             return True
 
-    def update_account(self, account: Account) -> None:
-        """持久化某个账号的当前状态。"""
+    def update_account(self, account: Account) -> bool:
+        """持久化某个账号的当前状态。
+
+        账号已从内存池删除时拒绝写回，避免后台任务 INSERT OR REPLACE 把已删行救活。
+        """
         with self._lock:
+            if self._find_locked(account.provider, account.id) is None:
+                return False
             self._persist_account(account)
+            return True
 
     def set_enabled(self, provider: str, id_or_name: str, enabled: bool) -> bool:
         with self._lock:

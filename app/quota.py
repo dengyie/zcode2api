@@ -97,6 +97,21 @@ async def fetch_quota(account: Account) -> dict:
 
     返回结构: {"billing":..., "balance":..., "usage":..., "error":...}
     """
+    live = store.find(account.provider, account.id)
+    if live is None:
+        return {"error": "账号已删除"}
+    if live is not account:
+        account = live
+    if not account.allows_billing() and not account.is_cooling():
+        # 与 admin/monitor 同一扇门。冷却账号仍允许查询（测试与兜底约定：
+        # 拿额度不得提前解除冷却）；废 JWT / 风控 / 手动停用一律不打 billing。
+        from .claim import AUTH_EXPIRED_MESSAGE, billing_block_reason
+
+        return {
+            "error": account.last_error
+            or billing_block_reason(account, action="上游查询")
+            or AUTH_EXPIRED_MESSAGE
+        }
     headers = _auth_headers(account)
     base = settings.ZCODE_BILLING_BASE
     result: dict = {}
@@ -114,6 +129,12 @@ async def fetch_quota(account: Account) -> dict:
             _get("/usage"),
         )
 
+    live = store.find(account.provider, account.id)
+    if live is None:
+        return {"error": "账号已删除"}
+    if live is not account:
+        account = live
+
     now = time.time()
     account.last_checked_at = now
 
@@ -121,8 +142,10 @@ async def fetch_quota(account: Account) -> dict:
     if billing_res is not None and billing_res.status_code in (401, 403):
         body = (billing_res.text or "").lower()
         if "captcha" not in body and "verify" not in body:
+            from .claim import AUTH_EXPIRED_MESSAGE
+
             account.status = Status.INVALID
-            account.last_error = f"鉴权失败 HTTP {billing_res.status_code}"
+            account.last_error = AUTH_EXPIRED_MESSAGE
             store.update_account(account)
             return {"error": account.last_error}
 
@@ -185,11 +208,11 @@ async def fetch_quota(account: Account) -> dict:
         if daily_exhausted and not has_bonus:
             account.status = Status.EXHAUSTED
             account.last_error = "额度已用完"
-        elif account.status in (Status.EXHAUSTED, Status.COOLING, Status.INVALID) and (
+        elif account.status in (Status.EXHAUSTED, Status.COOLING) and (
             has_daily or has_bonus
         ):
-            # 额度恢复（窗口重置 / 赠送池生效）→ 重新激活。风控冷却例外：冷却期内
-            # 不该有 billing 流量（monitor 已跳过），此处兜底不再提前解除
+            # 额度恢复（窗口重置 / 赠送池生效）→ 重新激活。冷却期内不提前解除；
+            # 废 JWT / 风控禁用绝不能因额度数字复活 Plan 通道。
             if not account.is_cooling():
                 account.status = Status.ACTIVE
                 account.last_error = None
@@ -236,8 +259,7 @@ class QuotaMonitor:
                 try:
                     accounts = [
                         a for a in store.list_accounts("zai")
-                        if a.mode == "jwt" and a.status != Status.DISABLED
-                        and not a.is_cooling()
+                        if a.mode == "jwt" and a.allows_billing()
                     ]
                     if accounts:
                         await refresh_accounts(accounts)

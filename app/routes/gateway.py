@@ -112,6 +112,10 @@ def _detect_captcha_challenge(resp: httpx.Response, text: str | None = None) -> 
 
 
 def _is_exhausted(status_code: int, text: str) -> bool:
+    # 429 是频控信号，优先于一切 body 关键词：429 body 带额度文案时
+    # （api.z.ai 实测形态）必须走频控重试，不得判成额度耗尽踢号。
+    if status_code == 429:
+        return False
     if status_code in constants.EXHAUST_HTTP_STATUSES:
         return True
     low = text.lower()
@@ -184,6 +188,11 @@ async def messages(request: Request):
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}},
+            status_code=400,
+        )
 
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
@@ -203,8 +212,19 @@ async def messages(request: Request):
         # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
         reqlog.finish_error(req_id, "客户端断开", status=499)
         raise
+    except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+        reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+        return JSONResponse(
+            {"error": {"message": "网关内部错误", "type": "internal_error"}},
+            status_code=500,
+        )
     if isinstance(result, _Upstream):
-        return result.to_streaming(req_id)
+        # dispatch 返回与流式生成器启动之间的取消窗口：兜底关闭释放并发槽位
+        try:
+            return result.to_streaming(req_id)
+        except asyncio.CancelledError:
+            await result.close()
+            raise
     return result
 
 
@@ -236,12 +256,22 @@ async def chat_completions(request: Request):
     except asyncio.CancelledError:
         reqlog.finish_error(req_id, "客户端断开", status=499)
         raise
+    except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+        reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+        return JSONResponse(
+            {"error": {"message": "网关内部错误", "type": "internal_error"}},
+            status_code=500,
+        )
     if not isinstance(result, _Upstream):
         return result
 
     model = str(body.get("model") or "")
     if payload.get("stream"):
-        return _openai_stream_response(result, model, req_id)
+        try:
+            return _openai_stream_response(result, model, req_id)
+        except asyncio.CancelledError:
+            await result.close()
+            raise
 
     try:
         raw = await result.resp.aread()
@@ -301,49 +331,153 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
 
 
 async def _dispatch(req_id, body, incoming_headers, port, provider):
-    """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。"""
-    tried: set[str] = set()
+    """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。
 
-    for _ in range(MAX_ACCOUNT_ATTEMPTS):
+    单账号并发限制：选号后若该账号在飞请求已达上限（store.account_concurrency，
+    0 = 不限），跳过换下一个账号——不排队（流式请求可占槽位数分钟，排队会
+    放大延迟甚至吊死客户端）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计真正
+    进入 _try_account 的次数）。全满/无号 → 503。
+    """
+    tried: set[str] = set()
+    limit = _limit()
+    attempts = 0
+
+    while attempts < MAX_ACCOUNT_ATTEMPTS:
         account = store.select(provider, skip_ids=tried)
         if account is None:
             break
         tried.add(account.id)
-        needs_captcha = provider == "zai" and account.mode == "jwt"
-
-        result = await _try_account(req_id, account, body, incoming_headers, port, needs_captcha)
-        if result is _NEXT_ACCOUNT:
+        if limit > 0 and _inflight.get(account.id, 0) >= limit:
+            logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
             continue
+        attempts += 1
+        needs_captcha = provider == "zai" and account.uses_plan_channel()
+
+        slot_box: list[str | None] = [None]
+        if limit > 0:
+            _inflight[account.id] = _inflight.get(account.id, 0) + 1
+            slot_box[0] = account.id
+        try:
+            result = await _try_account(
+                req_id, account, body, incoming_headers, port, needs_captcha, slot_box,
+            )
+        except BaseException:
+            if slot_box[0] is not None:
+                _release_slot(slot_box[0])
+                slot_box[0] = None
+            raise
+        if result is _NEXT_ACCOUNT:
+            if slot_box[0] is not None:
+                _release_slot(slot_box[0])
+                slot_box[0] = None
+            continue
+        if isinstance(result, _Upstream):
+            held = slot_box[0]
+            slot_box[0] = None
+            if held is not None:
+                result.on_close = _make_slot_releaser(held)
+            return result
+        if slot_box[0] is not None:
+            _release_slot(slot_box[0])
+            slot_box[0] = None
         return result
 
-    logs.req_err(req_id, "无可用账号 / 额度均已耗尽")
-    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽", status=503)
+    logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
+    reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=503)
     return JSONResponse(
-        {"error": {"message": "所有账号均不可用或额度已用完，请在后台检查账号状态", "type": "no_available_account"}},
+        {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态", "type": "no_available_account"}},
         status_code=503,
     )
+
+
+def _release_slot(account_id: str) -> None:
+    n = _inflight.get(account_id, 0) - 1
+    if n <= 0:
+        _inflight.pop(account_id, None)
+    else:
+        _inflight[account_id] = n
+
+
+def _park_slot(slot_box: list[str | None] | None) -> None:
+    """等待（429/验证码/5xx）前释放并发槽，避免把账号冻住数分钟。"""
+    if slot_box and slot_box[0] is not None:
+        _release_slot(slot_box[0])
+        slot_box[0] = None
+
+
+def _reacquire_slot(account: Account, slot_box: list[str | None] | None) -> bool:
+    """等待结束后重新占槽；占不到则让调用方换号。"""
+    if slot_box is None:
+        return True
+    limit = _limit()
+    if limit <= 0:
+        return True
+    if _inflight.get(account.id, 0) >= limit:
+        return False
+    _inflight[account.id] = _inflight.get(account.id, 0) + 1
+    slot_box[0] = account.id
+    return True
+
+
+def _make_slot_releaser(account_id: str):
+    def _release() -> None:
+        _release_slot(account_id)
+    return _release
 
 
 _NEXT_ACCOUNT = object()
 
 
+# fire-and-forget 后台任务强引用：事件循环对 task 只持弱引用，裸 create_task
+# 会被 GC 中途静默丢弃（同 main.py 启动安装序已修过的缺陷，2026-09 review）。
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+# 账号并发限制：account_id → 在飞请求数。asyncio 单线程事件循环下
+# check+inc 原子；释放走 _Upstream.close / 失败路径，泄漏面在测试钉住。
+_inflight: dict[str, int] = {}
+
+
+def _limit() -> int:
+    """当前并发上限（0 = 不限），实时读取设置（后台改后即生效）。"""
+    return store.account_concurrency()
+
+
 class _Upstream:
     """已建立的上游成功流：由调用方消费并负责关闭。"""
 
-    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode")
+    __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close", "_closed")
 
     def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
-                 t_first: float | None = None, account_name: str = "", mode: str = "") -> None:
+                 t_first: float | None = None, account_name: str = "", mode: str = "",
+                 on_close=None) -> None:
         self.resp = resp
         self.cm = cm
         self.client = client
         self.t_first = t_first
         self.account_name = account_name
         self.mode = mode
+        self.on_close = on_close
+        self._closed = False
 
     async def close(self) -> None:
+        """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。"""
+        if self._closed:
+            return
+        self._closed = True
         await self.cm.__aexit__(None, None, None)
         await self.client.aclose()
+        if self.on_close is not None:
+            try:
+                self.on_close()
+            except Exception:  # noqa: BLE001 - 槽位释放失败不掩盖主流程
+                pass
 
     def to_streaming(self, req_id: str) -> StreamingResponse:
         """原样透传（/v1/messages 直通路径）。"""
@@ -369,14 +503,17 @@ class _Upstream:
                                  headers={"Cache-Control": "no-cache"})
 
 
-async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha):
+async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha,
+                       slot_box: list | None = None):
     """尝试用单个账号转发，含验证码续期与可配置重试。
 
     错误处理策略（参数见 settings，均可用环境变量调整）：
       - 验证码挑战：清池换码重建请求，最多 MAX_CAPTCHA_RETRIES 次
       - 429 频控：**不冷却账号**，按上游 Retry-After（封顶 RETRY_429_WAIT_MAX）
         或 RETRY_429_WAIT 等待后原地重试，最多 RETRY_429_TIMES 次；
-        耗尽后换下一个账号，账号保持可用
+        耗尽后换下一个账号，账号保持可用。Plan 通道耗尽且有 API Key 时切
+        回退通道重试（force_fallback 显式路由——429 不改账号状态，不能靠
+        status 推导通道；回退通道自己的 429 重试预算独立计满后再换号）
       - 5xx 等一般错误：重试最多 RETRY_5XX_TIMES 次；耗尽后账号冷却
         COOLING_SECONDS 并换下一个账号
       - 风控（3012/405「unusual activity」真封禁）：直接禁用账号（UI 展示），
@@ -385,12 +522,14 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
     captcha_retries = 0
     retries_429 = 0
     retries_5xx = 0
+    force_fallback = False  # 本请求瞬态走 Key 回退（不改账号持久化状态）
     model_name = str(body.get("model") or "-")
     while True:
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
         verify_param = verify_region = None
         if needs_captcha:
+            _park_slot(slot_box)
             try:
                 verify_param, verify_region = await captcha_manager.get_verify_param(port)
             except Exception as err:  # noqa: BLE001
@@ -400,9 +539,14 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     {"error": {"message": f"无法完成人机校验: {err}", "type": "captcha_error"}},
                     status_code=500,
                 )
+            if not _reacquire_slot(account, slot_box):
+                logs.warn(req_id, f"账号 {account.name} 验证码等待后并发已满，切换下一个")
+                return _NEXT_ACCOUNT
 
         try:
-            url, headers, payload = build_request(account, body, verify_param, incoming_headers, verify_region)
+            url, headers, payload = build_request(account, body, verify_param,
+                                                  incoming_headers, verify_region,
+                                                  force_fallback=force_fallback)
         except RuntimeError as err:
             account.record_result(False, f"凭证无效: {err}")
             _mark(account, Status.INVALID, str(err))
@@ -416,7 +560,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         except httpx.HTTPError as err:
             await client.aclose()
             account.record_result(False, f"连接失败: {err}")
-            _mark(account, Status.COOLING, f"连接失败: {err}")
+            # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan
+            if account.status in (Status.INVALID, Status.DISABLED):
+                store.update_account(account)
+            else:
+                _mark(account, Status.COOLING, f"连接失败: {err}")
             logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
             return _NEXT_ACCOUNT
 
@@ -449,6 +597,15 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     f"确认恢复后请在后台手动启用（第 {account.risk_strikes} 次）"
                 )
                 store.update_account(account)
+                if needs_captcha and account.has_apikey_fallback():
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 命中风控 HTTP {status_code}，已禁用 Plan 通道"
+                        f"（累计第 {account.risk_strikes} 次），切 API Key 回退",
+                    )
+                    needs_captcha = False
+                    force_fallback = True
+                    continue
                 logs.warn(
                     req_id,
                     f"账号 {account.name} 命中风控 HTTP {status_code}，已禁用"
@@ -458,14 +615,22 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
 
             if _is_exhausted(status_code, text):
                 account.record_result(False, f"额度用完 HTTP {status_code}")
-                _mark(account, Status.EXHAUSTED, "额度已用完")
+                if account.status in (Status.INVALID, Status.DISABLED):
+                    store.update_account(account)
+                else:
+                    _mark(account, Status.EXHAUSTED, "额度已用完")
+                    _spawn_bg(_safe_refresh(account))
                 logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
-                asyncio.create_task(_safe_refresh(account))
                 return _NEXT_ACCOUNT
 
             if status_code == 401:
                 account.record_result(False, "鉴权失败 HTTP 401")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
+                if needs_captcha and account.has_apikey_fallback():
+                    logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切 API Key 回退")
+                    needs_captcha = False
+                    force_fallback = True
+                    continue
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切换下一个")
                 return _NEXT_ACCOUNT
 
@@ -473,11 +638,18 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
                 account.record_result(False, "鉴权失败 HTTP 403")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
+                if needs_captcha and account.has_apikey_fallback():
+                    logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切 API Key 回退")
+                    needs_captcha = False
+                    force_fallback = True
+                    continue
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切换下一个")
                 return _NEXT_ACCOUNT
 
             if status_code == 429:
-                # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用
+                # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
+                # Plan 通道耗尽 ≠ Key 回退也耗尽：同账号切回退并归还该通道的重试预算
+                #（与上方 3012/401/403 切回退同一语义）
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
                     wait = _parse_retry_after(resp.headers.get("retry-after")) or settings.RETRY_429_WAIT
@@ -486,9 +658,21 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         f"账号 {account.name} 被限流 429，{wait}s 后重试"
                         f"（{retries_429}/{settings.RETRY_429_TIMES}）",
                     )
+                    _park_slot(slot_box)
                     await _sleep(wait)
+                    if not _reacquire_slot(account, slot_box):
+                        logs.warn(req_id, f"账号 {account.name} 429 等待后并发已满，切换下一个")
+                        return _NEXT_ACCOUNT
+                    continue
+                if needs_captcha and account.has_apikey_fallback():
+                    account.record_result(False, "Plan 通道 429 耗尽，切 API Key 回退")
+                    logs.warn(req_id, f"账号 {account.name} Plan 通道 429 耗尽，切 API Key 回退")
+                    needs_captcha = False
+                    force_fallback = True
+                    retries_429 = 0
                     continue
                 account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
+                store.update_account(account)
                 logs.warn(
                     req_id,
                     f"账号 {account.name} 429 重试 {settings.RETRY_429_TIMES} 次耗尽，"
@@ -505,15 +689,24 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         f"账号 {account.name} 上游 HTTP {status_code}，"
                         f"{settings.RETRY_5XX_WAIT}s 后重试（{retries_5xx}/{settings.RETRY_5XX_TIMES}）",
                     )
+                    _park_slot(slot_box)
                     await _sleep(settings.RETRY_5XX_WAIT)
+                    if not _reacquire_slot(account, slot_box):
+                        logs.warn(req_id, f"账号 {account.name} 5xx 等待后并发已满，切换下一个")
+                        return _NEXT_ACCOUNT
                     continue
-                cool = settings.COOLING_SECONDS
-                account.status = Status.COOLING
-                account.cooling_until = time.time() + cool
-                account.last_error = f"上游 HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却"
                 account.record_result(False, f"HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却")
-                store.update_account(account)
-                logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，冷却 {cool}s，切换下一个")
+                if account.status in (Status.INVALID, Status.DISABLED):
+                    # Key 回退 5xx 不得覆盖废 JWT / 风控禁用，否则冷却结束会重开 Plan
+                    store.update_account(account)
+                    logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，Plan 已停用，切换下一个")
+                else:
+                    cool = settings.COOLING_SECONDS
+                    account.status = Status.COOLING
+                    account.cooling_until = time.time() + cool
+                    account.last_error = f"上游 HTTP {status_code} 重试 {settings.RETRY_5XX_TIMES} 次耗尽，冷却"
+                    store.update_account(account)
+                    logs.warn(req_id, f"账号 {account.name} 上游 {status_code} 重试耗尽，冷却 {cool}s，切换下一个")
                 return _NEXT_ACCOUNT
 
             # 其它 4xx：直接回传客户端；响应体全量落日志供排查
@@ -535,13 +728,15 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         account.use_count += 1
         account.last_used_at = time.time()
         account.record_result(True, f"HTTP 200 · {model_name} · {time.time() - attempt_t0:.1f}s")
-        account.risk_strikes = 0  # 成功即清零封禁计数
-        account.last_error = None
-        account.cooling_until = None
-        if account.status in (Status.COOLING, Status.EXHAUSTED):
-            account.status = Status.ACTIVE
+        # API Key 回退成功不得把废 JWT / 风控禁用洗成 active，也不得清风控计数
+        if account.status not in (Status.INVALID, Status.DISABLED):
+            account.risk_strikes = 0
+            account.last_error = None
+            account.cooling_until = None
+            if account.status in (Status.COOLING, Status.EXHAUSTED):
+                account.status = Status.ACTIVE
         store.update_account(account)
-        asyncio.create_task(_safe_refresh(account))
+        _spawn_bg(_safe_refresh(account))
 
         return _Upstream(resp, cm, client, t_first=time.time() - attempt_t0,
                          account_name=account.name, mode=account.mode)
@@ -556,12 +751,15 @@ def _safe_json(text: str):
 
 async def _safe_refresh(account: Account) -> None:
     try:
-        if account.provider == "zai" and account.mode == "jwt":
+        live = store.find(account.provider, account.id)
+        if live is None:
+            return
+        if live.provider == "zai" and live.allows_billing():
             # 去抖：每条消息都刷 billing 是流量放大器（会加剧风控），与 monitor 共享
             # last_checked_at，最小间隔内的刷新直接跳过
-            last = account.last_checked_at
+            last = live.last_checked_at
             if last and time.time() - last < settings.BILLING_REFRESH_MIN_INTERVAL:
                 return
-            await fetch_quota(account)
+            await fetch_quota(live)
     except Exception:  # noqa: BLE001
         pass

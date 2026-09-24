@@ -13,8 +13,8 @@ from app.models import Account
 
 GOOD_JWT = "h1.eyJzdWIiOiJhIn0.sig"
 
-_VALID_PLATFORMS = {("darwin", "arm64"), ("darwin", "x64"), ("win32", "x64"), ("linux", "x64")}
-_VALID_SCREENS = {"1920x1080", "2560x1440", "3840x2160", "5120x2880", "2560x1600",
+_VALID_PLATFORMS = {("darwin", "arm64"), ("darwin", "x64"), ("win32", "x64")}
+_VALID_SCREENS = {"1920x1080", "2560x1440", "3840x2160", "2560x1600",
                   "1728x1117", "1512x982", "1440x900", "1366x768"}
 # os.release() 形态门（按平台），与常量池解耦：上游只看形态真实性
 _OS_SHAPE = {
@@ -50,6 +50,15 @@ class TestRandomProfile:
         for _ in range(50):
             assert random_profile().screen in _VALID_SCREENS
 
+    def test_random_profile_is_coherent_sku(self):
+        """平台×内核×分辨率必须是成套桌面 SKU，禁止字段笛卡尔积。"""
+        from app import fingerprint
+
+        for _ in range(80):
+            p = random_profile()
+            assert (p.platform, p.arch, p.os_version, p.screen) in fingerprint.sku_combos()
+            assert p.platform in ("darwin", "win32")
+
     def test_device_mid_uuid_v4_unique(self):
         mids = {random_profile().device_mid for _ in range(50)}
         assert len(mids) == 50
@@ -79,32 +88,62 @@ class TestAssign:
         mids = {profile_for(_acc(f"acc-{i}")).device_mid for i in range(20)}
         assert len(mids) == 20  # device_mid 永不复用
 
-    def test_assign_defaults_to_host_real_shape(self):
-        """默认分配 = 宿主机真实形态 + 全新 device_mid（2026-09-07 用户决策）。"""
-        from app import hostinfo
+    def test_assign_is_generated_desktop_sku_not_host_clone(self):
+        """入池档案必须是成套桌面 SKU，禁止克隆部署机（linux 云内核 / 1920x1080 兜底）。"""
+        from app import fingerprint, hostinfo
 
-        acc = _acc("host")
+        acc = _acc("gen")
         p = profile_for(acc)
         host = hostinfo.collect_host_profile()
-        assert (p.platform, p.arch, p.os_version) == (host.platform, host.arch, host.os_version)
-        assert p.device_mid != host.device_mid  # 每账号一台「本机新装设备」
+        assert (p.platform, p.arch, p.os_version, p.screen) in fingerprint.sku_combos()
+        assert p.platform in ("darwin", "win32")
+        assert p.device_mid != host.device_mid
+        # 宿主机四元组若不是桌面 SKU（pxed linux 云内核），账号档案不得等于宿主机
+        host_key = (host.platform, host.arch, host.os_version, host.screen)
+        if host_key not in fingerprint.sku_combos():
+            assert (p.platform, p.arch, p.os_version, p.screen) != host_key
 
-    def test_assign_fallback_to_random_when_host_invalid(self, monkeypatch, capsys):
-        """宿主机数据不合规时退随机池（保证总能给出合规档案），且降级必须留痕。"""
+    def test_assign_does_not_read_host_when_host_invalid(self, monkeypatch):
+        """生成器不再依赖宿主机采集；hostinfo 抛错也不能阻断入池。"""
         import app.hostinfo as hostinfo
         from app import fingerprint
 
-        bad = DeviceProfile("plan9", "mips", "1.0", "xx-XX", "Nowhere", "1x1")
-        monkeypatch.setattr(hostinfo, "collect_host_profile", lambda: bad)
-        acc = _acc("fallback")
-        p = fingerprint.assign(acc)
-        assert p.platform in {plat for plat, _ in fingerprint._PLATFORM_ARCHS}
-        assert "退随机池" in capsys.readouterr().out  # 静默降级 = 功能无声丢失
+        def _boom():
+            raise OSError("no host")
+
+        monkeypatch.setattr(hostinfo, "collect_host_profile", _boom)
+        p = fingerprint.assign(_acc("nohost"))
+        assert (p.platform, p.arch, p.os_version, p.screen) in fingerprint.sku_combos()
 
     def test_distinct_accounts_usually_differ(self):
-        """随机池下两账号档案全同概率极低（组合空间 >10^4）。"""
+        """两账号至少 device_mid 不同；全套字段偶然全同不作为失败（SKU 池有限）。"""
         a, b = profile_for(_acc("x")), profile_for(_acc("y"))
-        assert (a.platform, a.os_version, a.device_mid) != (b.platform, b.os_version, b.device_mid)
+        assert a.device_mid != b.device_mid
+
+    def test_startup_backfills_host_clone_to_sku(self, fresh_app):
+        """旧版 linux 云主机克隆启动时换成桌面 SKU，并清 installed_at 以便重装。"""
+        from app import main as main_module
+        from app.fingerprint import is_generated_sku, profile_for
+
+        acc = fresh_app.add_account("zai", "old", "jwt.token.old")
+        old_mid = "12345678-1234-4123-8123-123456789abc"
+        acc.fingerprint = {
+            "platform": "linux", "arch": "x64",
+            "os_version": "5.10.134-18.0.11.lifsea8.x86_64",
+            "language": "en-US", "timezone": "UTC", "screen": "1920x1080",
+            "device_mid": old_mid,
+        }
+        acc.installed_at = 123.0
+        fresh_app.update_account(acc)
+
+        replaced = main_module._backfill_fingerprints()
+        assert len(replaced) == 1
+        after = fresh_app.find("zai", acc.id)
+        p = profile_for(after)
+        assert is_generated_sku(p)
+        assert p.platform in ("darwin", "win32")
+        assert p.device_mid != old_mid
+        assert after.installed_at is None
 
 
 class TestHostProfile:
@@ -186,6 +225,13 @@ class TestRotate:
         acc = _acc("a")
         mids = {rotate(acc).device_mid for _ in range(10)}
         assert len(mids) == 10
+
+    def test_rotate_stays_on_desktop_sku(self):
+        from app import fingerprint
+
+        acc = _acc("a")
+        p = rotate(acc)
+        assert (p.platform, p.arch, p.os_version, p.screen) in fingerprint.sku_combos()
 
 
 @pytest.mark.parametrize("field", ["platform", "arch", "os_version", "language", "timezone", "screen"])

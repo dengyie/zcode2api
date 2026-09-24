@@ -88,12 +88,13 @@ async def cmd_login(args: list[str]) -> None:
             if zcode_jwt:
                 acc = store.add_account("zai", "oauth-login", zcode_jwt)
                 print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
-                await cli_auto_claim(acc)
+                await _cli_ingest_followup(acc)
             if access_token:
                 try:
                     key = await flow.exchange_api_key(access_token)
-                    store.add_account("zai", "oauth-apikey", key)
+                    acc_key = store.add_account("zai", "oauth-apikey", key)
                     print(c(f"✔ 已兑换并保存 API Key: {key[:8]}...", "green"))
+                    await _cli_ingest_followup(acc_key)
                 except Exception as err:  # noqa: BLE001
                     print(c(f"⚠️ 兑换 API Key 失败: {err}", "yellow"))
             return
@@ -101,6 +102,18 @@ async def cmd_login(args: list[str]) -> None:
             print(c("❌ 授权失败或被拒绝。", "red"))
             return
     print(c("❌ 登录超时，请重试。", "red"))
+
+
+async def _cli_ingest_followup(acc) -> None:
+    """CLI 入池与 Web 入池对齐：按账号安装序 + JWT 自动领取。"""
+    from app.install import run_install_sequence_for_account
+
+    try:
+        await run_install_sequence_for_account(acc)
+    except Exception as err:  # noqa: BLE001
+        print(c(f"⚠️ 安装序异常: {err}", "yellow"))
+    if acc.mode == "jwt" and acc.jwt_token:
+        await cli_auto_claim(acc)
 
 
 async def cli_auto_claim(acc) -> None:
@@ -126,8 +139,7 @@ def cmd_add_account(args: list[str]) -> None:
     provider, name, secret = args[0], args[1], args[2]
     acc = store.add_account(provider, name, secret)
     print(c(f"✔ 已添加账号 {acc.name} ({acc.id}) 模式={acc.mode}", "green"))
-    if acc.mode == "jwt" and acc.jwt_token:
-        asyncio.run(cli_auto_claim(acc))
+    asyncio.run(_cli_ingest_followup(acc))
 
 
 def cmd_accounts(args: list[str]) -> None:
@@ -202,7 +214,11 @@ def cmd_import(args: list[str]) -> None:
         return
     with open(args[0], encoding="utf-8") as f:
         payload = json.load(f)
+    existing = {a.id for a in store.list_accounts()}
     count = store.import_accounts(payload)
+    imported = [a for a in store.list_accounts() if a.id not in existing]
+    for acc in imported:
+        asyncio.run(_cli_ingest_followup(acc))
     print(c(f"✔ 已导入 {count} 个账号", "green"))
 
 

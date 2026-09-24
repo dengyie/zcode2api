@@ -93,15 +93,31 @@
         <div id="login-idle">
           <input class="input" id="login-label" placeholder="账号备注（可选，如 acct-1）" maxlength="32" style="margin-bottom:10px">
           <button onclick="startLogin()" id="login-start-btn" class="dialog-btn dialog-btn-primary w-full" style="height:40px">生成授权链接</button>
+
+          <div style="margin-top:14px;padding:10px 12px;background:var(--panel-2);border:1px solid var(--hairline);border-radius:var(--radius);font-size:12px;color:var(--ink-mute);line-height:1.6">
+            <div style="font-weight:600;color:var(--ink);margin-bottom:4px;display:flex;align-items:center;gap:6px">
+              <span style="color:var(--amber)">💡</span><span>海外邮箱 / Google 账号登录说明</span>
+            </div>
+            <div>上游官方授权页默认仅展示国内手机号登录。如使用海外邮箱或 Google 账号，请按以下两步操作：</div>
+            <div style="margin-top:6px;display:grid;gap:4px">
+              <div>1. 先在同一浏览器中打开 👉 <a href="https://chat.z.ai/auth?redirect_uri=https://z.ai/" target="_blank" rel="noopener" style="color:var(--amber);text-decoration:underline;font-weight:500">海外邮箱/Google 预登录入口</a> 完成登录。</div>
+              <div>2. 登录成功后，点击上方「生成授权链接」并打开授权，即可秒级自动入池。</div>
+            </div>
+          </div>
         </div>
         <div id="login-active" style="display:none">
           <div class="dialog-help" style="margin-bottom:6px">在任意浏览器打开下面的链接完成授权（本页保持打开即自动入池）：</div>
           <div style="display:flex;gap:8px;align-items:center">
             <input class="input" id="login-url" readonly style="font-size:12px">
             <button onclick="copyLoginUrl()" class="dialog-btn">复制</button>
-            <button onclick="openLoginUrl()" class="dialog-btn dialog-btn-primary">打开</button>
+            <button onclick="openLoginUrl()" class="dialog-btn dialog-btn-primary">打开授权</button>
           </div>
           <div class="live-dot" id="login-status" style="margin-top:16px">等待授权中…</div>
+
+          <div style="margin-top:14px;padding:10px 12px;background:var(--panel-2);border:1px solid var(--hairline);border-radius:var(--radius);font-size:12px;color:var(--ink-mute);line-height:1.6">
+            <div style="color:var(--ink);font-weight:600;margin-bottom:2px">⚠️ 提示：若打开后未见邮箱/Google登录选项</div>
+            <div>上游官方前端默认仅展示手机登录。若需海外邮箱/Google登录：请先打开 <a href="https://chat.z.ai/auth?redirect_uri=https://z.ai/" target="_blank" rel="noopener" style="color:var(--amber);text-decoration:underline;font-weight:500">邮箱/Google 预登录入口</a> 登录账号，再点击上方「打开授权」即可秒级入池。</div>
+          </div>
         </div>
       </div>
       <div class="dialog-actions">
@@ -484,27 +500,31 @@ async function startLogin(){
     btn.disabled=false;
   }
 }
-function pollLogin(flowId){
-  let n=0;
-  _loginTimer=setInterval(async()=>{
-    if(++n>200){stopLoginPoll();setLoginStatus('登录超时，请重新生成链接',true);return;}
-    try{
-      const d=await api('GET','/login/poll/'+flowId);
-      if(d.status==='ready'){
-        stopLoginPoll();
-        showToast('登录成功，已导入账号池：'+(d.account&&d.account.name||''),'success');
-        closeModal('modal-add');
-        load();
-      }else if(d.status==='failed'){
-        stopLoginPoll();
-        setLoginStatus(d.message||'授权失败或被拒绝',true);
-      }else if(d.status==='expired'){
-        stopLoginPoll();
-        setLoginStatus('链接已过期，请重新生成',true);
-      }
-    }catch(e){/* 单次网络抖动继续轮询 */}
-  },2500);
-}
+	function pollLogin(flowId){
+	  let n=0, inflight=false;
+	  _loginTimer=setInterval(async()=>{
+	    if(inflight)return;
+	    if(++n>200){stopLoginPoll();setLoginStatus('登录超时，请重新生成链接',true);return;}
+	    inflight=true;
+	    try{
+	      const d=await api('GET','/login/poll/'+flowId);
+	      if(!_loginTimer)return;
+	      if(d.status==='ready'){
+	        stopLoginPoll();
+	        showToast('登录成功，已导入账号池：'+(d.account&&d.account.name||''),'success');
+	        closeModal('modal-add');
+	        load();
+	      }else if(d.status==='failed'){
+	        stopLoginPoll();
+	        setLoginStatus(d.message||'授权失败或被拒绝',true);
+	      }else if(d.status==='expired'){
+	        stopLoginPoll();
+	        setLoginStatus('链接已过期，请重新生成',true);
+	      }
+	    }catch(e){/* 单次网络抖动继续轮询 */}
+	    finally{inflight=false;}
+	  },2500);
+	}
 function setLoginStatus(text,isErr){
   const el=document.getElementById('login-status');
   el.textContent=text;

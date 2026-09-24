@@ -138,8 +138,11 @@ def build_app() -> FastAPI:
         _record("POST", request.url.path, headers, body)
         bind = headers.get("x-mock-bind") or _bind_key(headers)
         n = app.state.counters.get(bind, 0)
-        app.state.counters[bind] = n + 1
         scenario = _scenario_for(headers, bind)
+        app.state.counters[bind] = n + 1
+        # 测试协议：app.state.slow_all = True 时默认场景替换为 slow（并发重叠用）
+        if scenario == "ok" and getattr(app.state, "slow_all", False):
+            scenario = "slow"
 
         try:
             payload = json.loads(body) if body else {}
@@ -150,10 +153,27 @@ def build_app() -> FastAPI:
         # connect_fail_first 不在这里处理：判定在 _wrap_asgi 最外层
         #（FastAPI 的 ServerErrorMiddleware 会把异常兜底成 500，无法表达断连语义）
 
-        if scenario == "slow_first_byte":
-            await asyncio.sleep(30)
+        # 并发仪表：按凭证分账统计同时刻在飞 messages 请求数（并发限制测试用）
+        conc_in: dict[str, int] = getattr(app.state, "conc_in", None) or {}
+        app.state.conc_in = conc_in
+        conc_max: dict[str, int] = getattr(app.state, "conc_max", None) or {}
+        app.state.conc_max = conc_max
+        bind_gauge = headers.get("x-mock-bind") or _bind_key(headers)
+        conc_in[bind_gauge] = conc_in.get(bind_gauge, 0) + 1
+        conc_max[bind_gauge] = max(conc_max.get(bind_gauge, 0), conc_in[bind_gauge])
+        try:
+            if scenario == "slow_first_byte":
+                await asyncio.sleep(30)
+            if scenario == "slow":
+                await asyncio.sleep(0.3)
 
-        status, resp_body, extra_headers = _messages_result(scenario, payload)
+            status, resp_body, extra_headers = _messages_result(scenario, payload)
+        finally:
+            left = conc_in[bind_gauge] - 1
+            if left <= 0:
+                conc_in.pop(bind_gauge, None)
+            else:
+                conc_in[bind_gauge] = left
         if status != 200:
             return Response(
                 json.dumps(resp_body), status_code=status,
@@ -199,6 +219,10 @@ def build_app() -> FastAPI:
             return 400, {"code": 1002, "message": "额度已用完"}, {}
         if scenario == "rate_limited":
             return 429, _error_body("rate limited"), {"retry-after": "30"}
+        if scenario == "rate_limited_quota_body":
+            # 线上 2026-09-13 实测形态：api.z.ai 频控 429 但 body 带额度文案，
+            # 不得被 _is_exhausted 关键词分支误判成「额度用完」。
+            return 429, _error_body("quota exceeded for this key"), {"retry-after": "30"}
         if scenario == "auth_invalid":
             return 401, _error_body("invalid api key", type="authentication_error"), {}
         if scenario == "captcha_challenge":
@@ -304,6 +328,9 @@ def build_app() -> FastAPI:
         elif scenario == "claim_expired":
             return Response(json.dumps({"code": 1002, "msg": "expired"}),
                             media_type="application/json")
+        elif scenario == "claim_auth":
+            return Response(json.dumps({"error": {"message": "invalid token"}}),
+                            status_code=401, media_type="application/json")
         else:
             plans = [dict(_CLAIM_PLAN)]
         return Response(json.dumps({"code": 0, "data": {"plans": plans}}),
@@ -324,6 +351,9 @@ def build_app() -> FastAPI:
             return Response(json.dumps({"code": 3001, "msg": "bad plan"}),
                             media_type="application/json")
         scenario = getattr(app.state, "claim_scenario", None) or headers.get("x-mock-scenario")
+        if scenario == "claim_auth":
+            return Response(json.dumps({"error": {"message": "invalid token"}}),
+                            status_code=401, media_type="application/json")
         if scenario == "claim_captcha_fail":
             return Response(json.dumps({"code": 3007, "msg": "captcha invalid"}),
                             media_type="application/json")
@@ -347,6 +377,14 @@ def build_app() -> FastAPI:
         _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
         # 测试协议：app.state.oauth_state = "ready" | "failed" | "pending"
         #（默认 pending；ready 时附带可兑换的 mock 凭证组）
+        # app.state.oauth_poll_status：非 200 时模拟官方 poll HTTP 错误（默认 200）
+        poll_http = int(getattr(app.state, "oauth_poll_status", 200) or 200)
+        if poll_http != 200:
+            return Response(
+                json.dumps({"error": {"message": "poll denied"}}),
+                status_code=poll_http,
+                media_type="application/json",
+            )
         state = getattr(app.state, "oauth_state", "pending")
         data: dict = {"status": state}
         if state == "failed":
@@ -363,6 +401,15 @@ def build_app() -> FastAPI:
     async def z_login(request: Request) -> Response:
         body = await request.body()
         _record("POST", request.url.path, {k.lower(): v for k, v in request.headers.items()}, body)
+        delay = float(getattr(app.state, "oauth_exchange_delay", 0) or 0)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if getattr(app.state, "oauth_login_fail", False):
+            return Response(
+                json.dumps({"error": {"message": "exchange denied"}}),
+                status_code=500,
+                media_type="application/json",
+            )
         return Response(json.dumps({
             "data": {"access_token": "mock-biz-token"}
         }), media_type="application/json")

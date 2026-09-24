@@ -55,6 +55,9 @@ class Account:
     created_at: float = field(default_factory=time.time)
     # 每账号客户端指纹（fingerprint.DeviceProfile；dataclass 存 dict，取用时还原）
     fingerprint: dict | object | None = None
+    # 安装身份：入池分配的稳定安装令牌（hub 内部，跨账号不重复，导出时剥离）
+    install_id: str | None = None
+    installed_at: float | None = None  # 按账号安装序完成时间；None = 未安装
 
     @staticmethod
     def create(provider: str, name: str, secret: str) -> Account:
@@ -77,11 +80,36 @@ class Account:
         """命中真风控（3012/405「unusual activity」）：禁用账号，UI 展示封禁文案。
 
         风控由人工确认恢复后在后台手动启用（set_enabled）——不做自动退避恢复，
-        避免对真封禁的账号持续产生上游流量。
+        避免对真封禁的账号持续产生上游流量。Plan 通道停用；同账号若有
+        API Key 仍可走回退通道（is_selectable / uses_plan_channel 分离）。
         """
         self.risk_strikes += 1
         self.status = Status.DISABLED
         self.cooling_until = None
+
+    def has_apikey_fallback(self) -> bool:
+        """同账号是否持有可走 api.z.ai 的 API Key（JWT 死后的对话回退）。
+
+        仅 JWT 账号的附加 Key 算回退；纯 apiKey 账号的主键不是 fallback，
+        风控/失效后不得靠这把 Key 继续被选中。
+        """
+        return self.mode == "jwt" and bool((self.api_key or "").strip())
+
+    def uses_plan_channel(self) -> bool:
+        """当前是否允许走 Coding Plan JWT 通道（messages + billing）。
+
+        invalid / 风控 disabled / 手动停用 都视为 JWT 不可用；有 Key 时对话
+        走回退通道，但 billing/claim 仍必须停（Key 通道没有套餐领取）。
+        """
+        if self.mode != "jwt" or not (self.jwt_token or "").strip():
+            return False
+        if not self.enabled:
+            return False
+        return self.status not in (Status.INVALID, Status.DISABLED)
+
+    def allows_billing(self, now: float | None = None) -> bool:
+        """是否允许打 billing 全家桶（preview/claim/current/balance/usage）。"""
+        return self.uses_plan_channel() and not self.is_cooling(now)
 
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
         """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。
@@ -93,11 +121,17 @@ class Account:
         self.recent_results = (self.recent_results + [entry])[-keep:]
 
     def is_selectable(self, now: float | None = None) -> bool:
-        """是否可被轮询选中。"""
-        if not self.enabled or self.status in (Status.DISABLED, Status.INVALID):
+        """是否可被轮询选中。
+
+        JWT 失效 / 风控禁用后，若同账号有 API Key，仍可选中并走回退通道；
+        手动 enabled=False 永远不选。
+        """
+        if not self.enabled:
             return False
         if self.status == Status.EXHAUSTED:
             return False
+        if self.status in (Status.INVALID, Status.DISABLED):
+            return self.has_apikey_fallback()
         if self.status == Status.COOLING:
             now = now or time.time()
             return bool(self.cooling_until and now >= self.cooling_until)
@@ -159,6 +193,8 @@ class Account:
             "last_error": self.last_error,
             "created_at": self.created_at,
             "fingerprint": self.fingerprint_view(),
+            "install_id": self.install_id,
+            "installed_at": self.installed_at,
         }
 
     def effective_status(self, now: float | None = None) -> str:

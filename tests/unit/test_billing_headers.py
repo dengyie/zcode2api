@@ -91,3 +91,21 @@ class TestAuthHeaders:
         h = _auth_headers(acc2)
         assert h["x-api-key"] == "sk-x"
         assert "Authorization" not in h
+
+    def test_claim_headers_keep_account_platform(self, monkeypatch, tmp_path):
+        """领取头不得把 X-Platform 盖成全局 darwin-arm64；preview query 也跟档案走。"""
+        from app.claim import _claim_headers
+        from app.fingerprint import DeviceProfile, profile_for
+
+        monkeypatch.setattr(settings, "DATA_DIR", tmp_path)
+        acc = Account(id="win", name="w", provider="zai", mode="jwt",
+                      jwt_token=_make_jwt({"user_id": "uw"}))
+        acc.fingerprint = DeviceProfile(
+            platform="win32", arch="x64", os_version="10.0.22631",
+            language="zh-CN", timezone="Asia/Shanghai", screen="1920x1080",
+        )
+        profile = profile_for(acc)
+        h = _claim_headers(acc, "verify", "cn")
+        assert h["X-Platform"] == profile.platform_full == "win32-x64"
+        assert h["X-Device-Mid"] == profile.device_mid
+        assert h["X-ZCode-App-Version"] == constants.BILLING_APP_VERSION

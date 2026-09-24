@@ -1,8 +1,8 @@
-"""宿主机真实指纹采集 —— 默认指纹源（「模仿真机安装」模式）。
+"""宿主机真实指纹采集 —— 诊断/测试用，不是账号入池默认源。
 
-用户决策（2026-09-07）：默认**不再随机编造**设备档案，而是采集部署机的真实
-平台数据，让 hub 在上游视角就是「装在这台机器上的一份真 ZCode」。随机池
-（fingerprint.random_profile）降级为兜底/显式轮转选项。
+账号身份走 fingerprint.random_profile 的成套桌面 SKU（一号一台生成设备）。
+本模块只描述部署机事实（Linux 云内核、无显示器 1920x1080 等），供
+host_profile / 运维对照，禁止再当作多账号共用的上游身份。
 
 采集项 ↔ DeviceProfile 字段：
   platform    platform.system()   → darwin / win32 / linux（官方 process.platform 语义）

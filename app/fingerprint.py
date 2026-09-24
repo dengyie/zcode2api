@@ -1,27 +1,19 @@
-"""每账号客户端指纹（设备档案）—— 默认宿主机真实数据，随机池作轮转/兜底。
+"""每账号客户端指纹（设备档案）—— 入池生成高可信桌面 SKU，一号一台设备。
 
-用户决策（2026-09-07）：默认模式 =「模仿真机安装」——档案采自部署机真实平台
-数据（hostinfo.collect_host_profile：真实 platform/arch/os_version/时区/语言），
-device_mid 走官方 telemetry 语义（首装生成一次、持久化、永久复用）。hub 在上游
-视角即「装在这台机器上的一份真 ZCode」，多账号共用本机身份是真实形态（一台
-开发机上多个 ZCode 窗口/会话本就同设备）。
+默认不再克隆部署机。hub 跑在 Linux 云主机上，把 N 个账号都标成同一套
+云内核 + 1920x1080，会在上游聚成「一台机房机器开了 N 个 ZCode」。官方
+客户端是 Electron 桌面（darwin-arm64 / win32-x64 为主），账号身份必须
+长得像用户电脑。
 
-随机池（random_profile）保留两个用途：
-  1. rotate（风控后换发）——显式换一台「虚拟设备」；
-  2. 宿主机数据不合规时的兜底（如容器内缺失信息）。
+生成规则：
+  - 从成套 SKU 表抽样（platform × arch × os_version × screen 绑定），
+    禁止字段笛卡尔积（darwin-arm64 + 1366x768 这类假电脑）。
+  - 账号池不含 linux：官方桌面主形态是 Mac / Windows。
+  - 语言/时区取真实地区对；device_mid 每次全新 UUIDv4，跨账号不复用。
+  - 同账号档案一经分配即稳定；rotate() 换一整台 SKU（含新 MID）。
 
-合规 = 官方客户端真实会出现的组合：
-  - X-Platform  = {platform}-{arch}，随机池仅取真实主流组合
-    （darwin×arm64/x64、win32×x64、linux×x64；win-arm64 桌面占有率可忽略）；
-    host_real 不受预置组合约束 —— 宿主机实际形态即真机事实（linux/arm64 等）
-  - X-Os-Version = os.release() 语义，按平台从各自版本池取（darwin 2x.x 内核
-    ↔ macOS 13–26；win32 = 10.0.{build}；linux = 发行版内核包版本）
-    —— 例外：host_profile 采到的真实 Linux 内核版本（如 pxed 的 5.10.134-…）
-    不在预置池，属真机事实，按形态校验后放行（见 _validate）。
-  - 语言/时区取真实地区对（zh-CN↔上海、en-US↔纽约/洛杉矶、ja-JP↔东京…）
-  - 分辨率取桌面端常见值；device_mid 每次全新 UUIDv4，跨账号永不复用
-
-同账号档案一经分配即稳定幂等，不像爬虫乱跳。
+host_profile 仍采集部署机，只给诊断/测试；不作为入池默认源。
+存量非 SKU 档案（旧版宿主机克隆）由启动回填换成生成 SKU。
 """
 
 from __future__ import annotations
@@ -31,17 +23,49 @@ import secrets
 import uuid
 from dataclasses import dataclass, field, replace
 
-from . import logs
-
-# 平台×架构：官方 process.platform-process.arch 的真实主流组合
-_PLATFORM_ARCHS = (
-    ("darwin", "arm64"),
-    ("darwin", "x64"),
-    ("win32", "x64"),
-    ("linux", "x64"),
+# 成套桌面 SKU：(weight, platform, arch, os_version, screen)
+# 分辨率只取官方桌面端常见值，并与平台绑定（Mac 逻辑分辨率不配 Windows）。
+_SKUS: tuple[tuple[int, str, str, str, str], ...] = (
+    # Apple silicon MacBook Air/Pro 13–14"（darwin 24 = Sequoia，25 = Tahoe）
+    (10, "darwin", "arm64", "24.5.0", "1512x982"),
+    (10, "darwin", "arm64", "24.6.0", "1512x982"),
+    (8, "darwin", "arm64", "24.5.0", "1728x1117"),
+    (8, "darwin", "arm64", "24.6.0", "1728x1117"),
+    (8, "darwin", "arm64", "25.5.0", "1512x982"),
+    (6, "darwin", "arm64", "25.5.0", "1728x1117"),
+    (5, "darwin", "arm64", "23.6.0", "1512x982"),
+    (4, "darwin", "arm64", "23.6.0", "1728x1117"),
+    (4, "darwin", "arm64", "24.5.0", "2560x1440"),
+    (3, "darwin", "arm64", "24.6.0", "2560x1600"),
+    (2, "darwin", "arm64", "25.5.0", "2560x1440"),
+    (2, "darwin", "arm64", "24.5.0", "3840x2160"),
+    # Intel Mac 存量（Ventura/Sonoma；darwin 24+ 不再配 x64）
+    (2, "darwin", "x64", "23.6.0", "1920x1080"),
+    (2, "darwin", "x64", "22.6.0", "1440x900"),
+    (1, "darwin", "x64", "23.6.0", "2560x1440"),
+    # Windows 11 主流 + 少量 Win10
+    (8, "win32", "x64", "10.0.22631", "1920x1080"),
+    (7, "win32", "x64", "10.0.26100", "1920x1080"),
+    (5, "win32", "x64", "10.0.22631", "2560x1440"),
+    (4, "win32", "x64", "10.0.26200", "1920x1080"),
+    (3, "win32", "x64", "10.0.26100", "2560x1440"),
+    (3, "win32", "x64", "10.0.22621", "1920x1080"),
+    (2, "win32", "x64", "10.0.22631", "3840x2160"),
+    (2, "win32", "x64", "10.0.19045", "1920x1080"),
+    (1, "win32", "x64", "10.0.19045", "1366x768"),
+    (1, "win32", "x64", "10.0.26100", "2560x1600"),
+    (1, "win32", "x64", "10.0.22000", "1920x1080"),
 )
-# os.release() 语义版本池（按平台）。darwin 2x.x ↔ macOS 13–26 内核；
-# win32 = 10.0.{build}（19045=Win10 22H2 … 26200=Win11 25H2）；linux = 内核包版本。
+_SKU_POOL: tuple[tuple[str, str, str, str], ...] = tuple(
+    (platform, arch, os_version, screen)
+    for weight, platform, arch, os_version, screen in _SKUS
+    for _ in range(weight)
+)
+_SKU_COMBOS = frozenset(_SKU_POOL)
+
+# host_real 校验仍认这些平台取值（部署机可能是 linux）
+_HOST_PLATFORMS = ("darwin", "win32", "linux")
+_HOST_ARCHS = ("arm64", "x64")
 _OS_VERSIONS = {
     "darwin": ("22.6.0", "23.6.0", "24.5.0", "24.6.0", "25.5.0"),
     "win32": ("10.0.19045", "10.0.22000", "10.0.22621", "10.0.22631", "10.0.26100", "10.0.26200"),
@@ -58,15 +82,9 @@ _LOCALES = (
     ("ko-KR", "Asia/Seoul"),
     ("en-SG", "Asia/Singapore"),
 )
-# 桌面端常见分辨率（激活事件 screen_resolution）
-_SCREENS = (
-    "1920x1080", "2560x1440", "3840x2160", "5120x2880",
-    "2560x1600", "1728x1117", "1512x982", "1440x900", "1366x768",
-)
 
 _SCREEN_RE = re.compile(r"^\d{3,4}x\d{3,4}$")
 # os.release() 形态门（host_real 放行用）：主版本.次版本.修订 + 可选后缀
-# （Linux 内核打包后缀如 -generic / -amd64 / -18.0.11.lifsea8.x86_64）
 _RELEASE_SHAPE = re.compile(r"^\d+\.\d+(\.\d+)?[\w.\-]*$")
 
 
@@ -95,45 +113,51 @@ class DeviceProfile:
         return "linux"
 
 
-def _validate(profile: DeviceProfile, host_real: bool = False) -> None:
-    """合规校验：档案内部自洽（平台↔版本↔分类、地区对、分辨率、UUID）。
+def sku_combos() -> frozenset[tuple[str, str, str, str]]:
+    """生成器允许的 (platform, arch, os_version, screen) 成套组合。"""
+    return _SKU_COMBOS
 
-    host_real=True（宿主机真实档案）时按「真机事实优先于预置池」放宽两处：
-    平台组合按取值形态放行（linux/arm64 云主机等真实形态，报别的反而是伪装），
-    os_version 放宽为「内核版本形态」——真机事实（如 pxed 的
-    5.10.134-18.0.11.lifsea8.x86_64）优先于预置池，但仍必须长得像
-    os.release() 输出，防采集污染。随机池不受放宽，仍走严格组合门。
+
+def is_generated_sku(profile: DeviceProfile) -> bool:
+    """档案是否为入池用的高可信桌面 SKU（旧版宿主机克隆为 False）。"""
+    return (profile.platform, profile.arch, profile.os_version, profile.screen) in _SKU_COMBOS
+
+
+def _validate(profile: DeviceProfile, host_real: bool = False) -> None:
+    """合规校验：档案内部自洽（成套 SKU / 真机形态、地区对、分辨率、UUID）。
+
+    host_real=True 只用于宿主机采集：平台按取值形态放行（linux/arm64 云主机
+    等真实形态），os_version 放宽为内核版本形态。账号生成路径走严格 SKU 门。
     """
     if host_real:
-        if profile.platform not in ("darwin", "win32", "linux") or \
-                profile.arch not in ("arm64", "x64"):
+        if profile.platform not in _HOST_PLATFORMS or profile.arch not in _HOST_ARCHS:
             raise ValueError(f"非法平台形态: {profile.platform_full}")
-    elif (profile.platform, profile.arch) not in _PLATFORM_ARCHS:
-        raise ValueError(f"非法平台组合: {profile.platform_full}")
-    if profile.os_version not in _OS_VERSIONS.get(profile.platform, ()):
-        if not (host_real and _RELEASE_SHAPE.match(profile.os_version)):
-            raise ValueError(f"os_version 与平台不符: {profile.platform}/{profile.os_version}")
-    if not host_real and (profile.language, profile.timezone) not in _LOCALES:
-        # 随机档案必须取真实地区对；host_real 不做此约束 —— 真机上语言与时区
-        # 独立配置（en-US locale + Asia/Shanghai 时区的开发机是真实存在形态），
-        # 官方客户端两者分开读（Intl locale / timeZone），真实组合即合规。
-        raise ValueError(f"语言/时区组合不真实: {profile.language}/{profile.timezone}")
+        if profile.os_version not in _OS_VERSIONS.get(profile.platform, ()):
+            if not _RELEASE_SHAPE.match(profile.os_version):
+                raise ValueError(f"os_version 与平台不符: {profile.platform}/{profile.os_version}")
+    else:
+        if not is_generated_sku(profile):
+            raise ValueError(
+                f"非桌面 SKU: {profile.platform_full}/{profile.os_version}/{profile.screen}"
+            )
+        if (profile.language, profile.timezone) not in _LOCALES:
+            raise ValueError(f"语言/时区组合不真实: {profile.language}/{profile.timezone}")
     if not _SCREEN_RE.match(profile.screen):
         raise ValueError(f"分辨率形态非法: {profile.screen}")
     uuid.UUID(profile.device_mid)  # 必须是合法 UUID
 
 
 def random_profile() -> DeviceProfile:
-    """随机生成一份合规设备档案（生成时自校验）。"""
-    platform, arch = secrets.choice(_PLATFORM_ARCHS)
+    """随机生成一份成套桌面 SKU 档案（生成时自校验）。"""
+    platform, arch, os_version, screen = secrets.choice(_SKU_POOL)
     language, timezone = secrets.choice(_LOCALES)
     profile = DeviceProfile(
         platform=platform,
         arch=arch,
-        os_version=secrets.choice(_OS_VERSIONS[platform]),
+        os_version=os_version,
         language=language,
         timezone=timezone,
-        screen=secrets.choice(_SCREENS),
+        screen=screen,
         device_mid=str(uuid.uuid4()),
     )
     _validate(profile)
@@ -141,7 +165,7 @@ def random_profile() -> DeviceProfile:
 
 
 def profile_for(account) -> DeviceProfile:
-    """取账号档案：无则随机分配（幂等）。仅内存态分配，落库由调用方 save。"""
+    """取账号档案：无则生成分配（幂等）。仅内存态分配，落库由调用方 save。"""
     fp = getattr(account, "fingerprint", None)
     if isinstance(fp, DeviceProfile):
         return fp
@@ -157,11 +181,10 @@ def profile_for(account) -> DeviceProfile:
 
 
 def host_profile(device_mid: str | None = None):
-    """宿主机真实档案（默认指纹源）。
+    """宿主机真实档案（诊断/测试用，不是入池默认源）。
 
-    device_mid 缺省 = DeviceProfile 缺省工厂的全新 UUID（collect 每次重采，
-    MID 归属由调用方定）：传入 quota.device_mid() 即「这台机器」语义，
-    传入新 UUID 即「本机新装设备」语义（assign 的用法）。
+    device_mid 缺省 = DeviceProfile 缺省工厂的全新 UUID；传入
+    quota.device_mid() 即「这台机器」语义。
     """
     from . import hostinfo
 
@@ -173,22 +196,15 @@ def host_profile(device_mid: str | None = None):
 
 
 def assign(account) -> DeviceProfile:
-    """入池分配档案：默认宿主机真实形态 + 全新 device_mid（每账号一台
-    「本机新装设备」）。宿主机采集失败（异常平台/数据）时退随机池兜底 ——
-    降级必须留痕（用户决策默认真机数据，静默失效等于功能丢失）。"""
-    try:
-        account.fingerprint = host_profile(device_mid=str(uuid.uuid4()))
-    except (ValueError, OSError) as err:
-        logs.warn("fingerprint", f"宿主机档案不合规，退随机池: {err}")
-        account.fingerprint = random_profile()
+    """入池分配档案：成套高可信桌面 SKU + 全新 device_mid（一号一台设备）。"""
+    account.fingerprint = random_profile()
     return account.fingerprint
 
 
 def rotate(account) -> DeviceProfile:
     """换发全新档案（device_mid 必变；风控后换设备语义）。
 
-    换发走随机池：宿主机形态不变时换发等于没换设备（上游按组合识别），
-    全新随机档案才是「换了一台机器」。
+    换发换一整台成套 SKU（平台/内核/屏幕都可能变）+ 新 device_mid。
     """
     account.fingerprint = random_profile()
     return account.fingerprint

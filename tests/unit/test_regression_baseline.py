@@ -109,6 +109,45 @@ class TestAccountStateMachine:
         acc.cooling_until = time.time() + 100
         assert not acc.is_selectable()
 
+    def test_invalid_jwt_not_selectable_without_apikey(self):
+        acc = self._acc()
+        acc.status = Status.INVALID
+        assert not acc.is_selectable()
+        assert not acc.allows_billing()
+        assert acc.uses_plan_channel() is False
+
+    def test_invalid_jwt_selectable_via_apikey_fallback(self):
+        acc = self._acc()
+        acc.api_key = "sk-fallback"
+        acc.status = Status.INVALID
+        assert acc.is_selectable()
+        assert not acc.allows_billing()
+        assert acc.uses_plan_channel() is False
+
+    def test_risk_disabled_jwt_selectable_via_apikey(self):
+        acc = self._acc()
+        acc.api_key = "sk-fallback"
+        acc.ban_for_risk()
+        assert acc.status == Status.DISABLED
+        assert acc.enabled is True
+        assert acc.is_selectable()
+        assert not acc.allows_billing()
+
+    def test_manual_disable_never_selectable(self):
+        acc = self._acc()
+        acc.api_key = "sk-fallback"
+        acc.enabled = False
+        acc.status = Status.DISABLED
+        assert not acc.is_selectable()
+        assert not acc.allows_billing()
+
+    def test_exhausted_jwt_not_selectable_but_plan_alive(self):
+        acc = self._acc()
+        acc.status = Status.EXHAUSTED
+        assert not acc.is_selectable()
+        assert acc.uses_plan_channel() is True
+        assert acc.allows_billing() is True
+
     def test_effective_status_after_cooldown(self):
         acc = self._acc()
         acc.status = Status.COOLING
@@ -170,8 +209,9 @@ class TestBuildRequest:
         assert url == "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
         assert headers["Authorization"] == "Bearer a.b.c"
         assert headers["anthropic-version"] == "2023-06-01"
-        # JWT 通道带全量身份头 + 追踪头（对齐 zapi identity.ts）
-        assert headers["X-Title"] == "Z Code@cli"
+        # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/stable
+        assert headers["X-Title"] == "Z Code@electron"
+        assert headers["X-Release-Channel"] == "stable"
         assert "X-Device-Mid" in headers
         assert "x-request-id" in headers and "x-zcode-trace-id" in headers
 
@@ -181,6 +221,16 @@ class TestBuildRequest:
         url, headers, _payload = build_request(acc, {}, None)
         assert url == "https://api.z.ai/api/anthropic/v1/messages"
         assert headers["x-api-key"] == "plain-key"
+
+    def test_invalid_jwt_with_apikey_routes_to_fallback(self):
+        from app.agent import build_request
+        acc = Account.create("zai", "t", "a.b.c")
+        acc.api_key = "sk-fallback"
+        acc.status = Status.INVALID
+        url, headers, _payload = build_request(acc, {}, None)
+        assert url == "https://api.z.ai/api/anthropic/v1/messages"
+        assert headers["x-api-key"] == "sk-fallback"
+        assert "Authorization" not in headers
 
     def test_captcha_header_injected(self):
         from app.agent import build_request
@@ -214,6 +264,38 @@ class TestBuildRequest:
         acc.jwt_token = None
         with pytest.raises(RuntimeError):
             build_request(acc, {}, None)
+
+
+# ── billing 阻断文案 ──────────────────────────────────────────────────────────
+class TestBillingBlockReason:
+    def test_cooling(self):
+        from app.claim import billing_block_reason
+        acc = Account.create("zai", "t", "a.b.c")
+        acc.status = Status.COOLING
+        acc.cooling_until = time.time() + 100
+        assert "冷却" in (billing_block_reason(acc) or "")
+
+    def test_invalid_jwt(self):
+        from app.claim import AUTH_EXPIRED_MESSAGE, billing_block_reason
+        acc = Account.create("zai", "t", "a.b.c")
+        acc.status = Status.INVALID
+        assert billing_block_reason(acc) == AUTH_EXPIRED_MESSAGE
+
+    def test_manual_disable(self):
+        from app.claim import billing_block_reason
+        acc = Account.create("zai", "t", "a.b.c")
+        acc.enabled = False
+        msg = billing_block_reason(acc, action="上游刷新") or ""
+        assert "停用" in msg
+        assert "重新授权" not in msg
+
+    def test_risk_disabled(self):
+        from app.claim import billing_block_reason
+        acc = Account.create("zai", "t", "a.b.c")
+        acc.ban_for_risk()
+        msg = billing_block_reason(acc) or ""
+        assert "风控" in msg
+        assert "重新授权" not in msg
 
 
 # ── 网关主流程（HTTP 层，走 Mock 上游；夹具见 conftest.py）────────────────────

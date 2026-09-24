@@ -86,9 +86,14 @@ class TestClaim:
         assert headers.get("x-aliyun-captcha-verify-param") == "stub-verify-param"
         assert headers.get("x-aliyun-captcha-verify-region") == "sgp"
         assert headers.get("x-device-mid")  # billing 全家桶必需（否则上游 3001）
-        # 客户端 claim 头形态：缺版本/平台头即使验证码有效也 3007（实测）
+        # 客户端 claim 头形态：缺版本/平台头即使验证码有效也 3007（实测）；
+        # 平台必须跟账号档案走，禁止再盖成全局 darwin-arm64。
+        from app.fingerprint import profile_for
+
+        profile = profile_for(acc)
         assert headers.get("x-zcode-app-version") == "3.11.2"  # BILLING_APP_VERSION
-        assert headers.get("x-platform") == "darwin-arm64"
+        assert headers.get("x-platform") == profile.platform_full
+        assert headers.get("x-device-mid") == profile.device_mid
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 1
         # 领取成功后触发额度刷新
@@ -259,6 +264,48 @@ class TestClaim:
         res = await client.post("/admin/api/claim", json={"account_ids": [acc.id]})
         assert res.status_code == 401
 
+    async def test_claim_skips_invalid_without_upstream(self, claim_env, fresh_app):
+        """失效 JWT 不得再打 billing（线上 401 领取根因）。"""
+        client, mock, stub, acc = claim_env
+        acc.status = "invalid"
+        acc.last_error = "鉴权失败 HTTP 401"
+        fresh_app.update_account(acc)
+        before = len(mock.state.calls)
+        res = await client.post("/admin/api/claim", json={"account_ids": [acc.id]},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert "重新授权" in outcome["message"]
+        assert stub.solve_count == 0
+        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+
+    async def test_preview_skips_invalid_without_upstream(self, claim_env, fresh_app):
+        client, mock, _stub, acc = claim_env
+        acc.status = "invalid"
+        fresh_app.update_account(acc)
+        before = len(mock.state.calls)
+        res = await client.get("/admin/api/claim/preview",
+                               headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        entry = res.json()["preview"][0]
+        assert entry["plans"] == []
+        assert "重新授权" in (entry["error"] or "")
+        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+
+    async def test_claim_401_marks_invalid(self, claim_env, fresh_app):
+        client, mock, stub, acc = claim_env
+        mock.state.claim_scenario = "claim_auth"
+        res = await client.post("/admin/api/claim", json={"account_ids": [acc.id]},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert "重新授权" in outcome["message"]
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == "invalid"
+        assert stub.solve_count == 0  # preview 401 即停，不解验证码
+
 
 @pytest.mark.integration
 class TestManualClaim:
@@ -295,9 +342,12 @@ class TestManualClaim:
         _method, _path, headers, body = claim_calls[0]
         assert headers.get("x-aliyun-captcha-verify-param") == "browser-slider-param"
         assert headers.get("x-aliyun-captcha-verify-region") == "cn"
-        assert headers.get("x-device-mid")
+        from app.fingerprint import profile_for
+
+        profile = profile_for(acc)
+        assert headers.get("x-device-mid") == profile.device_mid
         assert headers.get("x-zcode-app-version") == "3.11.2"  # 客户端 claim 头形态
-        assert headers.get("x-platform") == "darwin-arm64"
+        assert headers.get("x-platform") == profile.platform_full
         assert b"mock-claim-plan" in body
         assert stub.solve_count == 0
         # 成功后触发额度刷新
@@ -354,6 +404,23 @@ class TestManualClaim:
             headers={"Authorization": "Bearer zcode"},
         )
         assert res.status_code == 404
+
+    async def test_manual_claim_skips_invalid(self, claim_env, fresh_app):
+        client, mock, stub, acc = claim_env
+        acc.status = "invalid"
+        fresh_app.update_account(acc)
+        before = len(mock.state.calls)
+        res = await client.post(
+            "/admin/api/claim/manual",
+            json={"account_id": acc.id, "captcha_verify_param": "browser-slider-param",
+                  "plan_id": "mock-claim-plan"},
+            headers={"Authorization": "Bearer zcode"},
+        )
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is False
+        assert "重新授权" in outcome["message"]
+        assert stub.solve_count == 0
+        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
 
     async def test_manual_claim_requires_admin_key(self, claim_env):
         client, _mock, _stub, acc = claim_env

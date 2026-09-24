@@ -14,7 +14,13 @@ from . import settings
 
 class ZaiAuthFlow:
     """api_base / exchange_origin 可注入（测试指向 Mock 上游）；
-    默认值来自 settings（其缺省又来自 constants 收口）。"""
+    默认值来自 settings（其缺省又来自 constants 收口）。
+
+    官方 CLI 规范（对齐 zcode.cjs createZaiCliOAuthClient）：
+    - init 仅带 Authorization: Bearer <pollToken> 与 Content-Type: application/json
+    - poll 仅带 Authorization: Bearer <pollToken>
+    不携带额外伪装头，避免上游服务端对 OAuth 会话产生异常的设备/上下文绑定限制。
+    """
 
     def __init__(self, api_base: str | None = None, exchange_origin: str | None = None) -> None:
         self.api_base = api_base or settings.OAUTH_API_BASE

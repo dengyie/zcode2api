@@ -57,6 +57,8 @@ class CaptchaManager:
         self._config_cache: dict | None = None
         self._config_cache_at: float = 0.0
         self._last_error: str | None = None
+        # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
+        self._bg_tasks: set[asyncio.Task] = set()
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
     async def fetch_config(self) -> dict:
@@ -100,12 +102,15 @@ class CaptchaManager:
         self._refill_task = None
 
     def _gate_open(self) -> bool:
-        """是否允许预热：存在可服务的 jwt 账号才预热（apiKey 账号不需要验证码）。
+        """是否允许预热：存在可走 Plan 对话的 jwt 账号才预热。
 
-        账号冷却状态随 store 落库，重启后全冷却期间此门保持关闭 ——
-        覆盖 _paused_until（monotonic，进程内）不持久化的重启场景。
+        apiKey 回退 / 废 JWT / 风控禁用 / 额度用完 / 冷却 都不需要验证码。
+        账号冷却状态随 store 落库，重启后全冷却期间此门保持关闭。
         """
-        return any(a.mode == "jwt" and a.is_selectable() for a in store.list_accounts("zai"))
+        return any(
+            a.allows_billing() and a.is_selectable()
+            for a in store.list_accounts("zai")
+        )
 
     async def _refill_loop(self) -> None:
         while True:
@@ -178,8 +183,10 @@ class CaptchaManager:
                 break
             self._pool_size = max(0, self._pool_size - 1)
             if not token.expired():
-                # 触发后台补货（fire-and-forget；_refilling 防重入）
-                asyncio.create_task(self._refill_batch(1))
+                # 触发后台补货（fire-and-forget；_refilling 防重入，强引用防 GC）
+                task = asyncio.create_task(self._refill_batch(1))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
                 return token.param, token.region
 
         # 2) 池空/全过期：同步现解一次（首启兜底；正常情况下后台循环已预热）

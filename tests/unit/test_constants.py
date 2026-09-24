@@ -24,16 +24,16 @@ def test_billing_base():
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
     # 实测带 platform 参数上游 3001，只允许 app_version
-    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.10.2"
+    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.11.2"
 
 
 def test_client_version_single_source():
-    # asar 客户端 gr="3.10.2"；3.0.x 已被上游拒绝（configs 400 / claim 3007）
+    # asar 客户端 3.11.2
     # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
-    assert constants.CLIENT_APP_VERSION == "3.10.2"
+    assert constants.CLIENT_APP_VERSION == "3.11.2"
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
     assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
-    assert constants.X_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
+    assert constants.CLIENT_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
 
 
 def test_billing_version_and_activation():
@@ -74,8 +74,8 @@ def test_identity_headers():
     assert constants.ANTHROPIC_VERSION == "2023-06-01"
     assert constants.X_ZCODE_AGENT == "glm"
     assert constants.HTTP_REFERER == "https://zcode.z.ai/"
-    assert constants.IDENTITY_TITLE == "Z Code@cli"
-    assert constants.IDENTITY_RELEASE_CHANNEL == "production"
+    assert constants.IDENTITY_TITLE == "Z Code@electron"
+    assert constants.IDENTITY_RELEASE_CHANNEL == "stable"
     assert constants.IDENTITY_CLIENT_LANGUAGE == "zh-CN"
     assert constants.IDENTITY_CLIENT_TIMEZONE == "Asia/Shanghai"
     assert constants.IDENTITY_OS_CATEGORY == "macos"

@@ -28,16 +28,52 @@ def _display_host() -> str:
     return "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
 
 
-def _backfill_fingerprints() -> int:
-    """启动时给无指纹的存量账号补配（入池于旧版本）并落库。返回补配数。"""
-    from .fingerprint import profile_for
+def _backfill_fingerprints() -> list:
+    """启动时给无指纹或非桌面 SKU（旧版宿主机克隆）的存量账号换发生成档案。
+
+    换机后清 installed_at，由 lifespan 补跑按账号安装序（新 device_mid 需要
+    自己的 app_launch / app_daily_active）。返回被替换的账号列表。
+    """
+    from .fingerprint import DeviceProfile, is_generated_sku, profile_for
+    from .store import store
+
+    replaced = []
+    for account in store.list_accounts():
+        fp = account.fingerprint
+        needs = False
+        if not isinstance(fp, dict) or not fp.get("device_mid"):
+            needs = True
+        else:
+            try:
+                profile = DeviceProfile(
+                    platform=fp["platform"], arch=fp["arch"], os_version=fp["os_version"],
+                    language=fp["language"], timezone=fp["timezone"], screen=fp["screen"],
+                    device_mid=fp["device_mid"],
+                )
+            except (KeyError, TypeError, ValueError):
+                needs = True
+            else:
+                needs = not is_generated_sku(profile)
+        if needs:
+            account.fingerprint = None
+            account.installed_at = None
+            profile_for(account)
+            store._assign_fingerprint(account)
+            store.update_account(account)
+            replaced.append(account)
+    return replaced
+
+
+def _backfill_install_ids() -> int:
+    """启动时给无 install_id 的存量账号补配安装身份（纯本地，无网络）并落库。"""
+    import uuid as _uuid
+
     from .store import store
 
     backfilled = 0
     for account in store.list_accounts():
-        if not isinstance(account.fingerprint, dict) or not account.fingerprint.get("device_mid"):
-            profile_for(account)  # 懒分配（内存态为 DeviceProfile）
-            store._assign_fingerprint(account)  # 固化为 dict 形态，与 add_account 一致
+        if not (account.install_id or "").strip():
+            account.install_id = str(_uuid.uuid4())
             store.update_account(account)
             backfilled += 1
     return backfilled
@@ -66,9 +102,14 @@ def _run_install_sequence_on_start() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    backfilled = _backfill_fingerprints()
-    if backfilled:
-        logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{backfilled}")
+    replaced = _backfill_fingerprints()
+    if replaced:
+        logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{len(replaced)}")
+        for acc in replaced:
+            admin_api._schedule_install(acc)
+    installed = _backfill_install_ids()
+    if installed:
+        logs.ok("install", f"存量账号补配安装身份 ×{installed}")
     monitor.start()
     captcha_manager.start()   # 验证码预解池后台补充
     _run_install_sequence_on_start()

@@ -19,12 +19,14 @@ import httpx
 
 from . import constants, logs, settings
 from .captcha import captcha_manager
-from .models import Account
+from .models import Account, Status
 
 
 class ClaimError(Exception):
     """业务失败（含上游 code 语义），message 面向用户。"""
 
+
+AUTH_EXPIRED_MESSAGE = "凭证失效，请重新授权"
 
 _CLAIM_FAIL = {
     1001: "套餐不存在",
@@ -36,6 +38,34 @@ _CLAIM_FAIL = {
     3007: "验证码校验失败，请重试",
     401: "请先登录后再领取",
 }
+
+
+def billing_block_reason(account: Account, *, action: str = "领取") -> str | None:
+    """JWT 不可打 billing 时的用户文案；可打则返回 None。"""
+    if account.is_cooling():
+        return f"账号冷却中（风控/限流），已跳过{action}"
+    if account.mode != "jwt" or not (account.jwt_token or "").strip():
+        return f"非 Coding Plan 账号，已跳过{action}"
+    if not account.enabled:
+        return f"账号已停用，已跳过{action}"
+    if account.status == Status.DISABLED:
+        return f"账号风控封禁，已跳过{action}"
+    if account.status == Status.INVALID or not account.uses_plan_channel():
+        return AUTH_EXPIRED_MESSAGE
+    return None
+
+
+def _mark_auth_failure(account: Account) -> None:
+    from .store import store
+
+    live = store.find(account.provider, account.id)
+    if live is None:
+        return
+    live.status = Status.INVALID
+    live.last_error = AUTH_EXPIRED_MESSAGE
+    store.update_account(live)
+    account.status = live.status
+    account.last_error = live.last_error
 
 
 def _fail_message(code: int, body: dict) -> str:
@@ -93,7 +123,8 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
     if res.status_code in (401, 403):
         text = (res.text or "").lower()
         if "captcha" not in text and "verify" not in text:
-            raise ClaimError(f"鉴权失败 HTTP {res.status_code}")
+            _mark_auth_failure(account)
+            raise ClaimError(AUTH_EXPIRED_MESSAGE)
     try:
         body = res.json()
     except ValueError:
@@ -192,15 +223,19 @@ async def auto_claim_all_plans(account: Account) -> list[dict]:
 
 async def preview_plans(account: Account) -> list[dict]:
     """拉取账号当前可领取套餐，按优先级降序。"""
+    blocked = billing_block_reason(account, action="上游查询")
+    if blocked:
+        raise ClaimError(blocked)
+    from .fingerprint import profile_for
     from .quota import _auth_headers
 
     body = await _billing_request(
         account, "GET", "/billing/preview",
         headers=_auth_headers(account),
-        # 官方客户端 preview 用 TH()（darwin-arm64 等）；platform 参数上游宽容。
-        # 实测 client/configs 才拒 platform 参数。
+        # platform 跟账号档案走（官方 TH() = process.platform-arch）；
+        # 实测 client/configs 才拒 platform 参数，preview 宽容。
         params={"app_version": constants.BILLING_APP_VERSION,
-                "platform": constants.CLIENT_PLATFORM},
+                "platform": profile_for(account).platform_full},
     )
     code = _business_code(body)
     if code != 0:
@@ -234,9 +269,8 @@ def _claim_headers(account: Account, verify_param: str, region: str | None) -> d
     if region and region.strip():
         headers["X-Aliyun-Captcha-Verify-Region"] = region.strip()
     # 实测缺版本/平台头时即使验证码有效也 3007（_auth_headers 已带，此处显式
-    # 兜底防止基座头漂移）
+    # 兜底防止基座头漂移）。平台必须跟账号档案走，禁止再盖成全局 darwin-arm64。
     headers["X-ZCode-App-Version"] = constants.BILLING_APP_VERSION
-    headers["X-Platform"] = constants.X_PLATFORM
     return headers
 
 
@@ -264,6 +298,9 @@ async def claim_with_captcha(
     """
     if not (account.mode == "jwt" and account.jwt_token):
         raise ClaimError("仅 Coding Plan (JWT) 账号支持领取")
+    blocked = billing_block_reason(account)
+    if blocked:
+        raise ClaimError(blocked)
     if not (verify_param or "").strip():
         raise ClaimError("缺少验证码参数，请先完成人机验证")
 
@@ -280,6 +317,9 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     """
     if not (account.mode == "jwt" and account.jwt_token):
         raise ClaimError("仅 Coding Plan (JWT) 账号支持领取")
+    blocked = billing_block_reason(account)
+    if blocked:
+        raise ClaimError(blocked)
 
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
     last_err: ClaimError | None = None

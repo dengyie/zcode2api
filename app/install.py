@@ -24,6 +24,8 @@ errors 列表留痕（安装仿真不影响主服务，与官方「配置拉取�
 
 from __future__ import annotations
 
+import time
+
 import httpx
 
 from . import constants, logs, telemetry
@@ -50,25 +52,83 @@ def _captcha_enabled(configs: dict) -> bool:
     return bool(captcha.get("enabled")) if isinstance(captcha, dict) else False
 
 
+async def run_install_sequence_for_account(account) -> dict:
+    """按账号安装序：client/configs + 激活事件，绑定该账号的安装身份。
+
+    与 run_install_sequence 的差别：
+      - 设备档案 = 账号自身指纹（profile_for → 每账号独立 device_mid，
+        官方语义「每台安装一台设备」），而非全局 device_mid；
+      - user_id 从账号 JWT 解出（登录态安装）；无 JWT（apiKey 账号）退回空串
+        —— 官方未登录安装形态；
+      - 幂等：account.installed_at 非空直接跳过（skipped=True，零上游请求），
+        完成后落 installed_at 并持久化。
+
+    任何失败都不抛出，errors 留痕（同 run_install_sequence 约定）。
+    """
+    from .claim import jwt_user_id
+    from .fingerprint import profile_for
+    from .store import store
+
+    result: dict = {"configs_fetched": False, "events_reported": [],
+                    "errors": [], "installed": False, "skipped": False}
+    if account.installed_at:
+        result["skipped"] = True
+        return result
+
+    profile = profile_for(account)
+    user_id = jwt_user_id(account) or ""
+
+    try:
+        await _fetch_client_configs()
+        result["configs_fetched"] = True
+    except (httpx.HTTPError, RuntimeError, ValueError) as err:
+        result["errors"].append(f"client/configs 失败: {err}")
+
+    for element in constants.ACTIVATION_ELEMENTS:
+        try:
+            await telemetry.post_activation_event(profile, user_id, element,
+                                                  timeout=_CLIENT_TIMEOUT)
+            result["events_reported"].append(element)
+        except (httpx.HTTPError, RuntimeError) as err:
+            result["errors"].append(str(err))
+
+    if not result["errors"]:
+        live = store.find(account.provider, account.id)
+        if live is None:
+            result["errors"].append("账号已删除，跳过安装落库")
+            logs.warn("install", f"账号 {account.name} 安装序完成前已被删除")
+            return result
+        live.installed_at = time.time()
+        store.update_account(live)
+        account.installed_at = live.installed_at
+        result["installed"] = True
+        logs.ok("install", f"账号 {account.name} 安装序完成（install_id={account.install_id}）")
+    else:
+        logs.warn("install", f"账号 {account.name} 安装序部分失败: {'; '.join(result['errors'])}")
+    return result
+
+
 async def run_install_sequence() -> dict:
     """按官方首启顺序执行一次安装初始化，返回各步结果（含失败文案）。
 
-    设备身份 = 宿主机真实档案 + 全局持久化 device_mid（quota.device_mid，
-    官方语义：一台机器一个 deviceMid）。任何失败都不抛出 —— 调用方
-    （main.lifespan）可以完全放心 fire-and-forget。
+    设备身份 = 官方桌面常量档案 + 全局持久化 device_mid（quota.device_mid）。
+    进程级安装序只拉 configs / 报日活，不得把部署机云内核上报成用户设备；
+    每账号安装序才使用该号自己的生成 SKU。任何失败都不抛出。
     """
+    from .fingerprint import DeviceProfile
+    from .quota import device_mid
+
     result: dict = {"configs_fetched": False, "events_reported": [], "errors": []}
-
-    try:
-        from .fingerprint import host_profile
-        from .quota import device_mid
-
-        profile = host_profile(device_mid=device_mid())
-    except (ValueError, OSError) as err:
-        # 宿主机档案不合规且随机兜底也异常（理论上 assign 已兜过一次，防御性留痕）
-        logs.err("install", f"安装序设备档案构建失败: {err}")
-        result["errors"].append(f"设备档案构建失败: {err}")
-        return result
+    plat, _, arch = constants.CLIENT_PLATFORM.partition("-")
+    profile = DeviceProfile(
+        platform=plat or "darwin",
+        arch=arch or "arm64",
+        os_version=constants.IDENTITY_OS_VERSION,
+        language=constants.IDENTITY_CLIENT_LANGUAGE,
+        timezone=constants.IDENTITY_CLIENT_TIMEZONE,
+        screen=constants.ACTIVATION_SCREEN_RESOLUTION,
+        device_mid=device_mid(),
+    )
 
     try:
         configs = await _fetch_client_configs()

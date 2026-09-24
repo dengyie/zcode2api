@@ -7,8 +7,8 @@
     X-Platform, X-Release-Channel, X-Client-Language, X-Client-Timezone,
     X-Os-Category, X-Os-Version, X-Device-Mid
 
-X-Device-Mid 复用 quota.device_mid()（UUIDv4，首次生成后持久化 data/device_mid，
-与 billing 全家桶同一设备身份 —— 同机异 MID 本身就是异常信号）。
+有账号时 X-Device-Mid / 平台 / 语言 / 时区取自该号 DeviceProfile（一号一台
+生成的桌面设备）。无账号时回退全局伪装常量 + quota.device_mid()。
 
 另含追踪头（zapi upstream.ts buildTraceHeaders）：JWT 通道即 zapi 的
 start-plan，只发 x-request-id / x-zcode-session-type / x-zcode-trace-id
@@ -64,7 +64,7 @@ def build_identity_headers(account=None) -> dict[str, str]:
         profile = profile_for(account)
         plat, arch = profile.platform, profile.arch
         release = profile.os_version
-        channel: str | None = constants.IDENTITY_RELEASE_CHANNEL
+        channel: str | None = constants.BILLING_RELEASE_CHANNEL
         language, timezone = profile.language, profile.timezone
         device_mid_val = profile.device_mid
     else:
@@ -83,7 +83,9 @@ def build_identity_headers(account=None) -> dict[str, str]:
     }
     if app_version:
         headers["X-ZCode-App-Version"] = app_version
-    headers["X-Title"] = constants.IDENTITY_TITLE
+    headers["X-Title"] = (
+        constants.BILLING_TITLE if account is not None else constants.IDENTITY_TITLE
+    )
     headers["X-ZCode-Agent"] = constants.X_ZCODE_AGENT
     headers["X-Platform"] = f"{plat}-{arch}"
     if channel:

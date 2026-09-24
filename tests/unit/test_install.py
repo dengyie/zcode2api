@@ -93,6 +93,10 @@ async def test_run_install_sequence_against_mock(monkeypatch):
     assert captured[1][2]["element_name"] == "app_launch"
     assert captured[2][2]["element_name"] == "app_daily_active"
     assert captured[1][2]["user_id"] == ""
+    # 进程级安装序不得上报宿主机云内核；用官方桌面常量档案
+    from app import constants
+    assert captured[1][2]["device_os_category"] == constants.IDENTITY_OS_CATEGORY
+    assert captured[1][2]["device_os_version"] == constants.IDENTITY_OS_VERSION
 
 
 async def test_run_install_sequence_tolerates_failures(monkeypatch):
