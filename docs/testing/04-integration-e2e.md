@@ -53,6 +53,7 @@
 | `captcha_loop` | 每次都挑战 | GW-008 上限 |
 | `connect_fail_first` | 首次真断连（连接上无任何响应字节，客户端 httpx 抛 ReadError/RemoteProtocolError），之后正常 | GW-009 |
 | `slow_first_byte` | TTFB 延迟 30s | 超时/取消路径 |
+| `slow` | TTFB 延迟 0.3s（并发重叠测试；mock 按 `x-mock-bind`/凭证记录 `conc_in`/`conc_max` 分账仪表） | GW-015 账号并发 |
 | `sse_truncate` | SSE 中途断流 | GW-013/014 |
 | `waf_block` | billing 端点 403 HTML | INT-011 |
 | `server_error` | 500 随机 JSON | CLS-012 |

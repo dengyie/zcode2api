@@ -114,9 +114,10 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
 前置: identity.appVersion ≥ 活动要求的最低客户端版本（否则 ineligible）
 ```
 
-版本口径（单一真相源 `app/constants.py`，2026-09 实测）：`CLIENT_APP_VERSION="3.10.2"`（asar `gr`，3.0.x 已被上游拒绝）、
-`CLIENT_PLATFORM="darwin-arm64"`（asar `TH()` = `process.platform-process.arch`，服务端固定伪装）；
-`USER_AGENT` / `X-ZCode-App-Version` / configs 查询串全部引用该常量。
+版本口径（单一真相源 `app/constants.py`）：`CLIENT_APP_VERSION="3.11.2"`；
+无账号路径的 `CLIENT_PLATFORM="darwin-arm64"`（asar `TH()` = `process.platform-process.arch`）。
+有账号时 `X-Platform` / preview `platform` 跟该号 DeviceProfile 走（成套桌面 SKU，一号一台），禁止再盖成全局 darwin-arm64。
+`USER_AGENT` / `X-ZCode-App-Version` / configs 查询串全部引用版本常量。
 
 ## 6. 免费额度以外的两条通道（认知备查）
 
@@ -139,7 +140,7 @@ POST billing/claim     → 头: Bearer JWT + 验证码头 + X-Device-Mid + X-ZCo
   "X-ZCode-Agent": "glm",
   "X-Platform": "{platform}-{arch}",
   "X-Os-Category": "{osCategory}",
-  "X-Release-Channel": "production",
+  "X-Release-Channel": "stable",
   "X-Client-Language": "{locale}",
   "X-Client-Timezone": "{timezone}",
   "X-Title": "Z Code@{sourceTitle}",

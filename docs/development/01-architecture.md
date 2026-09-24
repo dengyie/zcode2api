@@ -1,30 +1,30 @@
 # 01 — 总体架构
 
-状态：定稿（v1，随 Phase 1 开工修订）
+状态：与 2.5.11 实现对齐（无 pool.py / gateway 子包 / bundle.py / zclient.py / `/v1/responses`）。
 
 ## 1. 系统定位
 
 zcode-hub 是一个**自托管服务**，同时承担两个角色：
 
-1. **API 供给端（网关）**：把池内 ZCode 账号的 Coding Plan / Start Plan 额度，以标准 API（Anthropic Messages / OpenAI Chat / OpenAI Responses）暴露给任意 agent（Claude Code、Codex CLI、Cline 等）。
-2. **账号运营端（控制台）**：账号池的增删、额度监控、限时套餐自动领取、加密封包导入导出、以及（桌面场景）对本机 ZCode 客户端登录身份的快照切换。
+1. **API 供给端（网关）**：把池内 ZCode 账号的 Coding Plan / API Key 额度，以 Anthropic Messages（`/v1/messages`）和 OpenAI Chat Completions（`/v1/chat/completions`）暴露给任意 agent。
+2. **账号运营端（控制台）**：账号池增删、额度监控、限时套餐领取、明文 JSON 导入导出、OAuth CLI 入池。没有本机 `~/.zcode` 快照切换，也没有 `.zsb` 封包。
 
 ```
                     ┌────────────────────────────────────────────────┐
    Claude Code ────▶│  Gateway  /v1/messages  /v1/chat/completions   │
-   Codex CLI  ─────▶│           /v1/responses  /v1/models            │
-   OpenAI agent ───▶│       （账号池轮换 + 故障转移 + 流式透传/翻译）  │
+   Codex CLI  ─────▶│           /v1/models                           │
+   OpenAI agent ───▶│       （store.select 轮换 + 故障转移 + 流式）   │
                     └───────────────┬────────────────────────────────┘
                                     │
 ┌──────────────┐    ┌───────────────▼────────────────────────────────┐
 │ 管理后台 Web │───▶│                FastAPI 核心进程                 │
-│ /admin/*     │    │  Store(SQLite) · Pool · Quota · Claim · OAuth  │
-└──────────────┘    │  CaptchaManager(jsdom) · Bundle · ZClient      │
-                    └───┬──────────────┬───────────────┬─────────────┘
-                        │              │               │
-                 zcode.z.ai        api.z.ai /     ~/.zcode/v2/*
-                 (Plan 通道+       open.bigmodel.cn （本机 ZCode 客户端，
-                  验证码/领取)      (API Key 通道)   可选：快照/切换)
+│ /admin/*     │    │  Store(SQLite) · Quota · Claim · OAuth         │
+└──────────────┘    │  CaptchaManager(jsdom) · Install · Fingerprint │
+                    └───┬──────────────┬─────────────────────────────┘
+                        │              │
+                 zcode.z.ai        api.z.ai /
+                 (Plan 通道+       open.bigmodel.cn
+                  验证码/领取)      (API Key 通道)
 ```
 
 ## 2. 技术栈
@@ -45,111 +45,111 @@ zcode-hub 是一个**自托管服务**，同时承担两个角色：
 ```
 zcode-hub/
 ├── app/
-│   ├── main.py            # FastAPI 工厂 + lifespan（启动 QuotaMonitor / ClaimScheduler / 预热验证码池）
-│   ├── settings.py        # 环境变量 + YAML 配置（沿用 zcode2api .env 风格）
-│   ├── models.py          # Account、Status 状态机、PlanSlot/QuotaItem 额度模型
-│   ├── store.py           # SQLite 账号池：CRUD、轮询游标、设置 KV、领取历史
-│   ├── pool.py            # PoolSelector：round-robin + 健康标记 + 重进轮换判定（纯逻辑，可测）
-│   ├── gateway/
-│   │   ├── anthropic.py   # POST /v1/messages 透传 + 故障转移循环
-│   │   ├── openai.py      # POST /v1/chat/completions（OpenAI→Anthropic 翻译）(Phase 2)
-│   │   ├── responses.py   # POST /v1/responses（Responses→Chat→Anthropic）(Phase 2)
-│   │   ├── classify.py    # 上游错误 → 账号健康事件的分类器
-│   │   └── headers.py     # 上游请求头构建（身份仿真）
-│   ├── translator/        # OpenAI ↔ Anthropic 双向 + SSE 逐块翻译 (Phase 2，移植自 zcode-api 设计)
-│   ├── quota.py           # 多端点额度探测 + PlanSlot 分组 + 错峰轮询（zcode-switch quota.rs 移植）
-│   ├── claim.py           # billing/preview 轮询 + 自动领取 + 退避（claim.rs 移植）
-│   ├── captcha.py         # 求解器编排：缓存 / 单飞 / 重试（zcode2api 保留）
-│   ├── captcha_node/      # Node + jsdom 求解器 solver.js（zcode2api 原样移植）
-│   ├── oauth.py           # zai server-mediated CLI 流 + bigmodel 授权码流（zcode2api + zcode-switch oauth.rs 补全）
-│   ├── zclient.py         # enc:v1 编解码 + ~/.zcode/v2 三文件快照/切换 (Phase 3)
-│   ├── bundle.py          # .zsb 兼容封包：PBKDF2(100k)+AES-256-GCM (Phase 1)
-│   ├── auth_admin.py      # 后台 / 网关鉴权
-│   └── routes/            # admin_api / pages / health
-├── web/                   # 后台静态资源（accounts / quota / claim / settings 页）
+│   ├── main.py            # FastAPI 工厂 + lifespan（额度监控 / 验证码池 / 启动安装序）
+│   ├── settings.py        # 环境变量（.env）
+│   ├── models.py          # Account、Status；选号/回退/billing 门在账号对象上
+│   ├── store.py           # SQLite WAL：账号 CRUD、round-robin select、设置 KV
+│   ├── routes/gateway.py  # /v1/messages + /v1/chat/completions 调度与错误分类
+│   ├── routes/admin_api.py
+│   ├── routes/pages.py
+│   ├── openai_compat.py   # OpenAI ↔ Anthropic 翻译（含 SSE）
+│   ├── agent.py           # 上游请求构建（身份头 / 透传头过滤 / 通道选择）
+│   ├── identity.py        # 身份头仿真（每账号 DeviceProfile）
+│   ├── fingerprint.py     # 每账号成套桌面 SKU（一号一台生成设备）
+│   ├── install.py         # 全局 + 按账号安装序
+│   ├── quota.py           # billing/current+balance+usage 刷新
+│   ├── claim.py           # billing/preview + claim
+│   ├── captcha.py         # 求解器编排 + 预热池
+│   ├── oauth.py           # zai server-mediated CLI 流
+│   ├── auth_admin.py      # 后台 / 网关鉴权（后台失败节流）
+│   └── reqlog.py          # 内存环形请求日志
+├── captcha_node/          # Node + jsdom solver.js
+├── frontend/              # 后台静态页（accounts / settings / login）
 ├── tests/
-│   ├── unit/              # pytest 单元（用例 ID 见测试文档 02）
-│   ├── contract/          # 上游响应结构 fixture 契约测试
-│   ├── interop/           # enc:v1 / .zsb 对拍向量
-│   ├── mock_upstream/     # Mock ZCode 上游服务（集成测试核心资产）
-│   └── e2e/               # compose 拉起全栈的端到端场景
-├── main.py                # CLI：serve / login / accounts / quota / claim / export / import
-├── config.example.yaml
-├── Dockerfile / docker-compose.yml
+│   ├── unit/
+│   ├── integration/
+│   └── mock_upstream/
+├── cli.py                 # serve / login / add-account / quota / export / import
 └── docs/
 ```
 
 ### 模块间依赖规则
 
-- `pool.py` 不依赖 httpx/fastapi —— 纯内存逻辑 + 时间注入，便于单元测试
-- `gateway/*` 只通过 `pool.py` 取号、通过 `classify.py` 上报健康事件，不直接改账号状态
-- `quota.py` / `claim.py` 复用 `captcha.py` 取验证码 token，不自己管理缓存
-- `zclient.py` / `bundle.py` 是独立的加解密与文件操作层，不反向依赖 store
+- 选号在 `store.select` + `Account.is_selectable`，没有独立 `pool.py`
+- `routes/gateway.py` 直接改账号状态（INVALID / DISABLED / EXHAUSTED / COOLING）并 `store.update_account`
+- `quota.py` / `claim.py` 复用 `captcha.py` 取验证码 token
+- 删号后 `update_account` 拒绝写回，避免后台任务 `INSERT OR REPLACE` 救活已删行
 
 ## 4. 核心流程
 
 ### 4.1 网关请求（含账号池故障转移）
 
 ```
-client → 鉴权 → [循环: attempt ≤ pool.maxAttempts]
-   1. PoolSelector 取号（round-robin，跳过 exhausted/cooling/invalid/expired）
-   2. 构建上游请求（身份头 + 验证码头[start-plan] + 端点路由[coding-plan]）
-   3. 发送（连接级失败重试 ×2）
+client → 鉴权 → [循环: attempt ≤ MAX_ACCOUNT_ATTEMPTS=5]
+   1. store.select 取号（round-robin；跳过 exhausted / 冷却中 / 手动停用；
+      JWT invalid/风控 disabled 仅当同账号有 API Key 回退时可选）
+   2. 并发槽：该号在飞 ≥ account_concurrency 则跳号（不排队；跳过不计 attempt）
+   3. 构建上游请求（每账号指纹 + 透传头过滤 + Plan/Key 通道）
    4. 响应分类：
-      ok                → reportSuccess，透传/翻译返回
-      402/额度关键词     → reportFailure(quota)，换号
-      429               → reportFailure(rate_limited)，换号
-      401/403(非验证码)  → reportFailure(auth_invalid)，换号
-      403(验证码挑战)    → 刷新验证码原账号重试（≤3 次）
-      其它              → 原样回传客户端
-   5. 池内无可选号 → 503 no_available_account
+      ok                 → 透传/翻译返回；释放槽在流关闭时
+      402/额度关键词      → EXHAUSTED，换号
+      429                → 不冷却，原地等 Retry-After 后重试（等待期间放槽）；
+                           Plan 预算耗尽且有 Key 则 force_fallback
+      401/403(非验证码)   → INVALID；JWT+Key 可切回退，纯 Key 不可再选
+      3012/405 风控       → ban_for_risk（DISABLED）；JWT+Key 可切回退
+      403(验证码挑战)     → 刷新验证码原账号重试（≤3 次）
+      5xx                → 重试后 COOLING，换号
+      其它 4xx           → 原样回传客户端
+   5. 池内无可选号 / 全满 → 503 no_available_account
 ```
 
 ### 4.2 账号健康状态机
 
 ```
-            ┌─────────┐  402/额度关键词(30min 后自动重试)   ┌───────────┐
+            ┌─────────┐  额度耗尽（quota 刷新探测恢复）    ┌───────────┐
    login───▶│ ACTIVE  │◀──────────────────────────────────│ EXHAUSTED │
-            │         │  429(冷却 300s)                    └───────────┘
+            │         │  5xx/连接失败（冷却 300s）         └───────────┘
             │         │◀──────┐        ┌─────────┐
             │         │       ├────────│ COOLING │
             │         │       └───────▶└─────────┘
             │         │  401/403 非验证码        ┌─────────┐
             │         │────────────────────────▶│ INVALID │ （直到重新登录）
+            │         │  3012/405 风控           ┌─────────┐
+            │         │────────────────────────▶│ DISABLED│ （手动启用）
             └─────────┘                         └─────────┘
-   reportSuccess() 可清除 COOLING/EXHAUSTED；INVALID 仅重新登录（凭证 upsert）或重启清除
+   成功响应可清除 COOLING/EXHAUSTED（不得洗掉 INVALID/风控 DISABLED）。
+   JWT+Key：INVALID/DISABLED 仍可选，对话走 api.z.ai 回退；纯 apiKey 不可再选。
 ```
 
-参数：`pool.max_attempts=4`、`pool.cooldown_seconds=300`、`pool.exhausted_retry_seconds=1800`（env 可覆盖）。
+参数：`MAX_ACCOUNT_ATTEMPTS=5`、`COOLING_SECONDS=300`（仅 5xx/连接失败）、`RETRY_429_TIMES=5`、`ACCOUNT_CONCURRENCY=2`（0 = 不限）。额度耗尽由后台 `quota` 刷新探测恢复，没有独立 `exhausted_retry_seconds`。
 
-### 4.3 额度监控（错峰轮询）
+### 4.3 额度监控
 
-后台任务按 `quota.refresh_interval`（默认 60s）分批探测池内账号；单轮内账号之间加随机抖动（stagger）避免固定节奏触发 WAF；每个账号并发探测多端点（`billing/balance` + `subscription/list` + `usage/quota/limit`），结果归并为 `QuotaOverview { PlanSlot[] }`。额度全部归零 → 标记 EXHAUSTED；检测到恢复 → 自动回 ACTIVE。
+后台任务按 `quota_refresh_interval`（默认 60s，meta 表可改，0 = 关）刷新池内 JWT 账号；冷却 / invalid / 风控禁用 / 手动停用不打 billing。每个账号探测 `billing/current` + `billing/balance` + `usage`。日窗口耗尽且无赠送池 → EXHAUSTED；额度恢复且非冷却 → 回 ACTIVE。废 JWT / 风控禁用绝不能因额度数字复活 Plan 通道。成功对话后的 billing 刷新有 `BILLING_REFRESH_MIN_INTERVAL`（默认 60s）去抖。
 
-### 4.4 活动领取（ClaimScheduler）
+### 4.4 活动领取
 
 ```
-每 claim.poll_interval(默认5min): GET billing/preview（Bearer JWT + X-Device-Mid）
-  ├─ 404（活动未上线）→ 静默等待
-  ├─ 有可领套餐 → 取验证码 verifyParam → POST billing/claim
-  │    ├─ already_claimed / quota_exhausted → 按服务端返回的下次窗口退避
-  │    └─ 其它失败 → cooldown(10min) 退避
-  └─ 领取成功 → 写入 claim_history（SQLite），后台 UI 展示
-支持 auto=false 的手动模式；领取作用于池内所有 ACTIVE 的 JWT 账号。
+入池（Web/CLI）或后台「领取」：
+  JWT 且 allows_billing → GET billing/preview（Bearer JWT + 每账号 X-Device-Mid）
+  ├─ 无可领套餐 → 结束
+  ├─ 有可领 → 取验证码 verifyParam → POST billing/claim
+  │    ├─ 1003 已领取 / 1002 结束 / 1005 名额用完 → 记失败文案
+  │    ├─ 3007 验证码失败 → 换码重试一次
+  │    └─ 401 → 标 INVALID
+  └─ 领取成功 → 刷新额度
+无独立 ClaimScheduler 轮询；纯 API Key 账号跳过领取。
 ```
 
-### 4.5 凭证进入池内的四条路径
+### 4.5 凭证进入池内的路径
 
-| 路径 | 流程 | 阶段 |
-|------|------|------|
-| OAuth 登录（zai） | `POST /oauth/cli/init` → 浏览器授权 → 轮询换 token → 兑换 API Key + JWT | P1 |
-| OAuth 登录（bigmodel） | bigmodel.cn 授权码 → 本地回调 → token 交换 | P1 |
-| `.zsb` 包导入 | 口令解包 → 校验 → 入池（与 zcode-switch 互通） | P1 |
-| 本机 ZCode 导入 | 读 `~/.zcode/v2/credentials.json` → enc:v1 解密出 `zcodejwttoken` → 入池 | P3 |
+| 路径 | 流程 |
+|------|------|
+| Web OAuth | `POST /admin/api/login/start` → 浏览器授权官方 callback → `GET login/poll` ready 入池 JWT；API Key 兑换后台回填 |
+| Web / CLI 粘贴 | `POST /admin/api/accounts` 或 `cli.py add-account`（JWT 或 Key） |
+| JSON 导入 | `GET/POST /admin/api/export|import` 或 `cli.py export/import`（明文 name/mode/secret） |
 
-### 4.6 ZCode 客户端切换（可选，桌面场景）
-
-快照 `~/.zcode/v2/{credentials,config,telemetry-state}.json` 三文件至账号库 → 原子换入目标账号（临时文件 + rename）→ 可选重启 ZCode 客户端。**切换前自动保全当前未入库登录，绝不丢号。**
+入池后：按账号安装序（configs + 激活事件）+ JWT 自动领取。CLI 与 Web 同序。官方 callback 在 `zcode.z.ai`，hub 只 poll 结果，收不到授权 code。
 
 ## 5. 与来源项目的边界
 
