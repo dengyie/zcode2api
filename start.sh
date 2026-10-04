@@ -67,7 +67,9 @@ if ss -tln 2>/dev/null | grep -q ":${PORT} "; then
     exit 1
 fi
 
-# 5. 启动（不设 ALL_PROXY/socks —— httpx 缺 socks 支持会报 Unknown scheme）
+# 5. 启动。剔除环境里已有的 ALL_PROXY/socks（Clash 系统代理常注入 socks://，
+#    httpx 缺 socks 支持会报 Unknown scheme → 全部请求 500）；仅留 HTTP(S)_PROXY
+unset ALL_PROXY all_proxy
 echo "[*] 启动 zcode-hub (port=${PORT})..."
 if [ -n "$PROXY" ]; then
     env "HTTP_PROXY=${PROXY}/" "HTTPS_PROXY=${PROXY}/" \
