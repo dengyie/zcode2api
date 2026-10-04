@@ -71,6 +71,8 @@ def fresh_app(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "DATA_DIR", data_dir)
     monkeypatch.setattr(settings, "DB_PATH", data_dir / "accounts.db")
     monkeypatch.setattr(settings, "COOLING_SECONDS", 300)
+    # 本机 .env 的自定义 ZCODE_ADMIN_KEY 不得漏进夹具：admin 接口测试依赖默认密钥 "zcode"
+    monkeypatch.setattr(settings, "DEFAULT_ADMIN_KEY", "zcode")
 
     from app import store as store_module
     from app.store import Store
@@ -123,6 +125,8 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     # OAuth（cli init/poll + api-key 兑换链）全部收敛到 Mock —— 测试永不打真网
     monkeypatch.setattr(settings, "OAUTH_API_BASE", f"{base}/api/v1")
     monkeypatch.setattr(settings, "ZAI_EXCHANGE_ORIGIN", base)
+    # 国内版（bigmodel.cn）兑换链业务域同样指向 Mock
+    monkeypatch.setattr(settings, "BIGMODEL_EXCHANGE_ORIGIN", base)
 
     from app.routes import gateway as gateway_module
     monkeypatch.setattr(gateway_module, "captcha_manager", stub_captcha)

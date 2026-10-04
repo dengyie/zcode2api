@@ -412,11 +412,15 @@ def build_app() -> FastAPI:
         if state == "failed":
             data["message"] = getattr(app.state, "oauth_fail_message", "user denied")
         if state == "ready":
-            data.update({
-                "status": "ready",
-                "token": "mock-gateway-jwt-header.eyJzdWIiOiJtb2NrIn0.sig",
-                "zai": {"access_token": "mock-access-token"},
-            })
+            data["status"] = "ready"
+            data["token"] = "mock-gateway-jwt-header.eyJzdWIiOiJtb2NrIn0.sig"
+            # 业务 token 块随区域（真实上游只下发与 init provider 匹配的块）：
+            # oauth_poll_realm="cn" → data.bigmodel（业务 token 即 access_token）；
+            # 缺省 intl → data.zai（OAuth 会话凭证，还需 z/login 换业务 token）
+            if str(getattr(app.state, "oauth_poll_realm", "") or "") == "cn":
+                data["bigmodel"] = {"access_token": "mock-cn-access-token"}
+            else:
+                data["zai"] = {"access_token": "mock-access-token"}
         return Response(json.dumps({"data": data}), media_type="application/json")
 
     @app.post("/api/auth/z/login")

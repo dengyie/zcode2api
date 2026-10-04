@@ -7,6 +7,9 @@ import time
 from dataclasses import asdict, dataclass, field
 
 PROVIDERS = ("zai", "bigmodel")
+# 账号区域：intl=国际版(z.ai 授权，业务域 api.z.ai)；cn=国内版(bigmodel.cn 授权，
+# 业务域 bigmodel.cn)。Plan 通道（messages/billing/claim）两区域同端点，JWT 决定归属
+REALMS = ("intl", "cn")
 
 
 class Status:
@@ -33,6 +36,7 @@ class Account:
     name: str
     provider: str
     mode: str  # "jwt" | "apiKey"
+    realm: str = "intl"  # 账号区域（models.REALMS）：intl=国际版 / cn=国内版
     jwt_token: str | None = None
     api_key: str | None = None
     enabled: bool = True
@@ -61,14 +65,18 @@ class Account:
     installed_at: float | None = None  # 按账号安装序完成时间；None = 未安装
 
     @staticmethod
-    def create(provider: str, name: str, secret: str) -> Account:
+    def create(provider: str, name: str, secret: str, realm: str = "") -> Account:
         secret = (secret or "").strip()
         is_jwt = secret.count(".") == 2 and provider == "zai"
+        # 区域缺省/非法值时自动归区：bigmodel 提供商即国内域 Key，其余国际版
+        if realm not in REALMS:
+            realm = "cn" if provider == "bigmodel" else "intl"
         return Account(
             id=_account_id(name),
             name=name or f"{provider}-account",
             provider=provider,
             mode="jwt" if is_jwt else "apiKey",
+            realm=realm,
             jwt_token=secret if is_jwt else None,
             api_key=None if is_jwt else secret,
         )
@@ -192,6 +200,7 @@ class Account:
             "id": self.id,
             "name": self.name,
             "provider": self.provider,
+            "realm": self.realm,
             "mode": self.mode,
             "token_masked": masked,
             "enabled": self.enabled,

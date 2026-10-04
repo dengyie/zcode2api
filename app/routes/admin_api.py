@@ -21,8 +21,8 @@ from ..claim import (
     report_activation_events,
 )
 from ..claim import claim as do_claim
-from ..models import PROVIDERS, Status
-from ..oauth import ZaiAuthFlow
+from ..models import PROVIDERS, REALMS, Status
+from ..oauth import REALM_INTL, ZaiAuthFlow
 from ..quota import fetch_quota, refresh_accounts
 from ..store import store
 
@@ -68,8 +68,11 @@ async def status_info():
 @router.post("/accounts")
 async def add_accounts(payload: dict = Body(...)):
     provider = payload.get("provider", "zai")
+    realm = str(payload.get("realm") or "").strip().lower()
     if provider not in PROVIDERS:
         raise HTTPException(400, "不支持的 provider")
+    if realm and realm not in REALMS:
+        raise HTTPException(400, "realm 必须是 intl 或 cn")
     tokens = payload.get("tokens") or []
     if isinstance(tokens, str):
         tokens = [t.strip() for t in tokens.splitlines() if t.strip()]
@@ -77,11 +80,18 @@ async def add_accounts(payload: dict = Body(...)):
     if not tokens:
         raise HTTPException(400, "请输入至少一个 Token / API Key")
 
+    # 纠偏：bigmodel 提供商通道只接受 open.bigmodel.cn 的 API Key（x-api-key）；
+    # 两段点的 zcodejwttoken 在该通道永远不可用，自动归位为 zai + 国内版
+    migrated = [t for t in tokens if provider == "bigmodel" and t.count(".") == 2]
+    if migrated:
+        provider, realm = "zai", "cn"
+        logs.info("accounts", f"检测到 {len(migrated)} 个 JWT 凭证，已从 bigmodel 归位为 zai/cn")
+
     added = []
     existing = {a.id for a in store.list_accounts(provider)}  # 识别真新增（重复 token 跳过）
     for tok in dict.fromkeys(tokens):  # 去重保序
         name = payload.get("name") or f"{provider}-{len(store.list_accounts(provider)) + 1}"
-        acc = store.add_account(provider, name, tok)
+        acc = store.add_account(provider, name, tok, realm=realm)
         added.append(acc.id)
     # 立即刷新一次额度（仅 zai jwt）
     fresh = [a for a in store.list_accounts(provider) if a.id in added and a.mode == "jwt"]
@@ -225,24 +235,30 @@ def _login_gc() -> None:
 
 @router.post("/login/start")
 async def login_start(payload: dict = Body(default=None)):
-    """发起 Z.AI OAuth，返回授权链接供前端展示。
+    """发起 OAuth 授权，返回授权链接供前端展示。
 
-    payload 可选 {"label": "acct-1"} —— 作为账号名前缀入池，便于多号识别。
+    payload 可选 {"label": "acct-1", "realm": "intl"|"cn"} —— label 作为账号名
+    前缀入池，便于多号识别；realm 决定授权页与业务域（intl=z.ai 国际版，
+    cn=bigmodel.cn 国内版），缺省 intl。
     """
     payload = payload or {}
     label = (payload.get("label") or "").strip()[:32]
+    realm = str(payload.get("realm") or REALM_INTL).strip().lower()
+    if realm not in REALMS:
+        raise HTTPException(400, "realm 必须是 intl 或 cn")
     _login_gc()
-    flow = ZaiAuthFlow()
+    flow = ZaiAuthFlow(realm=realm)
     try:
         flow_id, authorize_url = await flow.init()
     except Exception as err:  # noqa: BLE001
-        logs.warn("oauth", f"登录初始化失败: {type(err).__name__}: {err}")
+        logs.warn("oauth", f"登录初始化失败 realm={realm}: {type(err).__name__}: {err}")
         raise HTTPException(502, f"登录初始化失败: {err}") from err
     _login_flows[flow_id] = {"flow": flow, "created": time.time(), "label": label}
-    logs.info("oauth", f"发起登录 flow_id={flow_id} label={label or '-'}")
+    logs.info("oauth", f"发起登录 realm={realm} flow_id={flow_id} label={label or '-'}")
     return {
         "flow_id": flow_id,
         "authorize_url": authorize_url,
+        "realm": realm,
         "expires_in": int(LOGIN_FLOW_TTL),
     }
 
@@ -297,17 +313,19 @@ async def login_poll(flow_id: str):
 
     # JWT 先入池并立刻 ready；兑换 API Key / 额度刷新改后台，避免卡住前端下一轮 poll。
     zcode_jwt = data.get("token")
-    access_token = (data.get("zai") or {}).get("access_token")
+    # 业务 token 块随区域：intl=data.zai，cn=data.bigmodel（flow 已带 realm）
+    access_token = flow.business_access_token(data)
+    realm = getattr(flow, "realm", REALM_INTL)
     label = entry.get("label") or "oauth-login"
     account = None
     if zcode_jwt:
-        account = store.add_account("zai", label, zcode_jwt)
+        account = store.add_account("zai", label, zcode_jwt, realm=realm)
     elif access_token:
         try:
             api_key = await asyncio.wait_for(
                 flow.exchange_api_key(access_token), timeout=LOGIN_EXCHANGE_TIMEOUT
             )
-            account = store.add_account("zai", label, api_key)
+            account = store.add_account("zai", label, api_key, realm=realm)
         except Exception as err:  # noqa: BLE001
             logs.warn("oauth", f"无 JWT 时兑换 API Key 失败: {err}")
 

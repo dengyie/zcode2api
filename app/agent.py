@@ -75,10 +75,16 @@ def build_request(
 
     if provider == "zai":
         if account.uses_plan_channel() and not force_fallback:
+            # Plan 通道 intl/cn 同端点（zcode.z.ai，JWT 决定归属）
             target_url = settings.UPSTREAM["zai"]
             auth = {"Authorization": f"Bearer {account.jwt_token}"}
         elif account.api_key:
-            target_url = settings.UPSTREAM["zai_fallback"]
+            # 回退 Key 的域随账号区域：intl → api.z.ai；cn（bigmodel OAuth
+            # 兑换的 Key）→ open.bigmodel.cn
+            if account.realm == "cn":
+                target_url = settings.UPSTREAM["bigmodel"]
+            else:
+                target_url = settings.UPSTREAM["zai_fallback"]
             auth = {"x-api-key": account.api_key}
         else:
             raise RuntimeError("账号缺少有效凭证")
