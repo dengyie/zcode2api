@@ -7,6 +7,7 @@ login/start → （测试侧模拟用户授权：切 Mock oauth_state）→ logi
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -273,3 +274,131 @@ class TestOAuthLoginFlow:
         assert any(p.endswith("/api_keys/copy/mock-api-key-id") for p in paths)
         # ready 后立即触发一次额度刷新（billing 三端点）
         assert any(p.endswith("/billing/current") for p in paths)
+
+
+@pytest.mark.integration
+class TestOAuthCnRealm:
+    """国内版（bigmodel.cn）OAuth 双区域回归（对齐 codeapi providers/zcode 实证）：
+
+    - init 请求体 provider=bigmodel（国内版授权出口）
+    - poll 业务 token 在 data.bigmodel 块，且本身就是业务 token —— 不打 z/login
+    - 兑换链（getCustomerInfo → api_keys → copy）照走，Key 挂回 JWT 作回退
+    - 账号以 realm=cn 入池；非法 realm 400
+    """
+
+    @pytest.fixture(autouse=True)
+    async def _reset_mock(self, gateway_client):
+        _, mock = gateway_client
+        mock.state.oauth_state = "pending"
+        mock.state.oauth_poll_status = 200
+        mock.state.oauth_poll_realm = "cn"
+        yield
+        mock.state.oauth_poll_realm = None
+        await _drain_login_followup()
+
+    async def test_invalid_realm_rejected(self, gateway_client):
+        client, _ = gateway_client
+        res = await client.post("/admin/api/login/start", json={"realm": "xx"},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 400
+
+    async def test_cn_start_uses_bigmodel_provider(self, gateway_client):
+        client, mock = gateway_client
+        # mock 上游 session 级共享，calls 跨用例累积 —— 记录基线后只断言增量
+        base = len(mock.state.calls)
+        start = (await client.post("/admin/api/login/start", json={"realm": "cn"},
+                                   headers={"Authorization": "Bearer zcode"})).json()
+        assert start["realm"] == "cn"
+        init = next(c for c in mock.state.calls[base:] if c[1].endswith("/oauth/cli/init"))
+        assert json.loads(init[3])["provider"] == "bigmodel"
+        # 对照：缺省（intl）发起时 provider=zai
+        base2 = len(mock.state.calls)
+        await client.post("/admin/api/login/start",
+                          headers={"Authorization": "Bearer zcode"})
+        init_intl = next(c for c in mock.state.calls[base2:]
+                         if c[1].endswith("/oauth/cli/init"))
+        assert json.loads(init_intl[3])["provider"] == "zai"
+
+    async def test_cn_full_flow_skips_z_login_and_pools_cn_account(self, gateway_client):
+        client, mock = gateway_client
+        base = len(mock.state.calls)
+        start = (await client.post("/admin/api/login/start",
+                                   json={"label": "cn-1", "realm": "cn"},
+                                   headers={"Authorization": "Bearer zcode"})).json()
+        mock.state.oauth_state = "ready"
+        poll = (await client.get(f"/admin/api/login/poll/{start['flow_id']}",
+                                 headers={"Authorization": "Bearer zcode"})).json()
+        assert poll["status"] == "ready"
+        acc = poll["account"]
+        assert acc["provider"] == "zai"
+        assert acc["realm"] == "cn"
+        assert acc["mode"] == "jwt"
+
+        await _drain_login_followup()
+        paths = [c[1] for c in mock.state.calls[base:]]
+        # cn 的业务 token 即 access_token：绝不打国际版的 z/login 换取
+        assert "/api/auth/z/login" not in paths
+        # 兑换链照走，回退 Key 挂回同一 JWT 账号
+        assert "/api/biz/customer/getCustomerInfo" in paths
+        assert any(p.endswith("/api_keys/copy/mock-api-key-id") for p in paths)
+        accounts = (await client.get("/admin/api/accounts",
+                                     headers={"Authorization": "Bearer zcode"})).json()
+        stored = next(a for a in accounts["accounts"] if a["id"] == acc["id"])
+        assert stored["realm"] == "cn"
+        assert (stored["token_masked"] or "") != ""
+
+
+@pytest.mark.integration
+class TestPasteRealm:
+    """粘贴入池的区域语义：
+
+    - zai + realm=cn 的两段点 JWT → JWT 模式、realm=cn 入池
+    - bigmodel 提供商粘入两段点 JWT（zcodejwttoken）→ 自动归位 zai/cn
+      （bigmodel 通道只接受 open.bigmodel.cn 的 x-api-key，JWT 在该通道永不可用）
+    - 非法 realm 400
+    """
+
+    async def _post(self, client, payload):
+        return await client.post("/admin/api/accounts", json=payload,
+                                 headers={"Authorization": "Bearer zcode"})
+
+    async def test_zai_cn_jwt_pools_with_cn_realm(self, gateway_client):
+        client, _ = gateway_client
+        res = await self._post(client, {"provider": "zai", "realm": "cn",
+                                        "tokens": ["h.cnjwt.sig"]})
+        assert res.status_code == 200
+        accounts = (await client.get("/admin/api/accounts",
+                                     headers={"Authorization": "Bearer zcode"})).json()
+        acc = accounts["accounts"][0]
+        assert acc["realm"] == "cn"
+        assert acc["mode"] == "jwt"
+
+    async def test_bigmodel_jwt_auto_migrates_to_zai_cn(self, gateway_client):
+        client, _ = gateway_client
+        res = await self._post(client, {"provider": "bigmodel",
+                                        "tokens": ["h.migrated.sig"]})
+        assert res.status_code == 200
+        accounts = (await client.get("/admin/api/accounts",
+                                     headers={"Authorization": "Bearer zcode"})).json()
+        acc = accounts["accounts"][0]
+        assert acc["provider"] == "zai"
+        assert acc["realm"] == "cn"
+        assert acc["mode"] == "jwt"
+
+    async def test_bigmodel_apikey_defaults_cn(self, gateway_client):
+        client, _ = gateway_client
+        res = await self._post(client, {"provider": "bigmodel",
+                                        "tokens": ["mock-api-key-id.secret"]})
+        assert res.status_code == 200
+        accounts = (await client.get("/admin/api/accounts",
+                                     headers={"Authorization": "Bearer zcode"})).json()
+        acc = accounts["accounts"][0]
+        assert acc["provider"] == "bigmodel"
+        assert acc["realm"] == "cn"
+        assert acc["mode"] == "apiKey"
+
+    async def test_invalid_realm_rejected(self, gateway_client):
+        client, _ = gateway_client
+        res = await self._post(client, {"provider": "zai", "realm": "xx",
+                                        "tokens": ["abc"]})
+        assert res.status_code == 400

@@ -205,10 +205,10 @@ class Store:
         return None
 
     # ── 账号增删改 ───────────────────────────────────────────────────────────
-    def add_account(self, provider: str, name: str, secret: str) -> Account:
+    def add_account(self, provider: str, name: str, secret: str, realm: str = "") -> Account:
         if provider not in PROVIDERS:
             raise ValueError(f"不支持的 provider: {provider}")
-        account = Account.create(provider, name, secret)
+        account = Account.create(provider, name, secret, realm=realm)
         with self._lock:
             for a in self._accounts[provider]:
                 if a.secret and a.secret == account.secret:
@@ -294,7 +294,8 @@ class Store:
                 "exported_at": time.time(),
                 "providers": {
                     p: [
-                        {"name": a.name, "mode": a.mode, "secret": a.secret}
+                        {"name": a.name, "mode": a.mode, "secret": a.secret,
+                         "realm": a.realm}
                         for a in self._accounts[p]
                     ]
                     for p in PROVIDERS
@@ -311,7 +312,8 @@ class Store:
                 secret = it.get("secret") or it.get("token") or it.get("jwtToken") or it.get("apiKey")
                 if not secret:
                     continue
-                self.add_account(provider, it.get("name", provider), secret)
+                self.add_account(provider, it.get("name", provider), secret,
+                                 realm=str(it.get("realm") or ""))
                 count += 1
         return count
 

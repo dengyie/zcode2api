@@ -41,6 +41,23 @@ USAGE_PATH = "/usage"
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
+# OAuth 双区域（对齐 codeapi providers/zcode/realms.py，官方客户端 3.14.x 实证）：
+# CLI init/poll 端点 intl/cn 共用，provider 参数与业务域随区域——
+#   intl → provider=zai，授权页 chat.z.ai；poll 的 data.zai.access_token 是
+#          OAuth 会话凭证，需经 api.z.ai/api/auth/z/login 换业务 token；
+#   cn   → provider=bigmodel，授权页 bigmodel.cn/login（服务端回调）；
+#          poll 的 data.bigmodel.access_token 本身就是业务 token（官方客户端
+#          BigModel adapter 不做二次换取）。
+# 两个区域的 data.token 都是 zcodejwttoken（Plan 通道 Bearer，JWT 决定归属，
+# messages / billing / claim 端点 intl/cn 完全相同，无需分域）。
+BIGMODEL_BUSINESS_ORIGIN = "https://bigmodel.cn"
+OAUTH_REALMS = {
+    "intl": {"oauth_provider": "zai", "business_origin": ZAI_API_ORIGIN},
+    "cn": {"oauth_provider": "bigmodel", "business_origin": BIGMODEL_BUSINESS_ORIGIN},
+}
+# poll 响应里业务 token 块的块名随区域
+OAUTH_PROVIDER_BLOCKS = {"intl": "zai", "cn": "bigmodel"}
+
 # ── 客户端版本（单一真相源：官方客户端 3.14.4，2026-10-02 跟进）────────────────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
 # 出处：本机官方 ZCode.exe（注册表 DisplayVersion=3.14.4，2026-10-02 实测；

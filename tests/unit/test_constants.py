@@ -21,6 +21,19 @@ def test_billing_base():
     assert constants.BILLING_BASE == "https://zcode.z.ai/api/v1/zcode-plan"
 
 
+def test_oauth_realms():
+    """双区域表（对齐 codeapi providers/zcode/realms.py，官方客户端 3.14.x 实证）：
+    CLI init/poll 端点 intl/cn 共用，provider 参数、业务 token 块名与业务域随区域。"""
+    assert constants.BIGMODEL_BUSINESS_ORIGIN == "https://bigmodel.cn"
+    assert constants.OAUTH_REALMS["intl"] == {
+        "oauth_provider": "zai", "business_origin": "https://api.z.ai",
+    }
+    assert constants.OAUTH_REALMS["cn"] == {
+        "oauth_provider": "bigmodel", "business_origin": "https://bigmodel.cn",
+    }
+    assert constants.OAUTH_PROVIDER_BLOCKS == {"intl": "zai", "cn": "bigmodel"}
+
+
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
     # 实测带 platform 参数上游 3001，只允许 app_version
@@ -88,6 +101,9 @@ def test_settings_upstream_defaults_from_constants():
     assert settings.UPSTREAM["zai_fallback"] == constants.MESSAGES_URLS["zai_fallback"]
     assert settings.UPSTREAM["bigmodel"] == constants.MESSAGES_URLS["bigmodel"]
     assert settings.ZCODE_BILLING_BASE == constants.BILLING_BASE
+    # 兑换链业务域随区域：intl=api.z.ai，cn=bigmodel.cn
+    assert settings.ZAI_EXCHANGE_ORIGIN == constants.ZAI_API_ORIGIN
+    assert settings.BIGMODEL_EXCHANGE_ORIGIN == constants.BIGMODEL_BUSINESS_ORIGIN
 
 
 # 网关常量（底座原值，回归锁定）

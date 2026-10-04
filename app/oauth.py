@@ -1,6 +1,16 @@
-"""Z.AI OAuth 登录流程。
+"""Z.AI / BigModel（国内版）OAuth 登录流程。
 
-主要供 CLI `login zai` 使用：发起 OAuth → 轮询 → 兑换 API Key。
+主要供 CLI `login zai` 与后台「授权登录」使用：发起 OAuth → 轮询 → 兑换 API Key。
+
+双区域（constants.OAUTH_REALMS，对齐官方客户端 3.14.x 实证）：
+- intl（zai）：init `{"provider":"zai"}`，授权页 chat.z.ai；poll 的
+  `data.zai.access_token` 是 OAuth 会话凭证，需经 `api.z.ai/api/auth/z/login`
+  换业务 token 后再走机构/项目/Key 兑换链（业务域 api.z.ai）；
+- cn（bigmodel）：init `{"provider":"bigmodel"}`，授权页 bigmodel.cn/login
+  （服务端回调）；poll 的 `data.bigmodel.access_token` 本身就是业务 token
+  （官方客户端 BigModel adapter 不做二次换取），业务链在 bigmodel.cn 域。
+两个区域的 `data.token` 都是 zcodejwttoken（Plan 通道 Bearer），messages /
+billing / claim 端点 intl/cn 完全相同，无需分域。
 """
 
 from __future__ import annotations
@@ -9,11 +19,16 @@ import secrets
 
 import httpx
 
-from . import settings
+from . import constants, settings
+
+REALM_INTL = "intl"
+REALM_CN = "cn"
 
 
 class ZaiAuthFlow:
-    """api_base / exchange_origin 可注入（测试指向 Mock 上游）；
+    """一次 OAuth CLI 登录会话；realm 决定 provider 参数、业务 token 块与业务域。
+
+    api_base / exchange_origin 可注入（测试指向 Mock 上游）；
     默认值来自 settings（其缺省又来自 constants 收口）。
 
     官方 CLI 规范（对齐 zcode.cjs createZaiCliOAuthClient）：
@@ -26,9 +41,19 @@ class ZaiAuthFlow:
     （保留旧协议兼容）。
     """
 
-    def __init__(self, api_base: str | None = None, exchange_origin: str | None = None) -> None:
+    def __init__(self, api_base: str | None = None, exchange_origin: str | None = None,
+                 realm: str = REALM_INTL) -> None:
+        realm = str(realm or REALM_INTL).strip().lower()
+        self.realm = realm if realm in constants.OAUTH_REALMS else REALM_INTL
+        self.oauth_provider = constants.OAUTH_REALMS[self.realm]["oauth_provider"]
         self.api_base = api_base or settings.OAUTH_API_BASE
-        self.exchange_origin = exchange_origin or settings.ZAI_EXCHANGE_ORIGIN
+        if exchange_origin:
+            self.exchange_origin = exchange_origin
+        else:
+            self.exchange_origin = (
+                settings.BIGMODEL_EXCHANGE_ORIGIN if self.realm == REALM_CN
+                else settings.ZAI_EXCHANGE_ORIGIN
+            )
         self.poll_token = secrets.token_hex(32)
 
     async def init(self) -> tuple[str, str]:
@@ -39,7 +64,7 @@ class ZaiAuthFlow:
                     "Authorization": f"Bearer {self.poll_token}",
                     "Content-Type": "application/json",
                 },
-                json={"provider": "zai"},
+                json={"provider": self.oauth_provider},
             )
         res.raise_for_status()
         body = res.json()
@@ -64,19 +89,39 @@ class ZaiAuthFlow:
         res.raise_for_status()
         return res.json().get("data") or {}
 
+    def business_access_token(self, data: dict) -> str:
+        """从 poll 结果提取业务 access_token；块名随区域（intl=data.zai，cn=data.bigmodel）。"""
+        block = data.get(constants.OAUTH_PROVIDER_BLOCKS[self.realm])
+        if isinstance(block, dict):
+            return str(block.get("access_token") or "").strip()
+        return ""
+
+    async def _resolve_business_token(self, client: httpx.AsyncClient, access_token: str) -> str:
+        """OAuth access_token → 业务 token。
+
+        cn（bigmodel）：poll 下发的 access_token 本身就是业务 token，直接使用；
+        intl（zai）：需经 exchange_origin 的 /api/auth/z/login 换业务 token。
+        """
+        if self.realm == REALM_CN:
+            return access_token
+        login = await client.post(
+            f"{self.exchange_origin}/api/auth/z/login",
+            headers={"Content-Type": "application/json"},
+            json={"token": access_token},
+        )
+        login.raise_for_status()
+        biz = (login.json().get("data") or {})
+        biz_token = biz.get("access_token") or biz.get("accessToken")
+        if not biz_token:
+            raise RuntimeError("返回数据中不含业务凭证")
+        return biz_token
+
     async def exchange_api_key(self, access_token: str) -> str:
-        """OAuth access_token → 业务 token → 机构/项目 → API Key。"""
+        """OAuth access_token → 业务 token → 机构/项目 → API Key（业务域随区域）。"""
+        if not access_token:
+            raise RuntimeError("缺少 access_token，无法兑换 API Key")
         async with httpx.AsyncClient(timeout=30) as client:
-            login = await client.post(
-                f"{self.exchange_origin}/api/auth/z/login",
-                headers={"Content-Type": "application/json"},
-                json={"token": access_token},
-            )
-            login.raise_for_status()
-            biz = (login.json().get("data") or {})
-            biz_token = biz.get("access_token") or biz.get("accessToken")
-            if not biz_token:
-                raise RuntimeError("返回数据中不含业务凭证")
+            biz_token = await self._resolve_business_token(client, access_token)
 
             info = await client.get(
                 f"{self.exchange_origin}/api/biz/customer/getCustomerInfo",
