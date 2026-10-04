@@ -71,6 +71,8 @@ def fresh_app(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "DATA_DIR", data_dir)
     monkeypatch.setattr(settings, "DB_PATH", data_dir / "accounts.db")
     monkeypatch.setattr(settings, "COOLING_SECONDS", 300)
+    # 本机 .env 的自定义 ZCODE_ADMIN_KEY 不得漏进夹具：admin 接口测试依赖默认密钥 "zcode"
+    monkeypatch.setattr(settings, "DEFAULT_ADMIN_KEY", "zcode")
 
     from app import store as store_module
     from app.store import Store
