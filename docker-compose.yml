@@ -1,0 +1,23 @@
+services:
+  zcode-hub:
+    build: .
+    image: zcode-hub:latest
+    container_name: zcode-hub
+    restart: unless-stopped
+    init: true
+    ports:
+      # 宿主机端口取 .env 的 ZCODE_PORT（默认 3000）；容器内固定 3000
+      - "${ZCODE_PORT:-3000}:3000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # 容器侧固定值，覆盖 .env 中的宿主机配置（如 Windows Chrome 路径）
+      ZCODE_HOST: 0.0.0.0
+      ZCODE_PORT: "3000"
+      ZCODE_DATA_DIR: /app/data
+      ZCODE_NODE_PATH: /usr/local/bin/node
+      ZCODE_CHROMIUM_PATH: /usr/bin/chromium
+    volumes:
+      # 账号库（accounts.db）与设备指纹（device_mid）持久化；沿用宿主机已有 data/
+      - ./data:/app/data

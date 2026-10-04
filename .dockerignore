@@ -1,0 +1,22 @@
+# 构建上下文瘦身 + 秘密不入镜像（roadmap 约定：.env / data/ 永不入镜像）
+.git
+.github
+.venv
+.env
+data
+tests
+docs
+scripts
+__pycache__
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.mypy_cache
+captcha_node/node_modules
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+start.bat
+start.sh
+uv.lock
