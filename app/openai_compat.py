@@ -106,6 +106,11 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
             })
         elif role == "assistant":
             blocks: list[dict] = []
+            # 多轮重放：reasoning_content（历史轮思考文本）→ Anthropic thinking 块。
+            # 上游对 thinking 块 signature 不校验（实测伪造值可通过），空串亦可。
+            rc = msg.get("reasoning_content") or msg.get("reasoning") or msg.get("reasoning_text")
+            if isinstance(rc, str) and rc.strip():
+                blocks.append({"type": "thinking", "thinking": rc, "signature": ""})
             text = _text_from_content(content)
             if text:
                 blocks.append({"type": "text", "text": text})
@@ -148,6 +153,12 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
             body["top_p"] = float(payload["top_p"])
     except (TypeError, ValueError):
         pass
+    # 推理强度：上游 GLM-5.3 系原生接受 reasoning_effort（low/high/max）。
+    # 其余值（含 off/none）不带该字段——上游不支持关闭思考，交给默认档。
+    effort = payload.get("reasoning_effort")
+    if isinstance(effort, str) and effort.strip().lower() in ("low", "high", "max"):
+        body["reasoning_effort"] = effort.strip().lower()
+
     stop = payload.get("stop")
     if isinstance(stop, str) and stop:
         body["stop_sequences"] = [stop]
@@ -186,11 +197,14 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
 def anthropic_to_openai(data: dict, model: str) -> dict:
     """Anthropic message 响应 → OpenAI chat.completion。"""
     text_parts: list[str] = []
+    thinking_parts: list[str] = []
     tool_calls: list[dict] = []
     for block in data.get("content") or []:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "text" and isinstance(block.get("text"), str):
+        if block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+            thinking_parts.append(block["thinking"])
+        elif block.get("type") == "text" and isinstance(block.get("text"), str):
             text_parts.append(block["text"])
         elif block.get("type") == "tool_use":
             tool_calls.append({
@@ -205,6 +219,10 @@ def anthropic_to_openai(data: dict, model: str) -> dict:
     in_tok = _as_int(usage.get("input_tokens")) or 0
     out_tok = _as_int(usage.get("output_tokens")) or 0
     message: dict = {"role": "assistant", "content": "".join(text_parts) or None}
+    # OpenAI 兼容侧通用约定：思考文本放 reasoning_content（pi-ai/DeepSeek 风格均可识别）
+    reasoning = "\n".join(p for p in thinking_parts if p)
+    if reasoning:
+        message["reasoning_content"] = reasoning
     if tool_calls:
         message["tool_calls"] = tool_calls
     return {
@@ -261,6 +279,8 @@ class StreamConverter:
             return []
         if etype == "content_block_start":
             block = evt.get("content_block") or {}
+            if block.get("type") == "thinking":
+                return [self._chunk({"reasoning_content": ""})]
             if block.get("type") == "tool_use":
                 idx = self._tool_seq
                 self._tool_seq += 1
@@ -273,6 +293,8 @@ class StreamConverter:
             return []
         if etype == "content_block_delta":
             delta = evt.get("delta") or {}
+            if delta.get("type") == "thinking_delta" and isinstance(delta.get("thinking"), str):
+                return [self._chunk({"reasoning_content": delta["thinking"]})]
             if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
                 return [self._chunk({"content": delta["text"]})]
             if delta.get("type") == "input_json_delta" and isinstance(delta.get("partial_json"), str):
