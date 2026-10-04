@@ -59,6 +59,21 @@ cp .env.example .env            # 按需修改密钥、端口等
 
 > 使用 Z.AI **JWT 模式**需要 Node.js 求解验证码，首次先执行：`cd captcha_node && npm install`。
 
+### Docker 部署（推荐）
+
+镜像自带 Python 3.11 + Node 22 + Chromium，无需宿主机装任何运行时：
+
+```bash
+cp .env.example .env       # 按需修改 ZCODE_ADMIN_KEY、端口等
+docker compose up -d --build
+```
+
+- 访问 `http://127.0.0.1:3000/admin/login`；宿主机端口取 `.env` 的 `ZCODE_PORT`
+- 账号库与设备指纹持久化在宿主机 `./data/`（首次启动自动生成，已有数据直接沿用）
+- `.env` 里的 `ZCODE_CHROMIUM_PATH` 等宿主机路径会被 compose 覆盖为容器内路径，无需改动
+- 容器内 CLI：`docker compose exec zcode-hub python cli.py accounts`（其余子命令同理）
+- 停止：`docker compose down`（数据保留在 `./data/`）
+
 ## 快速上手一个账号
 
 ```bash
