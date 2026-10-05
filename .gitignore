@@ -24,3 +24,6 @@ node_modules/
 # 秘钥 / 凭证导出
 *accounts*.json
 zcode-accounts*.json
+
+# 工具会话产物（ZCode 等，永不入库）
+.zcode/

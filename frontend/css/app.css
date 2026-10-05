@@ -243,7 +243,8 @@ select.input option{background:var(--panel);color:var(--ink)}
 .dialog-btn-danger:hover{background:rgba(224,82,82,.2)}
 
 /* Settings card */
-.settings-card{background:var(--panel);border:1px solid var(--hairline-soft);border-radius:14px;padding:22px;margin-bottom:16px;max-width:640px}
+/* Settings card：与 admin-main 同宽（设置页表单/说明需要整行宽度，窄卡已弃用） */
+.settings-card{background:var(--panel);border:1px solid var(--hairline-soft);border-radius:14px;padding:22px;margin:0 auto 16px}
 .settings-row{display:grid;gap:6px;margin-bottom:18px}
 .settings-row:last-child{margin-bottom:0}
 .settings-row label{font-size:13px;font-weight:600}
