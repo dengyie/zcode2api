@@ -24,3 +24,12 @@ node_modules/
 # 秘钥 / 凭证导出
 *accounts*.json
 zcode-accounts*.json
+
+# 本地运行 / 工具杂物
+serve.log
+serve.err.log
+serve.pid
+.trae_*
+.sg_*
+.sg-js/
+.sg_login.html
