@@ -10,10 +10,10 @@
 有账号时 X-Device-Mid / 平台 / 语言 / 时区取自该号 DeviceProfile（一号一台
 生成的桌面设备）。无账号时回退全局伪装常量 + quota.device_mid()。
 
-另含追踪头（zapi upstream.ts buildTraceHeaders）：JWT 通道即 zapi 的
-start-plan，只发 x-request-id / x-zcode-session-type / x-zcode-trace-id
-三个头（start-plan 不发 x-query-id / x-session-id，误发触发 3012）。
-每请求重新生成。
+另含追踪头（attribution 六件，2026-10-29 对齐官方 3.16.3 构造器）：
+x-request-id / x-zcode-session-type / x-zcode-trace-id / x-query-id /
+x-zcode-query-source / x-session-id，每请求重新生成；分级语义已随
+官方客户端升级废除（详见 build_trace_headers docstring）。
 
 平台/语言/时区/设备 ID 取自账号指纹（fingerprint.profile_for）：每账号独立
 设备档案，消灭「多账号同一设备」的关联信号。account 为 None（CLI 自检等）
@@ -103,23 +103,29 @@ def build_identity_headers(account=None) -> dict[str, str]:
     return headers
 
 
-def build_trace_headers(plan: str = "start-plan") -> dict[str, str]:
-    """追踪头：每请求全新 UUID（对齐 zapi upstream.ts buildTraceHeaders）。
+def build_trace_headers() -> dict[str, str]:
+    """追踪头：每请求全新 UUID（对齐官方 3.16.3 attribution 构造器）。
 
-    通道差异（关键，误发会触发上游 3012 "unusual activity"）：
-      - start-plan（JWT 通道，cred.jwt 存在）：只发 x-request-id /
-        x-zcode-session-type / x-zcode-trace-id 三个头。**不发**
-        x-query-id / x-session-id —— 官方客户端 start-plan 请求不带这两个。
-      - coding-plan（API Key 通道）：额外发 x-query-id / x-session-id。
+    历史注记：旧实现按 zapi（3.10.2 时代）静态分析做 start-plan/coding-plan
+    分级——start-plan 只发 request-id/session-type/trace-id 三件，理由是
+    「误发 query-id/session-id 触发 3012」。该结论产生于 2026-09-05 事件，
+    事后已被修正为高频测试触发的临时风控，分级假设从未单独验证过。
 
-    本服务 JWT 通道即 zapi 的 start-plan，故默认 plan="start-plan"。
+    2026-10-29 对 3.16.3 bundle 静态核对（createModelRequestAttributionHeaders）：
+    六件头**无任何按套餐/通道的分级**，数据存在即发；同日 mitm 实抓真实
+    请求头六件俱全（x-zcode-query-source=main_turn）。故全量对齐：
+      x-request-id / x-zcode-session-type / x-zcode-trace-id /
+      x-query-id / x-zcode-query-source / x-session-id
+    （x-opencode-session 仅对 opencode.ai 域名生效，与本服务无关。）
+
+    与官方的已知残留差异：官方 session-id/query-id 在会话/查询内稳定，
+    hub 无会话态、每请求全新——形状一致、生命周期更短，属可接受漂移。
     """
-    headers = {
+    return {
         "x-request-id": str(uuid.uuid4()),
         "x-zcode-session-type": "main",
         "x-zcode-trace-id": str(uuid.uuid4()),
+        "x-query-id": str(uuid.uuid4()),
+        "x-zcode-query-source": "main_turn",
+        "x-session-id": str(uuid.uuid4()),
     }
-    if plan != "start-plan":
-        headers["x-query-id"] = str(uuid.uuid4())
-        headers["x-session-id"] = str(uuid.uuid4())
-    return headers

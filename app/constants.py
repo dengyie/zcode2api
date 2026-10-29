@@ -41,25 +41,28 @@ USAGE_PATH = "/usage"
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
-# ── 客户端版本（单一真相源：官方客户端 3.14.4，2026-10-02 跟进）────────────────
+# ── 客户端版本（单一真相源：官方客户端 3.16.3，2026-10-29 跟进）────────────────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
-# 出处：本机官方 ZCode.exe（注册表 DisplayVersion=3.14.4，2026-10-02 实测；
-# 前值 3.14.3 为 ProductVersion 3.14.3.7762 / app.asar rS="3.14.3"，构建 2026-09-22）。
+# 出处：2026-10-29 本机官方客户端 mitm 实抓（User-Agent/X-ZCode-App-Version 均为
+# 3.16.3；app bundle zcode.cjs 同版）。前值 3.14.4（2026-10-02 注册表实测）。
 # zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
 # billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，钉此常量为唯一真相源。
 # ⚠️ 上游疑似按客户端版本门槛投放活动套餐：钉旧版（3.11.2）时 preview 恒空，
 # 跟进官方现行版后恢复——发现 preview 为空时优先核对此常量是否落后于官方。
-CLIENT_APP_VERSION = "3.14.4"
+CLIENT_APP_VERSION = "3.16.3"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
+# bundle 实证（3.16.3）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
+# mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
-BILLING_APP_VERSION = "3.14.4"
-BILLING_TITLE = "Z Code@electron"        # zcode-switch billing 头实证形态
-BILLING_RELEASE_CHANNEL = "stable"
+BILLING_APP_VERSION = "3.16.3"
+BILLING_TITLE = "Z Code@electron"        # bundle：sourceTitle 缺省即 electron（CLI surface 才覆盖 cli）
+BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_ENV=test 才 test）；
+                                         # 旧值 stable 系 3.11.2 时代 zcode-switch 静态对齐，已过时
 # 官方客户端每日活跃事件：POST /api/v1/event/report（不在 zcode-plan 下、无
 # Authorization）。zcode-switch claim_refresh 在 preview 前上报 app_launch +
 # app_daily_active —— 疑似活动套餐投放的资格信号（官方客户端可见活动而纯
@@ -107,13 +110,14 @@ CAPTCHA_REGION_HEADER = "X-Aliyun-Captcha-Verify-Region"
 # 官方客户端 companion 头集合，让代理在指纹层与官方 ZCode 桌面端不可区分。
 # darwin-arm64 桌面身份。X-Device-Mid 走 quota.device_mid() 持久化复用。
 IDENTITY_TITLE = "Z Code@electron"      # X-Title = "Z Code@{sourceTitle}"；桌面端账号走 electron
-IDENTITY_RELEASE_CHANNEL = "stable"
+IDENTITY_RELEASE_CHANNEL = "production"  # 同 BILLING_RELEASE_CHANNEL（bundle DF() 实证）
 IDENTITY_CLIENT_LANGUAGE = "zh-CN"
 IDENTITY_CLIENT_TIMEZONE = "Asia/Shanghai"
 # X-Os-Category：darwin→macos / win32→windows / 其它→linux
 IDENTITY_OS_CATEGORY = "macos"
-# X-Os-Version：os.release() 语义；darwin 25.x 对应 macOS 15。固定伪装值。
-IDENTITY_OS_VERSION = "25.5.0"
+# X-Os-Version：os.release() 语义；darwin 25.x 对应 macOS 26（本机实测 25.6.0）。
+# 固定伪装值。
+IDENTITY_OS_VERSION = "25.6.0"
 
 # ── 上游被拒信号 → 账号动作（gateway / quota 判定共用）────────────────────────
 EXHAUST_HTTP_STATUSES = (402,)

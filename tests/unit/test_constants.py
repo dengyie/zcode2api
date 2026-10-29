@@ -24,24 +24,24 @@ def test_billing_base():
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
     # 实测带 platform 参数上游 3001，只允许 app_version
-    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.14.4"
+    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.16.3"
 
 
 def test_client_version_single_source():
-    # 官方客户端 3.14.4（本机 ZCode.exe 注册表实测 2026-10-02；前值 3.14.3）
+    # 官方客户端 3.16.3（2026-10-29 本机 mitm 实抓 + bundle 核对；前值 3.14.4）
     # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
-    assert constants.CLIENT_APP_VERSION == "3.14.4"
+    assert constants.CLIENT_APP_VERSION == "3.16.3"
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
     assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
     assert constants.CLIENT_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
 
 
 def test_billing_version_and_activation():
-    # billing 族与 messages 指纹版本同源（官方现行版 3.14.4）；zcode-switch 的
+    # billing 族与 messages 指纹版本同源（官方现行版 3.16.3）；zcode-switch 的
     # 「读注册表真实版」在 Linux hub 上收敛为钉常量，升级时改此处即可
-    assert constants.BILLING_APP_VERSION == "3.14.4"
+    assert constants.BILLING_APP_VERSION == "3.16.3"
     assert constants.BILLING_TITLE == "Z Code@electron"
-    assert constants.BILLING_RELEASE_CHANNEL == "stable"
+    assert constants.BILLING_RELEASE_CHANNEL == "production"
     assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"
     assert constants.ACTIVATION_ELEMENTS == ("app_launch", "app_daily_active")
     assert constants.ACTIVATION_SCREEN_RESOLUTION == "2560x1440"
@@ -75,7 +75,7 @@ def test_identity_headers():
     assert constants.X_ZCODE_AGENT == "glm"
     assert constants.HTTP_REFERER == "https://zcode.z.ai"
     assert constants.IDENTITY_TITLE == "Z Code@electron"
-    assert constants.IDENTITY_RELEASE_CHANNEL == "stable"
+    assert constants.IDENTITY_RELEASE_CHANNEL == "production"
     assert constants.IDENTITY_CLIENT_LANGUAGE == "zh-CN"
     assert constants.IDENTITY_CLIENT_TIMEZONE == "Asia/Shanghai"
     assert constants.IDENTITY_OS_CATEGORY == "macos"

@@ -174,7 +174,7 @@ class TestClaim:
         assert h.get("user-agent") == f"ZCode/{constants.BILLING_APP_VERSION}"
         assert h.get("x-zcode-app-version") == constants.BILLING_APP_VERSION
         assert h.get("x-title") == "Z Code@electron"
-        assert h.get("x-release-channel") == "stable"
+        assert h.get("x-release-channel") == "production"
         # 平台/语言/设备按账号指纹档案出值（2026-09-07 随机指纹池）
         assert h.get("x-client-language") == profile.language
         assert h.get("x-client-timezone") == profile.timezone

@@ -212,7 +212,7 @@ class TestBuildRequest:
         assert headers["anthropic-version"] == "2023-06-01"
         # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/stable
         assert headers["X-Title"] == "Z Code@electron"
-        assert headers["X-Release-Channel"] == "stable"
+        assert headers["X-Release-Channel"] == "production"
         assert "X-Device-Mid" in headers
         assert "x-request-id" in headers and "x-zcode-trace-id" in headers
 

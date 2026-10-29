@@ -13,7 +13,7 @@ import json
 
 from app import constants
 from app.agent import build_request
-from app.identity import build_identity_headers
+from app.identity import build_identity_headers, build_trace_headers
 from app.models import Account
 
 
@@ -39,6 +39,34 @@ def test_identity_env_override_still_works(monkeypatch):
     assert h["X-Platform"] == "windows-x64"
     assert h["X-Os-Category"] == "windows"
     assert h["X-Os-Version"] == "10.0.19045"
+
+
+def test_trace_headers_attribution_full_set():
+    """JWT 通道追踪头对齐官方 3.16.3 attribution 构造器：六件全发、无分级
+    （旧「start-plan 只发三件」系 3.10.2 时代 zapi 静态分析，其 3012 依据
+    已被 2026-09-05 真因修正推翻）。每请求全新 UUID。"""
+    a, b = build_trace_headers(), build_trace_headers()
+    expected = {
+        "x-request-id", "x-zcode-session-type", "x-zcode-trace-id",
+        "x-query-id", "x-zcode-query-source", "x-session-id",
+    }
+    assert set(a) == expected
+    assert a["x-zcode-session-type"] == "main"
+    assert a["x-zcode-query-source"] == "main_turn"
+    # 逐请求全新
+    for key in ("x-request-id", "x-zcode-trace-id", "x-query-id", "x-session-id"):
+        assert a[key] != b[key], key
+
+
+def test_plan_channel_request_carries_full_attribution():
+    """端到端：JWT 账号 build_request 出的 plan 请求带全部六件 attribution 头。"""
+    acc = Account.create("zai", "t", _fake_jwt())
+    body = {"model": "GLM-5.2", "messages": [{"role": "user", "content": "hi"}]}
+    headers = build_request(acc, body, None)[1]
+    for name in ("x-request-id", "x-zcode-session-type", "x-zcode-trace-id",
+                 "x-query-id", "x-zcode-query-source", "x-session-id"):
+        assert name in headers, name
+    assert headers["X-Release-Channel"] == "production"
 
 
 class TestPassthroughFilter:
