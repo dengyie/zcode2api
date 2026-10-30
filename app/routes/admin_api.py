@@ -499,8 +499,10 @@ async def claim(payload: dict = Body(default=None)):
 async def claim_captcha_config():
     """手动领取用：阿里验证码 SDK 初始化参数（前端浏览器内完成人机验证）。"""
     from ..captcha import captcha_manager
+    from ..egress import DIRECT
 
-    config = await captcha_manager.fetch_config()
+    # claim 全链路走直连（billing 请求 trust_env=False），验证码配置同源拉取
+    config = await captcha_manager.fetch_config(DIRECT)
     return {
         "enabled": bool(config.get("enabled", True)),
         "scene_id": config.get("sceneId") or "",

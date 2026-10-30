@@ -26,14 +26,14 @@ def claim_env(gateway_client, fresh_app, monkeypatch):
             self.solve_count = 0
             self.invalidated = 0
 
-        async def get_verify_param(self, port=None):
+        async def get_verify_param(self, egress_tag=None):
             self.solve_count += 1
             return "stub-verify-param", "sgp"
 
-        async def fetch_config(self):
+        async def fetch_config(self, egress_tag=None):
             return {"enabled": True, "prefix": "mockpre", "region": "sgp", "sceneId": "mock-scene"}
 
-        def invalidate(self):
+        def invalidate(self, tag=None):
             self.invalidated += 1
 
     stub = _StubCaptcha()
@@ -218,7 +218,7 @@ class TestClaim:
 
         client, _mock, stub, acc = claim_env
 
-        async def _exhausted(port=None):
+        async def _exhausted(self, egress_tag=None):
             raise CaptchaSolveError("验证码求解失败: 多次重试无结果")
 
         monkeypatch.setattr(type(stub), "get_verify_param", _exhausted)

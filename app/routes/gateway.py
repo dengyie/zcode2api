@@ -15,7 +15,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, logs, reqlog, settings
+from .. import constants, egress, logs, reqlog, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -197,8 +197,6 @@ async def messages(request: Request):
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
     body = _normalize_body(body)
-    # 验证码页面由本服务托管，端口取实际请求端口（兼容任意启动端口）
-    port = request.url.port or settings.PORT
 
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
@@ -206,7 +204,7 @@ async def messages(request: Request):
                  bool(body.get("stream")), _last_user_text(body))
 
     try:
-        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+        result = await _dispatch(req_id, body, incoming_headers, provider)
     except asyncio.CancelledError:
         # 客户端在调度期间断开（429 重试/验证码等待可达数分钟）——CancelError
         # 是 BaseException，不兜底会让监控条目永久滞留「进行中」
@@ -244,7 +242,6 @@ async def chat_completions(request: Request):
     incoming_headers = dict(request.headers)
     provider = _detect_provider(body, request.headers)
     body = _normalize_body(body)
-    port = request.url.port or settings.PORT
 
     req_id = secrets.token_hex(8)
     logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
@@ -252,7 +249,7 @@ async def chat_completions(request: Request):
                  bool(payload.get("stream")), _last_user_text(body))
 
     try:
-        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+        result = await _dispatch(req_id, body, incoming_headers, provider)
     except asyncio.CancelledError:
         reqlog.finish_error(req_id, "客户端断开", status=499)
         raise
@@ -330,7 +327,7 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
                              headers={"Cache-Control": "no-cache"})
 
 
-async def _dispatch(req_id, body, incoming_headers, port, provider):
+async def _dispatch(req_id, body, incoming_headers, provider):
     """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。
 
     单账号并发限制：选号后若该账号在飞请求已达上限（store.account_concurrency，
@@ -351,7 +348,14 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
             continue
         attempts += 1
-        needs_captcha = provider == "zai" and account.uses_plan_channel()
+        # 结构上能否用到验证码（Plan 通道）；是否**真的带**由上游 captcha 配置决定：
+        # 线上 skip_model_request=true ⇒ 官方客户端模型请求不带验证码头，hub 也必须不带
+        # （带了就是「官方不会干的事」，3012 的结构性嫌疑）。上游若仍回 3007 要码，
+        # _try_account 会补码重试。
+        plan_channel = provider == "zai" and account.uses_plan_channel()
+        needs_captcha = plan_channel and await captcha_manager.model_requests_need_captcha(
+            egress.egress_for(settings.UPSTREAM["zai"])
+        )
 
         slot_box: list[str | None] = [None]
         if limit > 0:
@@ -359,7 +363,8 @@ async def _dispatch(req_id, body, incoming_headers, port, provider):
             slot_box[0] = account.id
         try:
             result = await _try_account(
-                req_id, account, body, incoming_headers, port, needs_captcha, slot_box,
+                req_id, account, body, incoming_headers, plan_channel, needs_captcha,
+                slot_box,
             )
         except BaseException:
             if slot_box[0] is not None:
@@ -503,8 +508,8 @@ class _Upstream:
                                  headers={"Cache-Control": "no-cache"})
 
 
-async def _try_account(req_id, account, body, incoming_headers, port, needs_captcha,
-                       slot_box: list | None = None):
+async def _try_account(req_id, account, body, incoming_headers, plan_channel,
+                       needs_captcha, slot_box: list | None = None):
     """尝试用单个账号转发，含验证码续期与可配置重试。
 
     错误处理策略（参数见 settings，均可用环境变量调整）：
@@ -524,6 +529,9 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
     retries_5xx = 0
     force_fallback = False  # 本请求瞬态走 Key 回退（不改账号持久化状态）
     model_name = str(body.get("model") or "-")
+    # 结构上是否 Plan 通道（决定「能不能用验证码」）；needs_captcha 只表示「这一趟带不带」
+    # 验证码必须与本次 Plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
+    captcha_egress = egress.egress_for(settings.UPSTREAM["zai"]) if plan_channel else None
     while True:
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
@@ -531,7 +539,11 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
         if needs_captcha:
             _park_slot(slot_box)
             try:
-                verify_param, verify_region = await captcha_manager.get_verify_param(port)
+                # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
+                # 换出口使用会被上游判 unusual activity（3012）。
+                verify_param, verify_region = await captcha_manager.get_verify_param(
+                    egress_tag=egress.egress_for(settings.UPSTREAM["zai"])
+                )
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"人机校验失败: {err}")
                 reqlog.finish_error(req_id, f"人机校验失败: {err}", status=500)
@@ -575,22 +587,32 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             await cm.__aexit__(None, None, None)
             await client.aclose()
 
-            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）
-            challenge = _detect_captcha_challenge(resp, text) if needs_captcha else None
+            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）。Plan 通道上
+            # 即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
+            challenge = _detect_captcha_challenge(resp, text) if plan_channel and not force_fallback else None
             if challenge:
-                captcha_manager.invalidate()
+                captcha_manager.invalidate(egress.egress_for(settings.UPSTREAM["zai"]))
                 captcha_retries += 1
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
                     account.record_result(False, "验证码挑战连续失败")
                     logs.warn(req_id, f"账号 {account.name} 验证码连续失败，切换下一个")
                     return _NEXT_ACCOUNT
-                logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
+                if not needs_captcha:
+                    # 按配置本不该带码，但上游明确要码 → 下一趟补码
+                    needs_captcha = True
+                    logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），补码重试")
+                else:
+                    logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                 continue  # 同账号重建请求重试
 
             # 风控（3012「unusual activity」/ 405）：指数退避冷却自动恢复，累计
             # RISK_BAN_STRIKES 次升级禁用（人工恢复）。不立即重试（避免对风控
             # 账号持续施压）；冷却期零上游流量（is_cooling 全通道门禁）。
             if _is_risk_control(status_code, text):
+                # 405 一律按风控计（RISK_CONTROL_HTTP_STATUSES），所以必须把上游
+                # body 留一段在日志里——否则分不清是 3012 标记、验证码挑战还是
+                # WAF/签名拒绝，strikes 花完了仍不知道上游在拒什么。
+                snippet = " ".join(text.split())[:200]
                 account.record_result(False, f"风控 HTTP {status_code}（3012/unusual activity）")
                 account.risk_penalty(
                     settings.RISK_COOLDOWN_BASE, settings.RISK_COOLDOWN_MAX,
@@ -628,17 +650,19 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                     )
                     penalty_note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
                 store.update_account(account)
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     logs.warn(
                         req_id,
-                        f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切 API Key 回退",
+                        f"账号 {account.name} 命中风控 HTTP {status_code}（出口={captcha_egress}），"
+                        f"{penalty_note}，切 API Key 回退；上游body={snippet!r}",
                     )
                     needs_captcha = False
                     force_fallback = True
                     continue
                 logs.warn(
                     req_id,
-                    f"账号 {account.name} 命中风控 HTTP {status_code}，{penalty_note}，切换下一个",
+                    f"账号 {account.name} 命中风控 HTTP {status_code}（出口={captcha_egress}），"
+                    f"{penalty_note}，切换下一个；上游body={snippet!r}",
                 )
                 return _NEXT_ACCOUNT
 
@@ -655,7 +679,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
             if status_code == 401:
                 account.record_result(False, "鉴权失败 HTTP 401")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切 API Key 回退")
                     needs_captcha = False
                     force_fallback = True
@@ -667,7 +691,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
                 account.record_result(False, "鉴权失败 HTTP 403")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切 API Key 回退")
                     needs_captcha = False
                     force_fallback = True
@@ -682,7 +706,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                 if "1113" in text or "insufficient balance" in text.lower():
                     account.record_result(False, "429 1113 无余额（Key 无资源包，永久态）")
                     logs.warn(req_id, f"账号 {account.name} 429 为 1113 无余额，跳过等待重试")
-                    if needs_captcha and account.has_apikey_fallback():
+                    if plan_channel and not force_fallback and account.has_apikey_fallback():
                         needs_captcha = False
                         force_fallback = True
                         retries_429 = 0
@@ -705,7 +729,7 @@ async def _try_account(req_id, account, body, incoming_headers, port, needs_capt
                         logs.warn(req_id, f"账号 {account.name} 429 等待后并发已满，切换下一个")
                         return _NEXT_ACCOUNT
                     continue
-                if needs_captcha and account.has_apikey_fallback():
+                if plan_channel and not force_fallback and account.has_apikey_fallback():
                     account.record_result(False, "Plan 通道 429 耗尽，切 API Key 回退")
                     logs.warn(req_id, f"账号 {account.name} Plan 通道 429 耗尽，切 API Key 回退")
                     needs_captcha = False

@@ -19,7 +19,7 @@ import time
 
 import httpx
 
-from . import constants, logs, settings
+from . import constants, egress, logs, settings
 from .captcha import captcha_manager
 from .models import Account, Status
 
@@ -403,8 +403,12 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
         raise ClaimError(blocked)
 
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
-    verify_param, verify_region = await captcha_manager.get_verify_param()
-    config = await captcha_manager.fetch_config()
+    # claim 的 billing 请求走 trust_env=False 直连，验证码必须同样直连解，
+    # 否则 token 的出口与请求出口不一致，上游判 unusual activity。
+    verify_param, verify_region = await captcha_manager.get_verify_param(
+        egress_tag=egress.DIRECT
+    )
+    config = await captcha_manager.fetch_config(egress.DIRECT)
     headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
 
     body = await _billing_request(
@@ -415,7 +419,7 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     if code == 0:
         return _claim_outcome(body, plan_id, plan_name, grants)
     if code == 3007:
-        captcha_manager.invalidate()  # 被拒的码出池，避免下轮复用
+        captcha_manager.invalidate(egress.DIRECT)  # 被拒的码出池，避免下轮复用
     raise _fail_error(code, body)
 
 

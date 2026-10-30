@@ -20,7 +20,7 @@ import pytest_asyncio
 import uvicorn
 from httpx import ASGITransport, AsyncClient
 
-from app import settings
+from app import constants, settings
 from tests.mock_upstream import server as mock_server_module
 
 # 开发机常驻系统代理（如 Clash 监听 127.0.0.1:7897）时，httpx 默认 trust_env=True
@@ -92,11 +92,24 @@ class _StubCaptcha:
 
     def __init__(self) -> None:
         self.invalidated = 0
+        self.solve_count = 0
+        self.last_egress: str | None = None
+        # 线上配置默认「模型请求也要验证码」；测试可置 False 覆盖
+        self.needs_captcha = True
+        self.config = dict(constants.CAPTCHA_DEFAULTS)
 
-    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+    async def fetch_config(self, egress_tag: str | None = None) -> dict:
+        return dict(self.config)
+
+    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+        return self.needs_captcha
+
+    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+        self.solve_count += 1
+        self.last_egress = egress_tag
         return "mock-verify-param", None
 
-    def invalidate(self) -> None:
+    def invalidate(self, tag: str | None = None) -> None:
         self.invalidated += 1
 
 

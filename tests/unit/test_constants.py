@@ -51,6 +51,8 @@ def test_captcha_defaults_match_zcode2api():
     # 实测线上 captcha region=cn（非 zcode2api 的 sgp 兜底），以线上为准
     assert constants.CAPTCHA_DEFAULTS == {
         "enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd",
+        # 兜底按「模型请求要验证码」处理（官方无该配置时即此语义）
+        "skip_model_request": False,
     }
 
 

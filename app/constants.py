@@ -72,7 +72,14 @@ ACTIVATION_ELEMENTS = ("app_launch", "app_daily_active")
 ACTIVATION_SCREEN_RESOLUTION = "2560x1440"
 
 # ── 验证码默认配置（client/configs 拉取失败时的兜底；region 实测线上为 cn）────
-CAPTCHA_DEFAULTS = {"enabled": True, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
+# skip_model_request 缺省 False：官方无配置时按「模型请求也要验证码」处理
+CAPTCHA_DEFAULTS = {
+    "enabled": True,
+    "prefix": "no8xfe",
+    "region": "cn",
+    "sceneId": "11xygtvd",
+    "skip_model_request": False,
+}
 
 # ── 模型名 ───────────────────────────────────────────────────────────────────
 # Z.AI 上游模型名大小写敏感；客户端传小写别名时映射到官方名（gateway.MODEL_NAME_MAP）
