@@ -395,6 +395,45 @@ async def _dispatch(req_id, body, incoming_headers, provider):
     )
 
 
+def _business_error_code(data: dict) -> int | None:
+    """HTTP 200 承载的业务错误码（Plan 通道实测形态 `{"code":1005,"msg":...}`）。
+
+    合法 messages 响应一定带 `type`/`content`/`usage`，绝不会只有 code/msg，
+    因此「无 message 形状 + code 非 0/200」可安全判定为业务错误；反过来，
+    带 type/content 的响应一律不判错，避免误杀正常响应。
+    """
+    if "type" in data or "content" in data:
+        return None
+    code = data.get("code")
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    return None if code in (0, 200) else code
+
+
+def _status_for_business_code(code: int) -> int:
+    """业务码 → 等价 HTTP 状态（复用下方已有的错误分支，不另起一套处置）。
+
+    3012 → 405（风控，`RISK_CONTROL_HTTP_STATUSES`）；1005 额度类 → 402
+    （`EXHAUST_HTTP_STATUSES`）；其余按 400 业务拒绝原样回传。
+    """
+    if code == 3012:
+        return 405
+    if code in (1005, 1113):
+        return 402
+    return 400
+
+
+def _buffered_response(resp: httpx.Response, raw: bytes) -> httpx.Response:
+    """把已读净的正文包成内存响应，供下游按原语义消费。
+
+    去掉 content-encoding/content-length/transfer-encoding：正文已是解码后的
+    字节，保留这些头会让下游再解一次（httpx 对内存响应仍会解 content-encoding）。
+    """
+    drop = ("content-encoding", "content-length", "transfer-encoding")
+    headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in drop]
+    return httpx.Response(resp.status_code, headers=headers, content=raw)
+
+
 def _release_slot(account_id: str) -> None:
     n = _inflight.get(account_id, 0) - 1
     if n <= 0:
@@ -459,7 +498,7 @@ class _Upstream:
 
     __slots__ = ("resp", "cm", "client", "t_first", "account_name", "mode", "on_close", "_closed")
 
-    def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient,
+    def __init__(self, resp: httpx.Response, cm, client: httpx.AsyncClient | None,
                  t_first: float | None = None, account_name: str = "", mode: str = "",
                  on_close=None) -> None:
         self.resp = resp
@@ -472,12 +511,18 @@ class _Upstream:
         self._closed = False
 
     async def close(self) -> None:
-        """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。"""
+        """幂等关闭：释放上游流与并发槽位（on_close），重复调用安全。
+
+        cm/client 可能为 None（200 业务错误的正文已读净并包成内存响应），
+        只释放仍然存在的部分。
+        """
         if self._closed:
             return
         self._closed = True
-        await self.cm.__aexit__(None, None, None)
-        await self.client.aclose()
+        if self.cm is not None:
+            await self.cm.__aexit__(None, None, None)
+        if self.client is not None:
+            await self.client.aclose()
         if self.on_close is not None:
             try:
                 self.on_close()
@@ -581,11 +626,38 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             return _NEXT_ACCOUNT
 
         status_code = resp.status_code
+        text: str | None = None
 
-        if status_code >= 400:
-            text = (await resp.aread()).decode("utf-8", "ignore")
+        # 200 承载业务错误：Plan 通道对额度/风控类拒绝直接回 HTTP 200 +
+        # {"code":1005|3012,"msg":...}（2026-10-30 实测，content-type application/json）。
+        # 不识别有两个后果：① 当成成功洗掉 risk_strikes / 冷却 / last_error，把仍在
+        # 标记期的账号拉回 ACTIVE（「冷却期零上游流量」不变量被绕开）；② 错误体当正文
+        # 透传，客户端拿到「200 但没有 message」。JSON 正文一次读净：合法响应改走内存
+        # 流（下游消费逻辑不变），业务错误码映射成等价 HTTP 状态走下面统一分支。
+        if status_code < 400 and resp.headers.get("content-type", "").startswith("application/json"):
+            raw = await resp.aread()
             await cm.__aexit__(None, None, None)
             await client.aclose()
+            cm = client = None  # 已关闭，_Upstream.close 容忍 None
+            decoded = raw.decode("utf-8", "ignore")
+            data = _safe_json(decoded)
+            code = _business_error_code(data) if isinstance(data, dict) else None
+            if code is None:
+                resp = _buffered_response(resp, raw)
+            else:
+                text = decoded
+                status_code = _status_for_business_code(code)
+                logs.warn(
+                    req_id,
+                    f"账号 {account.name} HTTP 200 承载业务错误 code={code}"
+                    f"（按 {status_code} 处置）：{' '.join(text.split())[:160]}",
+                )
+
+        if status_code >= 400:
+            if text is None:
+                text = (await resp.aread()).decode("utf-8", "ignore")
+                await cm.__aexit__(None, None, None)
+                await client.aclose()
 
             # 验证码挑战：三形态任一命中即清池重试（不改账号状态）。Plan 通道上
             # 即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。

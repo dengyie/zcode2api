@@ -232,6 +232,15 @@ def build_app() -> FastAPI:
         if scenario == "risk_control_3012":
             # 2026-09-05 实测形态：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
             return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+        if scenario == "quota_exhausted_200":
+            # 2026-10-30 实测形态：Plan 通道对额度拒绝回 **HTTP 200** +
+            # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
+            return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
+        if scenario == "risk_control_3012_200":
+            # 同形：风控拒绝也用 200 承载，最危险——当成功处理会洗掉 strikes
+            return 200, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+        if scenario == "business_error_200_unknown":
+            return 200, {"code": 3006, "msg": "model not allowed"}, {}
         if scenario == "server_error":
             return 500, {"error": "internal"}, {}
         if scenario == "not_found":
