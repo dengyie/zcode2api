@@ -191,9 +191,9 @@ async def fetch_quota(account: Account) -> dict:
                     # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者
                     for k in ("total", "used", "remaining"):
                         prev[k] = (prev.get(k) or 0) + (window.get(k) or 0)
-                    # expires_at 保留**更晚**的那个。上游给的是 ISO8601 字符串，
-                    # 直接 max() 会按字典序/混型比较（str 与 None 甚至 TypeError），
-                    # 必须先归一成 epoch 再挑。
+                    # expires_at 保留**更晚**的那个。该字段线上是 epoch 秒、
+                    # 快照里也出现过 ISO8601 字符串，直接 max() 会按字典序比
+                    # （str 与 int 混型甚至 TypeError），必须先归一成 epoch 再挑。
                     prev_end = expires_epoch(prev.get("expires_at"))
                     new_end = expires_epoch(window.get("expires_at"))
                     if new_end is not None and (prev_end is None or new_end > prev_end):

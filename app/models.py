@@ -23,10 +23,11 @@ class Status:
 def expires_epoch(value) -> float | None:
     """把上游 `expires_at` 归一成 epoch 秒。
 
-    实测（2026-10-31 线上 balance）：字段是 **ISO8601 字符串**
-    `"2026-01-01T00:00:00Z"`，不是数字——直接拿它和 `time.time()` 比会抛
-    TypeError，这也正是「过期从未被判过」的物理原因。兼容：ISO8601（带 Z /
-    偏移 / 无时区按 UTC / 纯日期）、epoch 秒、epoch 毫秒、空值。
+    两种形态都出现过：线上 accounts.db 里是 **epoch 秒**（如 1793375999），
+    mock 与部分快照里是 **ISO8601 字符串**（`"2026-01-01T00:00:00Z"`）。原实现
+    从不解析该字段（只看 remaining），所以「过期」从未被判过；写入归一函数后
+    两种形态都能安全比较。兼容：epoch 秒、epoch 毫秒、ISO8601（带 Z / 偏移 /
+    无时区按 UTC / 纯日期）、空值。
     """
     if value is None or isinstance(value, bool):
         return None
