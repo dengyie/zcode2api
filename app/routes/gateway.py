@@ -15,7 +15,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, egress, logs, reqlog, settings
+from .. import business_error, constants, egress, logs, reqlog, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
@@ -49,8 +49,13 @@ def _normalize_body(body: dict) -> dict:
     if isinstance(model, str) and "/" in model:
         model = "/".join(model.split("/")[1:])
     if isinstance(model, str):
-        model = MODEL_NAME_MAP.get(model.lower(), model)
-        body["model"] = model
+        # 先按大小写别名改写，再兜底「已退役型号」→ 当前主力型号。上游对退役名
+        # 一律 3006（model not allowed），原样透传只会让客户端拿必然失败的结果。
+        mapped = MODEL_NAME_MAP.get(model.lower(), model)
+        mapped = constants.RETIRED_MODEL_ALIASES.get(mapped, mapped)
+        if mapped != model:
+            logs.warn("gateway", f"模型 {model} → {mapped}（别名/退役型号改写）")
+            body["model"] = mapped
 
     # 上游对 max_tokens 有硬校验（400 code 1210），钳制到合法区间并记录钳制动作
     raw = body.get("max_tokens")
@@ -117,6 +122,10 @@ def _is_exhausted(status_code: int, text: str) -> bool:
     if status_code == 429:
         return False
     if status_code in constants.EXHAUST_HTTP_STATUSES:
+        return True
+    # 业务码优先：Plan 通道 1005/1113 实测形态 {"code":1005,"msg":"exceed quota limit"}
+    data = _safe_json(text)
+    if isinstance(data, dict) and data.get("code") in constants.EXHAUST_BUSINESS_CODES:
         return True
     low = text.lower()
     return any(k in low for k in _EXHAUST_KEYWORDS)
@@ -398,28 +407,21 @@ async def _dispatch(req_id, body, incoming_headers, provider):
 def _business_error_code(data: dict) -> int | None:
     """HTTP 200 承载的业务错误码（Plan 通道实测形态 `{"code":1005,"msg":...}`）。
 
-    合法 messages 响应一定带 `type`/`content`/`usage`，绝不会只有 code/msg，
-    因此「无 message 形状 + code 非 0/200」可安全判定为业务错误；反过来，
-    带 type/content 的响应一律不判错，避免误杀正常响应。
+    实现在 `app.business_error`（gateway / quota 共用一份判定，避免两处漂移）。
     """
-    if "type" in data or "content" in data:
-        return None
-    code = data.get("code")
-    if isinstance(code, bool) or not isinstance(code, int):
-        return None
-    return None if code in (0, 200) else code
+    return business_error.business_code(data)
 
 
 def _status_for_business_code(code: int) -> int:
     """业务码 → 等价 HTTP 状态（复用下方已有的错误分支，不另起一套处置）。
 
-    3012 → 405（风控，`RISK_CONTROL_HTTP_STATUSES`）；1005 额度类 → 402
-    （`EXHAUST_HTTP_STATUSES`）；其余按 400 业务拒绝原样回传。
+    这里**不写死映射表**：风控码与额度码都取自 constants，改常量即同步生效，
+    不会出现「常量加了 1113、映射忘了」这类静默漂移（单测把两边对齐钉住）。
     """
-    if code == 3012:
-        return 405
-    if code in (1005, 1113):
-        return 402
+    if code == constants.RISK_BUSINESS_CODE:
+        return constants.RISK_CONTROL_HTTP_STATUSES[0]
+    if code in constants.EXHAUST_BUSINESS_CODES:
+        return constants.EXHAUST_HTTP_STATUSES[0]
     return 400
 
 

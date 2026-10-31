@@ -23,12 +23,14 @@ from app.routes.gateway import (
 # ── 模型归一化 ────────────────────────────────────────────────────────────────
 class TestNormalizeBody:
     def test_lowercase_alias_mapped(self):
+        # glm-5.2 是**已退役**型号（上游 3006），别名表直接改写到 GLM-5.3
         body = {"model": "glm-5.2"}
-        assert _normalize_body(body)["model"] == "GLM-5.2"
+        assert _normalize_body(body)["model"] == "GLM-5.3"
 
     def test_provider_prefix_stripped(self):
+        # 前缀剥离后仍是退役型号 → 再改写到 GLM-5.3（两层改写都覆盖）
         body = {"model": "bigmodel/GLM-5.2"}
-        assert _normalize_body(body)["model"] == "bigmodel/GLM-5.2".split("/")[-1]
+        assert _normalize_body(body)["model"] == "GLM-5.3"
 
     def test_unknown_model_passed_through(self):
         body = {"model": "glm-unknown"}

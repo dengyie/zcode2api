@@ -5,6 +5,7 @@ from __future__ import annotations
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 
 PROVIDERS = ("zai", "bigmodel")
 
@@ -17,6 +18,64 @@ class Status:
     COOLING = "cooling"      # 临时限流（冷却中）
     INVALID = "invalid"      # 凭证失效 / 鉴权失败
     DISABLED = "disabled"    # 手动禁用
+
+
+def expires_epoch(value) -> float | None:
+    """把上游 `expires_at` 归一成 epoch 秒。
+
+    实测（2026-10-31 线上 balance）：字段是 **ISO8601 字符串**
+    `"2026-01-01T00:00:00Z"`，不是数字——直接拿它和 `time.time()` 比会抛
+    TypeError，这也正是「过期从未被判过」的物理原因。兼容：ISO8601（带 Z /
+    偏移 / 无时区按 UTC / 纯日期）、epoch 秒、epoch 毫秒、空值。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number <= 0:
+            return None
+        return number / 1000.0 if number > 1e11 else number  # 毫秒时间戳
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        pass
+    else:
+        return number / 1000.0 if number > 1e11 else number
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def window_usable(window: dict, now: float) -> bool:
+    """额度窗口是否还有效：剩余 > 0 **且**未过期。
+
+    `remaining` 缺失视为「未知但有量」（上游有的窗口只给 total/used）；
+    `expires_at` 缺失/无法解析视为不过期（一次性/永久池）。
+    """
+    if not isinstance(window, dict) or not window:
+        return False
+    remaining = window.get("remaining")
+    if remaining is not None and (remaining or 0) <= 0:
+        return False
+    expires_at = expires_epoch(window.get("expires_at"))
+    return expires_at is None or expires_at > now
+
+
+def window_expired(window: dict, now: float) -> bool:
+    """窗口是否已过有效期（只看 expires_at；无/不可解析 = 不过期）。"""
+    if not isinstance(window, dict):
+        return False
+    expires_at = expires_epoch(window.get("expires_at"))
+    return expires_at is not None and expires_at <= now
 
 
 def _account_id(name: str) -> str:
@@ -127,6 +186,22 @@ class Account:
         """是否允许打 billing 全家桶（preview/claim/current/balance/usage）。"""
         return self.uses_plan_channel() and not self.is_cooling(now)
 
+    def quota_expired(self, now: float | None = None) -> bool:
+        """权益是否已全部失效（每个额度窗口都「过期」或「剩余为 0」）。
+
+        2026-10-31 线上实证：老号 `GLM-5.3-Flash` 本地记录 `remaining=1e8` 但
+        `expires_at=10-03`（28 天前），上游一律回 `{"code":1005,"msg":"exceed
+        quota limit"}` —— 只看 remaining 会把过期窗口当可用，等于让每个请求都
+        先撞一次必然失败的 1005。
+
+        口径：`quota` 为空 = **未知**（新号/尚未刷新），不判过期，否则会把可用
+        账号挡在门外；只有取到记录且**每一个**窗口都不可用时才判 True。
+        """
+        if not self.quota:
+            return False
+        now = now or time.time()
+        return not any(window_usable(w, now) for w in self.quota.values())
+
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
         """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。
 
@@ -141,13 +216,18 @@ class Account:
 
         JWT 失效 / 风控禁用后，若同账号有 API Key，仍可选中并走回退通道；
         手动 enabled=False 永远不选。
+
+        额度快照已判「全部窗口过期/为零」时也不选：这类账号本地看着有余额、
+        上游只会回 1005，选中它等于每次请求都先烧一次必然失败的调用（且会
+        挤掉真正可用的账号的轮询位）。额度未知（空快照）不在此列。
         """
         if not self.enabled:
             return False
-        if self.status == Status.EXHAUSTED:
-            return False
         if self.status in (Status.INVALID, Status.DISABLED):
+            # 回退通道（api.z.ai + API Key）花的是 Key 自己的额度，与套餐快照无关
             return self.has_apikey_fallback()
+        if self.status == Status.EXHAUSTED or self.quota_expired(now):
+            return False
         if self.status == Status.COOLING:
             now = now or time.time()
             return bool(self.cooling_until and now >= self.cooling_until)

@@ -12,8 +12,8 @@ import uuid
 
 import httpx
 
-from . import constants, logs, settings
-from .models import Account, Status
+from . import business_error, constants, logs, settings
+from .models import Account, Status, expires_epoch, window_expired, window_usable
 from .store import store
 
 _DEVICE_MID: str | None = None
@@ -149,14 +149,23 @@ async def fetch_quota(account: Account) -> dict:
             store.update_account(account)
             return {"error": account.last_error}
 
+    # HTTP 200 承载的业务错误（Plan 通道实测：额度/风控类拒绝常是 200 +
+    # {"code":1005,...}）。三条 billing 请求各自判：命中业务错误的**不得写库**，
+    # 否则会把 quota 快照 / plans 洗空，看起来像「上游没投放、额度未知」。
+    errors: dict[str, int] = {}
+
     if billing_res is not None and billing_res.status_code == 200:
         try:
             data = billing_res.json()
             result["billing"] = data
-            plans = (data.get("data") or {}).get("plans") or []
-            # 全量保留（多套餐时 entitlements 不丢）；plan 兼容保留首个
-            account.plans = plans
-            account.plan = plans[0] if plans else {}
+            code = business_error.business_code(data)
+            if code is not None:
+                errors["current"] = code
+            else:
+                plans = (data.get("data") or {}).get("plans") or []
+                # 全量保留（多套餐时 entitlements 不丢）；plan 兼容保留首个
+                account.plans = plans
+                account.plan = plans[0] if plans else {}
         except (ValueError, KeyError):
             pass
 
@@ -165,7 +174,11 @@ async def fetch_quota(account: Account) -> dict:
         try:
             data = balance_res.json()
             result["balance"] = data
-            for bal in (data.get("data") or {}).get("balances") or []:
+            code = business_error.business_code(data)
+            if code is not None:
+                errors["balance"] = code
+            for bal in [b for b in (data.get("data") or {}).get("balances") or []
+                        if code is None]:
                 name = bal.get("show_name") or bal.get("model") or "model"
                 window = {
                     "total": bal.get("total_units"),
@@ -178,7 +191,13 @@ async def fetch_quota(account: Account) -> dict:
                     # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者
                     for k in ("total", "used", "remaining"):
                         prev[k] = (prev.get(k) or 0) + (window.get(k) or 0)
-                    prev["expires_at"] = max(prev.get("expires_at") or 0, window.get("expires_at") or 0)
+                    # expires_at 保留**更晚**的那个。上游给的是 ISO8601 字符串，
+                    # 直接 max() 会按字典序/混型比较（str 与 None 甚至 TypeError），
+                    # 必须先归一成 epoch 再挑。
+                    prev_end = expires_epoch(prev.get("expires_at"))
+                    new_end = expires_epoch(window.get("expires_at"))
+                    if new_end is not None and (prev_end is None or new_end > prev_end):
+                        prev["expires_at"] = window.get("expires_at")
                     logs.warn("quota", f"balance 同名窗口 {name} 已合并")
                 else:
                     quota_map[name] = window
@@ -187,27 +206,33 @@ async def fetch_quota(account: Account) -> dict:
 
     if usage_res is not None and usage_res.status_code == 200:
         try:
-            account.usage = usage_res.json().get("data") or {}
-            result["usage"] = account.usage
+            data = usage_res.json()
+            code = business_error.business_code(data)
+            if code is not None:
+                errors["usage"] = code
+            else:
+                account.usage = data.get("data") or {}
+                result["usage"] = account.usage
         except (ValueError, KeyError):
             pass
 
     if quota_map:
         account.quota = quota_map
-        # 额度耗尽判定：所有日窗口剩余 <= 0。注意 balance 不含一次性赠送池——
-        # 赠送池有效时不判耗尽，否则账号会被路由跳过而实际仍有 3 亿级可用额度
+        # 额度耗尽判定：逐窗口算「有效余量」（remaining > 0 且未过期）。
+        # 原实现只看 remaining <= 0，把**已过期窗口**当可用 —— 2026-10-31 实证：
+        # 老号 GLM-5.3-Flash 本地 remaining=1e8、expires_at 在 28 天前，上游对
+        # 每个 messages 一律回 {"code":1005}。只看余额会让这类号长期占着轮询位。
+        # 注意 balance 不含一次性赠送池：赠送池有效时不判耗尽。
         now = time.time()
-        remainings = [
-            q.get("remaining") for q in quota_map.values() if q.get("remaining") is not None
-        ]
-        daily_exhausted = bool(remainings) and all((r or 0) <= 0 for r in remainings)
+        usable = [w for w in quota_map.values() if window_usable(w, now)]
+        all_expired = all(window_expired(w, now) for w in quota_map.values())
         has_bonus = _bonus_active(account.plan, now) or any(
             _bonus_active(p, now) for p in account.plans
         )
-        has_daily = bool(remainings) and any((r or 0) > 0 for r in remainings)
-        if daily_exhausted and not has_bonus:
+        has_daily = bool(usable)
+        if not has_daily and not has_bonus:
             account.status = Status.EXHAUSTED
-            account.last_error = "额度已用完"
+            account.last_error = "额度已过期" if all_expired else "额度已用完"
         elif account.status in (Status.EXHAUSTED, Status.COOLING) and (
             has_daily or has_bonus
         ):
@@ -217,8 +242,19 @@ async def fetch_quota(account: Account) -> dict:
                 account.status = Status.ACTIVE
                 account.last_error = None
                 account.cooling_until = None
+    elif any(business_error.is_quota_error(c) for c in errors.values()):
+        # 拿不到任何窗口、上游又明确回了额度码 → 就是没额度（不是「数据缺失」）
+        account.status = Status.EXHAUSTED
+        account.last_error = "额度已用完"
 
     store.update_account(account)
+    # 「三路全业务错误」才整体报失败（调用方据此区分「上游拒绝」与「上游确实
+    # 什么都没有」）。一路成功就照常返回，错误只记日志——避免把「部分可用」
+    # 误报成刷新失败。
+    if errors and "current" in errors and not quota_map and "usage" not in result:
+        detail = "，".join(f"{k}=code{v}" for k, v in errors.items())
+        logs.warn("quota", f"账号 {account.name} billing 全业务错误（{detail}）")
+        return {"error": f"上游业务错误（{detail}）"}
     return result or {"error": "无法获取额度数据"}
 
 

@@ -265,6 +265,10 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        # billing_quota_200：Plan 通道真实形态——HTTP 200 + {"code":1005}
+        if _scenario_for(headers, _bind_key(headers)) in ("billing_quota_200", "billing_all_quota_200"):
+            return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
         return Response(json.dumps({
             "data": {"plans": [{
                 "plan_id": "start", "show_name": "Start Plan",
@@ -279,19 +283,33 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        # balance_expired：本地仍有余额、但窗口早已过期（2026-10-31 线上真实形态，
+        # 上游对这类请求一律 200+{"code":1005}）
+        scenario = _scenario_for(headers, _bind_key(headers))
+        if scenario == "billing_all_quota_200":
+            return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
+        if scenario == "balance_expired":
+            expires_at = "2026-01-01T00:00:00Z"
+        else:
+            expires_at = "2099-01-01T00:00:00Z"
         return Response(json.dumps({
             "data": {"balances": [
                 {"model": "GLM-5.3", "show_name": "GLM-5.3",
                  "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000,
-                 "expires_at": "2099-01-01T00:00:00Z"},
+                 "expires_at": expires_at},
                 {"model": "GLM-5-Turbo", "show_name": "GLM-5-Turbo",
                  "total_units": 2000000, "used_units": 2000000, "remaining_units": 0,
-                 "expires_at": "2099-01-01T00:00:00Z"},
+                 "expires_at": expires_at},
             ]},
         }), media_type="application/json")
 
     async def _usage(request: Request) -> Response:
-        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        if _scenario_for(headers, _bind_key(headers)) == "billing_all_quota_200":
+            return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
         return Response(json.dumps({"data": {"requests": 42}}), media_type="application/json")
 
     async def _client_configs(request: Request) -> Response:

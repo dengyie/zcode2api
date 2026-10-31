@@ -83,17 +83,28 @@ CAPTCHA_DEFAULTS = {
 
 # ── 模型名 ───────────────────────────────────────────────────────────────────
 # Z.AI 上游模型名大小写敏感；客户端传小写别名时映射到官方名（gateway.MODEL_NAME_MAP）
+#
+# 2026-10-30 实测：套餐只放行 GLM-5.3 系，GLM-5.2 / GLM-5-Turbo / GLM-5.1 / GLM-4.7
+# 一律 400 code 3006「model not allowed」——它们是**已退役别名**，不是拼写别名。
+# 老客户端（Claude Code 配置、第三方 SDK 默认 GLM-5.2）会固定带这些名字，若原样
+# 透传，客户端拿到的是上游 3006 而网关没有任何可用模型，等于「用一个合规请求换一个
+# 必然失败的响应」。因此退役名统一改写到当前主力型号（GLM-5.3），保留大小写别名。
+RETIRED_MODEL_ALIASES = {
+    "GLM-5.2": "GLM-5.3",
+    "GLM-5-Turbo": "GLM-5.3",
+    "GLM-5.1": "GLM-5.3",
+    "GLM-4.7": "GLM-5.3",
+}
 MODEL_NAME_MAP = {
     "glm-5.3-flash": "GLM-5.3-Flash",
     "glm-5.3": "GLM-5.3",
-    "glm-5.2": "GLM-5.2",
-    "glm-5-turbo": "GLM-5-Turbo",
-    "glm-turbo": "GLM-5-Turbo",
-    "glm-5.1": "GLM-5.1",
-    "glm-4.7": "GLM-4.7",
+    "glm-5.2": "GLM-5.3",
+    "glm-5-turbo": "GLM-5.3",
+    "glm-turbo": "GLM-5.3",
+    "glm-5.1": "GLM-5.3",
+    "glm-4.7": "GLM-5.3",
 }
-# /v1/models 对外公布（2026-09-05 实测：当前账号套餐不含 GLM-5.2/5-Turbo，
-# 上游 3006 model not allowed；按账号实际余额窗口公布）
+# /v1/models 对外公布（按账号套餐实际窗口：2026-10-30 实测只有 5.3 系可用）
 AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
 
 # 上游 max_tokens 合法范围（2026-09-06 实测：超限报 400 code 1210
@@ -128,7 +139,16 @@ IDENTITY_OS_VERSION = "25.6.0"
 
 # ── 上游被拒信号 → 账号动作（gateway / quota 判定共用）────────────────────────
 EXHAUST_HTTP_STATUSES = (402,)
-EXHAUST_KEYWORDS = ("quota", "insufficient", "balance", "exhaust", "额度", "余额不足")
+# 额度耗尽信号。2026-10-31 复盘：原实现是**裸子串**匹配 "quota"，任何含该词的
+# 文案（含风控/验证码页）都会被判成「额度用完」而把号踢成 EXHAUSTED——比漏判更糟。
+# 改为 ① 业务码（Plan 通道 {"code":1005,"msg":"exceed quota limit"} 实测形态）
+#      ② 定量短语（完整词 + 明确的无额度语义），不再用裸词。
+EXHAUST_BUSINESS_CODES = (1005, 1113)   # 1005 exceed quota limit / 1113 无余额
+EXHAUST_KEYWORDS = (
+    "exceed quota", "quota limit", "quota exceeded", "quota exhausted",
+    "insufficient balance", "insufficient quota", "no balance",
+    "额度已用完", "额度用完", "额度不足", "余额不足", "余额已用完", "无余额",
+)
 # 验证码挑战：HTTP 403 + 文案，或 HTTP 400 + body {"code":3007}（docs 05 §被拒信号表）
 # 注意：403 不再无条件判 invalid —— 需先排除验证码挑战（captcha/verify 文案或
 # challenge 头），否则一次人机校验续期就把账号错杀成 INVALID（对齐 zapi
@@ -140,6 +160,7 @@ CAPTCHA_BODY_MARKERS = ('"code":3007', '"code": 3007')
 # 高频请求触发，官方政策定性为临时限制（限流/冻结，3 次以上违规才封号）。
 # 处置：账号指数退避冷却 + 暂停验证码池预热（池预热本身即上游流量，会加剧风控）。
 RISK_CONTROL_HTTP_STATUSES = (405,)
+RISK_BUSINESS_CODE = 3012
 RISK_CONTROL_MARKERS = (
     '"code":3012', '"code": 3012',
     "unusual activity",

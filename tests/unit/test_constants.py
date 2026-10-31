@@ -58,15 +58,33 @@ def test_captcha_defaults_match_zcode2api():
 
 def test_model_map():
     assert constants.MODEL_NAME_MAP["glm-5.3-flash"] == "GLM-5.3-Flash"
-    assert constants.MODEL_NAME_MAP["glm-5.2"] == "GLM-5.2"
-    assert constants.MODEL_NAME_MAP["glm-turbo"] == "GLM-5-Turbo"
     assert constants.AVAILABLE_MODELS == ["GLM-5.3-Flash", "GLM-5.3"]
+
+
+def test_retired_models_rewritten_to_live_model():
+    """退役型号（上游 3006 model not allowed）必须被改写到当前可用型号。
+
+    2026-10-30 实测：套餐只放行 GLM-5.3 系，5.2/Turbo/5.1/4.7 一律 3006。
+    别名表与退役表任一处漏改，客户端就会拿到必然失败的 3006。
+    """
+    retired = {"GLM-5.2", "GLM-5-Turbo", "GLM-5.1", "GLM-4.7"}
+    assert set(constants.RETIRED_MODEL_ALIASES) == retired
+    assert set(constants.RETIRED_MODEL_ALIASES.values()) <= set(constants.AVAILABLE_MODELS)
+    # 小写别名同样不得映射到退役名（否则别名改写会把请求送回 3006）
+    assert set(constants.MODEL_NAME_MAP.values()) <= set(constants.AVAILABLE_MODELS)
+    for lower in ("glm-5.2", "glm-5-turbo", "glm-turbo", "glm-5.1", "glm-4.7"):
+        mapped = constants.MODEL_NAME_MAP[lower]
+        assert mapped == "GLM-5.3", lower
 
 
 def test_rejection_signals():
     assert constants.EXHAUST_HTTP_STATUSES == (402,)
-    assert "余额不足" in constants.EXHAUST_KEYWORDS
-    assert "insufficient" in constants.EXHAUST_KEYWORDS
+    assert 1005 in constants.EXHAUST_BUSINESS_CODES  # Plan 通道 exceed quota limit
+    for word in ("余额不足", "额度不足", "exceed quota", "insufficient balance"):
+        assert any(word in k for k in constants.EXHAUST_KEYWORDS), word
+    # 定量短语而非裸词：裸 "quota" 会把风控/验证码文案误判成额度用完
+    assert "quota" not in constants.EXHAUST_KEYWORDS
+    assert all(len(k) >= 3 for k in constants.EXHAUST_KEYWORDS)
     # 403 不再无条件判 invalid：需先排除验证码挑战（对齐 zapi classifyAccountFailure）
     assert '"code":3007' in constants.CAPTCHA_BODY_MARKERS
 
@@ -106,7 +124,7 @@ def test_gateway_constants():
 def test_risk_control_signals():
     # 2026-09-05 3012 事件锁定：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
     assert constants.RISK_CONTROL_HTTP_STATUSES == (405,)
-    assert '"code":3012' in constants.RISK_CONTROL_MARKERS
+    assert constants.RISK_BUSINESS_CODE == 3012
     assert "unusual activity" in constants.RISK_CONTROL_MARKERS
 
 
