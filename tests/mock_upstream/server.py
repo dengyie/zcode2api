@@ -266,8 +266,13 @@ def build_app() -> FastAPI:
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
         # billing_quota_200：Plan 通道真实形态——HTTP 200 + {"code":1005}
-        if _scenario_for(headers, _bind_key(headers)) in ("billing_quota_200", "billing_all_quota_200"):
+        scenario = _scenario_for(headers, _bind_key(headers))
+        if scenario in ("billing_quota_200", "billing_all_quota_200"):
             return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
+        if scenario == "billing_empty":
+            # 新号形态：200 成功但既没套餐也没窗口（体验额度不在 billing 里表达）
+            return Response(json.dumps({"code": 0, "data": {"plans": []}}),
                             status_code=200, media_type="application/json")
         return Response(json.dumps({
             "data": {"plans": [{
@@ -289,6 +294,9 @@ def build_app() -> FastAPI:
         if scenario == "billing_all_quota_200":
             return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
                             status_code=200, media_type="application/json")
+        if scenario == "billing_empty":
+            return Response(json.dumps({"code": 0, "data": {"balances": []}}),
+                            status_code=200, media_type="application/json")
         if scenario == "balance_expired":
             expires_at = "2026-01-01T00:00:00Z"
         else:
@@ -307,8 +315,12 @@ def build_app() -> FastAPI:
     async def _usage(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
         _record("GET", request.url.path, headers, b"")
-        if _scenario_for(headers, _bind_key(headers)) == "billing_all_quota_200":
+        scenario = _scenario_for(headers, _bind_key(headers))
+        if scenario == "billing_all_quota_200":
             return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
+        if scenario == "billing_empty":
+            return Response(json.dumps({"code": 0, "data": {}}),
                             status_code=200, media_type="application/json")
         return Response(json.dumps({"data": {"requests": 42}}), media_type="application/json")
 

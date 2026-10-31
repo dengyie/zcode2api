@@ -94,10 +94,10 @@ _JWT_ALL_ERR = "allerr01.payload.signature"
 
 
 async def test_all_billing_business_errors_reported_as_failure(gateway_client, fresh_app):
-    """三路 billing 全回 200+1005：必须报 error（不是「成功但没有数据」），并标 EXHAUSTED。
+    """三路 billing 全回 200+1005：必须报 error（不是「成功但没有数据」）。
 
-    旧逻辑三路都只是 `data.get("data") or {}` → 函数返回空 dict → 后台当成刷新
-    成功、账号状态不变，额度耗尽永远发现不了。
+    但**不得据此把号判死**——上游对新号的 billing 支持并不一致（历史实证：空
+    billing 的号仍 100% 成功服务请求），判死会让这类号永远没机会被真实请求验证。
     """
     _client, mock = gateway_client
     acc = seed_account(fresh_app, _JWT_ALL_ERR, name="a-allerr")
@@ -107,5 +107,88 @@ async def test_all_billing_business_errors_reported_as_failure(gateway_client, f
 
     assert "error" in res and "1005" in res["error"]
     after = fresh_app.list_accounts("zai")[0]
-    assert after.status == Status.EXHAUSTED
     assert after.quota == {}  # 不得写入残缺快照
+    assert after.status == Status.ACTIVE  # 但也不得判死：留给真实请求定夺
+    assert after.is_selectable() is True
+
+
+_JWT_EMPTY = "empty001.payload.signature"
+
+
+async def test_new_account_with_empty_billing_still_selectable(gateway_client, fresh_app):
+    """新号形态：billing 三路 200 但全空（体验套餐不在账面表达）。
+
+    旧逻辑：空响应被当「刷新成功但没数据」，账号静默不可用且没有线索。
+    现逻辑：保持可选，`last_error` 明确写出「待首次请求验证」，后台能一眼看出
+    这个号不是坏了、而是还没被上游计费系统登记。
+    """
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_EMPTY, name="a-empty")
+    _bind(mock, _JWT_EMPTY, "billing_empty")
+
+    res = await quota.fetch_quota(acc)
+    assert "error" not in res
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.ACTIVE
+    assert after.is_selectable() is True
+    assert after.quota == {}
+    assert "待首次请求验证" in (after.last_error or "")
+
+
+
+_JWT_TRIAL = "trial001.payload.signature"
+
+
+async def test_new_account_trial_served_end_to_end(gateway_client, fresh_app):
+    """新号端到端：billing 全空 → 仍被选中 → 真实请求成功 → 状态确认可用。
+
+    这是「新号必须有体验套餐」这条产品事实的系统级回归：只用 billing 账本判断
+    会把新号直接判死，而它其实第一个请求就能服务。同时验证成功后「待首次请求
+    验证」提示被清掉（不然后台会一直挂着一条过期告示）。
+    """
+    client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_TRIAL, name="a-trial")
+    _bind(mock, _JWT_TRIAL, "billing_empty")
+
+    await quota.fetch_quota(acc)
+    assert fresh_app.list_accounts("zai")[0].last_error
+
+    res = await client.post("/v1/messages", json={
+        "model": "glm-5.3", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert res.status_code == 200
+    assert res.json()["content"][0]["text"] == "Hello from mock upstream"
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.ACTIVE
+    assert after.use_count == 1
+    assert after.last_error is None
+
+
+_JWT_TRIAL_DEAD = "dead0001.payload.signature"
+
+
+async def test_new_account_without_quota_fails_once_then_exhausted(gateway_client, fresh_app):
+    """反面对照：新号其实没额度 → 一次真实请求后判 EXHAUSTED，不再反复试错。
+
+    「billing 空就放行」必须配这条闸，否则新号会无限撞 1005（每圈一次真实上游
+    调用），而不会自己停下来。
+    """
+    client, mock = gateway_client
+    seed_account(fresh_app, _JWT_TRIAL_DEAD, name="a-trial-dead")
+    mock.state.sequences[_JWT_TRIAL_DEAD[:16]] = ["quota_exhausted_200"]
+    # billing 走同一凭证前缀，同样落到 quota_exhausted_200 之外的分支即可
+    # （billing_* 场景只认 balance_expired/billing_*，quota_exhausted_200 → 默认成功）
+
+    res = await client.post("/v1/messages", json={
+        "model": "glm-5.3", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert res.status_code >= 400  # 网关不再把 1005 当 200 透传
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.use_count == 0
+    assert after.status == Status.EXHAUSTED
+    assert after.is_selectable() is False

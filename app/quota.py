@@ -153,6 +153,7 @@ async def fetch_quota(account: Account) -> dict:
     # {"code":1005,...}）。三条 billing 请求各自判：命中业务错误的**不得写库**，
     # 否则会把 quota 快照 / plans 洗空，看起来像「上游没投放、额度未知」。
     errors: dict[str, int] = {}
+    billing_plans: list | None = None  # 本次 billing/current 实际解析到的 plans
 
     if billing_res is not None and billing_res.status_code == 200:
         try:
@@ -163,6 +164,7 @@ async def fetch_quota(account: Account) -> dict:
                 errors["current"] = code
             else:
                 plans = (data.get("data") or {}).get("plans") or []
+                billing_plans = plans
                 # 全量保留（多套餐时 entitlements 不丢）；plan 兼容保留首个
                 account.plans = plans
                 account.plan = plans[0] if plans else {}
@@ -242,16 +244,30 @@ async def fetch_quota(account: Account) -> dict:
                 account.status = Status.ACTIVE
                 account.last_error = None
                 account.cooling_until = None
-    elif any(business_error.is_quota_error(c) for c in errors.values()):
-        # 拿不到任何窗口、上游又明确回了额度码 → 就是没额度（不是「数据缺失」）
-        account.status = Status.EXHAUSTED
-        account.last_error = "额度已用完"
+    elif errors:
+        # billing 回了业务错误、但没拿到任何窗口：**不据此判死**。
+        # 上游对「体验套餐/新号」的 billing 支持并不一致（老实证：billing 全空
+        # 仍有 100% 可用的试用额度），拿不到账面数据 ≠ 没额度。真正的判定只有
+        # 两处：balance 窗口全部失效（上面分支）、messages 真实回 1005（gateway）。
+        # 这里只留痕，让一次真实请求去定生死——否则新号会被永久挡在门外。
+        detail = "，".join(f"{k}=code{v}" for k, v in errors.items())
+        logs.warn("quota", f"账号 {account.name} billing 业务错误但保留可选（{detail}）")
+
+    # 新号体验额度：上游对新注册账号可能 **billing 全空/全拒**，但 messages 仍能
+    # 正常服务（2026-09-06 实测：空 billing 的 oauth-login 100% 成功服务请求；
+    # 2026-11-01 复核：billing/preview、balance 均空/1005，新号照样有体验套餐）。
+    # 只凭 billing 就判死会把真能用的号挡在门外。这里**只给 ACTIVE 且零成功请求
+    # 的号**一条提示，绝不复活已判死的号——否则「首探 1005 → 判死 → 下次刷新又
+    # 拉活 → 再撞 1005」会无限循环，每圈烧一次真实请求（比误判更贵）。
+    elif not (quota_map or billing_plans or result.get("usage")):
+        if account.use_count == 0 and account.status == Status.ACTIVE:
+            account.last_error = "billing 为空，待首次请求验证（疑似新号体验额度）"
 
     store.update_account(account)
     # 「三路全业务错误」才整体报失败（调用方据此区分「上游拒绝」与「上游确实
     # 什么都没有」）。一路成功就照常返回，错误只记日志——避免把「部分可用」
     # 误报成刷新失败。
-    if errors and "current" in errors and not quota_map and "usage" not in result:
+    if errors and "current" in errors and not quota_map and not result.get("usage"):
         detail = "，".join(f"{k}=code{v}" for k, v in errors.items())
         logs.warn("quota", f"账号 {account.name} billing 全业务错误（{detail}）")
         return {"error": f"上游业务错误（{detail}）"}
