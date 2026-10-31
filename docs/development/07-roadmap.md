@@ -33,7 +33,7 @@ M0 骨架      ──▶ M1 账号运营层(P1) ──▶ M2 网关扩展(P2) �
 - [ ] `translator/`：OpenAI↔Anthropic 请求/响应/usage/tool_calls 映射（对照表先写测试用例）
 - [ ] `gateway/openai.py`：`/v1/chat/completions`（流式 + 批量）
 - [ ] `translator/sse.py`：SSE 逐块双向翻译
-- [ ] `gateway/responses.py`：`/v1/responses` + previous_response_id LRU
+- [x] `gateway/responses.py`：`/v1/responses` + previous_response_id LRU
 - [ ] 网关鉴权接入新端点；模型白名单统一
 
 **出口标准**：Claude Code（Anthropic 透传）、OpenAI SDK（chat/completions 流式+批量）、Codex CLI（/v1/responses）三客户端在 Mock 上游回归全绿，真实上游冒烟各 1 次。

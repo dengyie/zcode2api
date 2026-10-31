@@ -39,6 +39,17 @@
 | INT-030 | 真实 solver 冒烟 | （可选，`@pytest.mark.real_captcha`）真实 jsdom 子进程求解一次 | 输出 verifyParam 结构合法（base64(JSON{certifyId,...})）；默认 CI 跳过 |
 | INT-031 | solver 缺失报错 | 未 npm install → 明确报错指引用，而非悬死 | 用户体验 |
 
+### INT-E Responses 协议（/v1/responses，用例实现 `tests/integration/test_gateway_responses.py`）
+
+| ID | 场景 | 步骤 | 断言 |
+|----|------|------|------|
+| INT-040 | 非流式翻译 | `/v1/responses` 非流式一条（scenario=ok） | 200 且 Responses 对象形状完整（output 数组 / status / usage），文本与 /v1/messages 同源一致 |
+| INT-041 | 流式事件序 | stream=true → Responses SSE | 帧序符合事件序（created → in_progress → … → completed），sequence_number 连续，无 `[DONE]` 哨兵 |
+| INT-042 | previous_response_id 链 | 首请求取 `response_id` → 二次请求携带 → 200 | 第二轮上游请求含首轮上下文；response_store 命中 |
+| INT-043 | previous_response_id 未命中 | 携带不存在的 id | 400 invalid_request（api-spec §1.6 错误表） |
+| INT-044 | 503 全池耗尽 | 全部账号 402（`x-mock-sequence`）→ 请求 /v1/responses | 503 no_available_account，错误格式同 /v1/messages |
+| INT-045 | 401/403 网关鉴权 | 配置网关 key 后缺 key / 错 key | 401/403，行为同 /v1/messages |
+
 ## 2. 故障注入矩阵（Mock 上游 `x-mock-scenario`）
 
 | scenario | 行为 | 主要消费者 |
@@ -67,7 +78,7 @@
 
 | ID | 场景 | 步骤 | 断言 |
 |----|------|------|------|
-| E2E-001 | 三客户端协议 | Claude Code 形态（Anthropic SSE）、OpenAI SDK 形态（chat/completions，Phase 2）、Codex 形态（/v1/responses，Phase 2）各发 1 流式请求 | 三协议均 200 且内容一致（同一 Mock 模型输出） |
+| E2E-001 | 三客户端协议 | Claude Code 形态（Anthropic SSE）、OpenAI SDK 形态（chat/completions）、Codex 形态（/v1/responses，已落地，见 `tests/integration/test_gateway_responses.py`）各发 1 流式请求 | 三协议均 200 且内容一致（同一 Mock 模型输出） |
 | E2E-002 | 额度用尽自动降级 | 种子把号1/号2 置 exhausted → 请求自动走号3 → Mock 记录命中 | 故障转移跨进程 |
 | E2E-003 | 后台操作流 | UI 登录 → 加号 → 看额度面板 → 手动 claim → 导出 .zsb → 清库导入 | 管理面闭环 |
 | E2E-004 | 容器重建恢复 | compose down → up（卷保留）→ 池/设置/历史完好 | 持久化 |

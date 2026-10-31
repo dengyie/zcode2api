@@ -15,13 +15,18 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import constants, logs, reqlog, settings
+from .. import constants, logs, reqlog, response_store, settings
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
 from ..captcha import captcha_manager
 from ..models import Account, Status
 from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
 from ..quota import fetch_quota
+from ..responses_compat import (
+    ResponsesStreamConverter,
+    anthropic_to_responses,
+    responses_to_anthropic,
+)
 from ..store import store
 
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
@@ -317,6 +322,146 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
             reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
                              input_tokens=conv.usage.get("prompt_tokens"),
                              output_tokens=conv.usage.get("completion_tokens"))
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            raise
+        except Exception as err:  # noqa: BLE001
+            logs.req_err(req_id, f"流传输中断: {err}")
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+        finally:
+            await up.close()
+
+    return StreamingResponse(_iter(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_gateway_key)])
+async def responses_api(request: Request):
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}, status_code=400)
+
+    # previous_response_id 预处理：从内存库链入上一轮 input/output 条目，
+    # 合并成完整条目数组后按无状态请求转发（未命中即 400，客户端应重发全量 input）。
+    # 当前请求的 input 无论是否链历史都归一为条目数组——首轮也要入库，
+    # 否则下一轮链入时缺第一轮 user 内容（OpenAI Responses 续接语义即全量重放）。
+    pid = payload.get("previous_response_id")
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        new_items = [{"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": raw_input}]}] if raw_input else []
+    elif isinstance(raw_input, list):
+        new_items = raw_input
+    else:
+        new_items = []
+    store_input_items: list = new_items
+    if pid:
+        st = response_store.get(str(pid))
+        if st is None:
+            return JSONResponse(
+                {"error": {"message": "previous_response_id 未找到或已过期", "type": "invalid_request_error"}},
+                status_code=400,
+            )
+        merged = st["input_items"] + st["output_items"] + new_items
+        payload = {**payload, "input": merged}
+        payload.pop("previous_response_id", None)
+        store_input_items = merged  # 保留引用：成功后原样入库供下一轮续接
+
+    body, err = responses_to_anthropic(payload)
+    if err or body is None:
+        return JSONResponse({"error": {"message": err or "请求体不合法", "type": "invalid_request_error"}}, status_code=400)
+
+    incoming_headers = dict(request.headers)
+    provider = _detect_provider(body, request.headers)
+    body = _normalize_body(body)
+    port = request.url.port or settings.PORT
+
+    req_id = secrets.token_hex(8)
+    logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
+    reqlog.begin(req_id, "responses", str(body.get("model") or "-"),
+                 bool(payload.get("stream")), _last_user_text(body))
+
+    try:
+        result = await _dispatch(req_id, body, incoming_headers, port, provider)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499)
+        raise
+    except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+        reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+        return JSONResponse(
+            {"error": {"message": "网关内部错误", "type": "internal_error"}},
+            status_code=500,
+        )
+    if not isinstance(result, _Upstream):
+        return result
+
+    model = str(body.get("model") or "")
+    if payload.get("stream"):
+        try:
+            return _responses_stream_response(result, model, req_id, store_input_items)
+        except asyncio.CancelledError:
+            await result.close()
+            raise
+
+    try:
+        raw = await result.resp.aread()
+        logs.req_ok(req_id)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=result.t_first)
+        raise
+    except Exception as err:  # noqa: BLE001
+        logs.req_err(req_id, f"读取上游响应失败: {err}")
+        reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502)
+        return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
+    finally:
+        await result.close()
+    data = _safe_json(raw.decode("utf-8", "ignore"))
+    if not isinstance(data, dict) or data.get("type") != "message":
+        reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first)
+        return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
+    usage = data.get("usage") or {}
+    reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
+                     input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+    resp = anthropic_to_responses(data, model)
+    response_store.save(resp["id"], store_input_items, resp["output"])
+    return JSONResponse(resp)
+
+
+def _responses_stream_response(up: _Upstream, model: str, req_id: str,
+                               store_input_items: list) -> StreamingResponse:
+    """把上游 Anthropic SSE 事件流转换为 OpenAI Responses 事件流。
+
+    成功收尾时把历史条目 + 本次 output 入库（response_store），供下一轮
+    previous_response_id 续接；中断路径不入库（半截输出不可安全重放）。
+    """
+    conv = ResponsesStreamConverter(model)
+
+    async def _iter():
+        try:
+            first = conv.start()
+            if first:
+                yield first
+            async for line in up.resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str:
+                    continue
+                evt = _safe_json(data_str)
+                if isinstance(evt, dict):
+                    for out in conv.feed(evt):
+                        yield out
+            tail = conv.done()  # Responses 流无 [DONE] 哨兵，done() 恒为空串
+            if tail:
+                yield tail
+            response_store.save(conv.response_id, store_input_items, conv.output_items)
+            logs.req_ok(req_id)
+            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
+                             input_tokens=conv.usage.get("input_tokens"),
+                             output_tokens=conv.usage.get("output_tokens"))
         except asyncio.CancelledError:
             reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
             raise

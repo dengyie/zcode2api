@@ -1,6 +1,6 @@
 # 04 — API 规范
 
-状态：与 2.5.11 实现对齐。对外网关只有 Anthropic Messages、OpenAI Chat Completions、`/v1/models`；**没有** `/v1/responses`。
+状态：与 2.5.11 实现对齐。对外网关为 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses 三协议网关 + `/v1/models`，均已实现。
 
 所有管理端点挂 `/admin/api/*`，需 `Authorization: Bearer <后台密码>`（连续失败达上限后 429 锁 5 分钟）；网关端点按「网关 Key」配置可选鉴权（`Authorization: Bearer` 或 `x-api-key`，未配置即放行——生产必须配置）。
 
@@ -26,6 +26,30 @@
 - 入站 OpenAI Chat 格式 → 翻译为 Anthropic 上游 → 翻译回 OpenAI 响应；`stream:true` 逐块翻译。
 - usage/tool_calls 映射规则以移植对照表为准（`openai_compat.py`）。
 
+### 1.4 `POST /v1/responses`（OpenAI Responses 协议）
+
+- 入站 OpenAI Responses 格式 → 翻译为 Anthropic 上游（`responses_to_anthropic`）→ 翻译回 Responses 对象（`anthropic_to_responses`）；`stream:true` 经 `ResponsesStreamConverter` 逐事件翻译。翻译器实现见 `app/responses_compat.py`，会话状态见 `app/response_store.py`。
+- 请求字段映射：
+  - `instructions` → `system`；`input` 条目 `message` / `reasoning` / `function_call` / `function_call_output` → Anthropic 对应消息与块（`reasoning` 回放为 thinking，工具调用对 → `tool_use` / `tool_result`）。
+  - `tools` 仅接受 `function` 类型（`web_search` 等其他工具类型跳过）；`tool_choice` 映射同 chat/completions。
+  - `reasoning.effort` → 上游思考档位：`minimal` / `low` → `low`，`high` → `high`，`xhigh` → `max`，`medium`（或缺省）→ 不携带该字段（上游默认档）。
+  - `max_output_tokens` → `max_tokens`；`model` 规范化同 1.1。
+  - 未支持字段（`store` / `include` / `metadata` / `prompt_cache_key` / `text` 等）安静忽略。
+- 会话续接：`previous_response_id` 命中 → 上一轮完整输入输出拼入上游上下文；存储为进程内存 LRU（256 条，重启清零），未命中返回 400。
+- 响应映射：thinking 思考以 `reasoning` 条目（`summary` 内 `summary_text`）回传；`stop_reason=max_tokens` → `status: "incomplete"`，其余 → `"completed"`。
+
+```json
+{ "id": "resp_…", "object": "response", "status": "completed", "model": "GLM-5.3-Flash", "output": [ { "type": "reasoning", "summary": [ { "type": "summary_text", "text": "…" } ] }, { "type": "message", "role": "assistant", "content": [ { "type": "output_text", "text": "…" } ] } ] }
+```
+
+- 流式为 Responses SSE（`event:` + `data:` 帧，帧内含 `sequence_number`），无 `[DONE]` 哨兵，以 `response.completed` 收尾。事件序：
+  - `response.created` → `response.in_progress`
+  - 思考：`response.output_item.added` → `response.reasoning_summary_part.added` → `response.reasoning_summary_text.delta`
+  - 正文：`response.output_item.added` → `response.content_part.added` → `response.output_text.delta` → `response.output_text.done`
+  - 工具：`response.function_call_arguments.delta` → `response.function_call_arguments.done`
+  - 收尾：`response.completed`
+- 网关 Key 鉴权、故障转移与错误处理与 `/v1/messages` 一致（错误格式见 §1.6）。
+
 ### 1.6 错误格式
 
 ```json
@@ -35,6 +59,7 @@
 | HTTP | type | 触发 |
 |------|------|------|
 | 400 | invalid_request / invalid_request_error | JSON 非法，或请求体不是对象 |
+| 400 | invalid_request | `previous_response_id` 未命中（会话 LRU 无该记录） |
 | 401/403 | （FastAPI HTTPException） | 网关 key 缺失/不符 |
 | 500 | captcha_error | 验证码求解失败 |
 | 500 | internal_error | 调度层未捕获异常（监控条目会收口） |
@@ -117,4 +142,14 @@ npx claude
 curl http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer <gateway_key>" -H "Content-Type: application/json" \
   -d '{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# OpenAI Responses 兼容（非流式）
+curl http://127.0.0.1:3000/v1/responses \
+  -H "Authorization: Bearer <gateway_key>" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
+
+# OpenAI Responses 兼容（流式）
+curl http://127.0.0.1:3000/v1/responses \
+  -H "Authorization: Bearer <gateway_key>" -H "Content-Type: application/json" \
+  -d '{"model":"glm-5.3","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true}'
 ```

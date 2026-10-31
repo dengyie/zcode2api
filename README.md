@@ -1,7 +1,7 @@
 # zcode2api (zcode-hub)
 
-**ZCode 账号运营 + 双协议网关一体机**：把池内 ZCode Coding Plan / Start Plan / API Key 账号额度，统一转换为标准的
-**Anthropic Messages API**（`/v1/messages`）与 **OpenAI Chat Completions API**（`/v1/chat/completions`），向 Claude Code、Cline、Codex CLI、Chatbox、NextChat 等各类 Agent 与客户端提供高可用 API 服务。
+**ZCode 账号运营 + 三协议网关一体机**：把池内 ZCode Coding Plan / Start Plan / API Key 账号额度，统一转换为标准的
+**Anthropic Messages API**（`/v1/messages`）、**OpenAI Chat Completions API**（`/v1/chat/completions`）与 **OpenAI Responses API**（`/v1/responses`），向 Claude Code、Cline、Codex CLI（原生走 `/v1/responses`）、Chatbox、NextChat 等各类 Agent 与客户端提供高可用 API 服务。
 
 自带一套完整的账号运营控制台：多账号池轮询、高可信成套桌面指纹仿真、官方首启安装序仿真、单账号并发控制、429/5xx/3012 阶梯容灾、请求全景监控、限时套餐自动与手动领取、OAuth 免密登录入池，以及免浏览器的阿里云无痕验证求解——开箱即用，自托管部署。
 
@@ -9,7 +9,7 @@
 
 ## 核心能力
 
-- **双协议兼容网关**：原生支持 `POST /v1/messages`（Anthropic Messages 协议，支持流式 SSE）与 `POST /v1/chat/completions`（OpenAI 格式双向翻译，支持流式与非流式），并提供 `GET /v1/models` 模型列表。
+- **三协议兼容网关**：原生支持 `POST /v1/messages`（Anthropic Messages 协议，支持流式 SSE）、`POST /v1/chat/completions`（OpenAI 格式双向翻译，支持流式与非流式）与 `POST /v1/responses`（OpenAI Responses 协议双向翻译，支持流式与非流式，Codex CLI 原生直连），并提供 `GET /v1/models` 模型列表。
 - **高可信桌面指纹池（一号一台）**：入池自动生成加权桌面成套 SKU（Mac Sequoia/Tahoe、Win11 主流分辨率等），每账号独立全新 UUIDv4 `device_mid`，杜绝宿主机云 Linux 内核共享导致的账号集群关联风险。
 - **官方首启安装序仿真**：入池与指纹轮换自动执行 `client/configs` 与激活事件上报（`app_launch` / `app_daily_active`），持久化 `install_id` 与 `installed_at`。
 - **反代与 CDN 基础设施头深度清洗**：自动剔除 `x-forwarded-*`、`forwarded`、`cf-*`、`cdn-loop`、`x-real-ip`、`via`、`cookie`、`referer`、`origin`、`accept-language` 等网络中间件头部，杜绝部署网络拓扑泄露与客户端伪装冲突。
@@ -54,6 +54,7 @@ cp .env.example .env            # 按需修改密钥、端口等
 - 对话端点：
   - Anthropic 协议：`POST http://127.0.0.1:3000/v1/messages`（兼容 Claude Code、Cline）
   - OpenAI 协议：`POST http://127.0.0.1:3000/v1/chat/completions`（兼容 OpenAI 客户端）
+  - OpenAI Responses 协议：`POST http://127.0.0.1:3000/v1/responses`（Codex CLI 原生直连）
   - 模型列表：`GET http://127.0.0.1:3000/v1/models`
   - 探活端点：`GET http://127.0.0.1:3000/meta`
 
@@ -140,7 +141,7 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 ## 鉴权
 
 - **后台鉴权**：所有 `/admin/api/*` 需 `Authorization: Bearer <后台密码>`（也支持 `?app_key=`），内置 IP 失败节流保护。
-- **网关鉴权（可选）**：在「设置」配置「网关 API Key」后，`/v1/messages` 与 `/v1/chat/completions` 须携带
+- **网关鉴权（可选）**：在「设置」配置「网关 API Key」后，`/v1/messages`、`/v1/chat/completions` 与 `/v1/responses` 须携带
   `Authorization: Bearer <key>` 或 `x-api-key: <key>`；留空则不校验。
 
 ## 环境变量

@@ -137,3 +137,23 @@
 | ZC-007 | 切换前保全 | 未入库的当前登录自动先快照 → 不丢号 | P0 |
 | ZC-008 | 路径穿越防护 | id 含 `../`/非法字符 → 拒绝 | P0 |
 | ZC-009 | ZCode 运行中热切换保护 | 检测到客户端运行 → 按 behavior 配置拒绝/杀进程 | P2 |
+
+## 10. RS — Responses 协议翻译（responses_compat.py / response_store.py）
+
+| ID | 用例 | 输入 → 预期 | 优先级 |
+|----|------|-------------|--------|
+| RS-001 | 基本请求映射 | `instructions` → system；input message 条目 → user/assistant 消息（input_text 块）；model 规范化同网关 | P0 |
+| RS-002 | reasoning.effort 映射 | 参数化 minimal/low/medium/high/xhigh → `low`/`low`/不带（上游默认档）/`high`/`max` | P0 |
+| RS-003 | tools/tool_choice 映射 | function 工具 → Anthropic tools；tool_choice 各档同 chat/completions；非 function 类型（web_search 等）跳过 | P0 |
+| RS-004 | function_call 条目映射 | input `function_call` / `function_call_output` 条目 → assistant `tool_use` / user `tool_result` 块 | P0 |
+| RS-005 | reasoning 条目回放 | input `reasoning` 条目（summary_text）→ 上游 thinking 块 | P0 |
+| RS-006 | max_output_tokens 映射 | `max_output_tokens: 512` → 上游 `max_tokens: 512` | P1 |
+| RS-007 | 未支持字段安静忽略 | `store`/`include`/`metadata`/`prompt_cache_key`/`text` 等 → 不报错、不透传上游 | P1 |
+| RS-008 | 非流式响应映射 | Anthropic content → output 数组：thinking → `reasoning`（summary_text）、text → `message`（output_text）；`stop_reason=max_tokens` → `status:"incomplete"`，end_turn → `"completed"` | P0 |
+| RS-009 | response_id 生成 | 非流式 envelope 生成新 `resp_` id；流式沿用上游 message id（`resp_<id>`）。入库由网关路由层完成（集成 INT-042 覆盖） | P0 |
+| RS-010 | previous_response_id 链上下文 | store 命中 → 上一轮输入输出拼入上游 messages | P0 |
+| RS-011 | previous_response_id 未命中 | 不存在 id → 400 invalid_request（见 api-spec §1.6 错误表） | P0 |
+| RS-012 | 流式事件序 | 上游 message_start/thinking/text/tool_use 全链 → `response.created` → `response.in_progress` → 思考（`output_item.added` / `reasoning_summary_part.added` / `reasoning_summary_text.delta`）→ 正文（`output_item.added` / `content_part.added` / `output_text.delta` / `output_text.done`）→ 工具（`function_call_arguments.delta` / `.done`）→ `response.completed`；无 `[DONE]` 哨兵 | P0 |
+| RS-013 | sequence_number 连续 | 全部 SSE 帧 `sequence_number` 严格递增、无跳变 | P1 |
+| RS-014 | LRU 容量 256 | 连续写入 257 条 → 最早一条被淘汰，按其 id 再取 → `get` 返回 None | P0 |
+| RS-015 | LRU 清零语义 | `clear()` 清空后旧 id 全部未命中；模块级存储无持久化，进程重启即失 | P1 |
