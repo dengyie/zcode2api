@@ -583,6 +583,7 @@ async def get_settings():
         "quota_refresh_interval": store.quota_refresh_interval(),
         "account_concurrency": store.account_concurrency(),
         "claim_round_interval": store.claim_round_interval(),
+        "claim_round_hours": ",".join(map(str, store.claim_round_hours())),
     }
 
 
@@ -620,6 +621,24 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "自动领取轮间隔必须是非负整数（0 = 关闭）") from None
         store.set_setting("claim_round_interval", str(interval))
+    if "claim_round_hours" in payload:
+        # 领取窗口（北京时间小时，逗号分隔；空 / * = 全天）。归一成升序去重后落库。
+        raw = str(payload["claim_round_hours"] or "").strip()
+        hours: list[int] = []
+        if raw not in ("", "*"):
+            for part in raw.replace("，", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    hour = int(part)
+                except ValueError:
+                    raise HTTPException(400, "领取窗口小时必须是 0-23 的整数，逗号分隔（空 = 全天）") from None
+                if not 0 <= hour <= 23:
+                    raise HTTPException(400, "领取窗口小时必须在 0-23 之间")
+                if hour not in hours:
+                    hours.append(hour)
+        store.set_setting("claim_round_hours", ",".join(map(str, sorted(hours))))
     return {"ok": True}
 
 

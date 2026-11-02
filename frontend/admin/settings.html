@@ -43,8 +43,13 @@
     </div>
     <div class="settings-row">
       <label>套餐自动领取轮（秒）</label>
-      <div class="hint">周期对全部 JWT 账号执行活动套餐领取（激活上报 + 查询 + 领取）。设为 0 关闭轮次，仅入池/手动触发。默认 600（10 分钟）。修改后即时生效。</div>
-      <input class="input" id="claim-round-interval" type="number" min="0" step="30" placeholder="600">
+      <div class="hint">周期对全部 JWT 账号执行活动套餐领取（激活上报 + 查询 + 领取）。设为 0 关闭轮次，仅入池/手动触发。默认 3600（1 小时）。修改后即时生效。</div>
+      <input class="input" id="claim-round-interval" type="number" min="0" step="30" placeholder="3600">
+    </div>
+    <div class="settings-row">
+      <label>领取窗口（北京时间小时）</label>
+      <div class="hint">只在窗口内跑领取轮；窗口外自动休眠、到点准时醒来（上游套餐每天 19:00 放量，填 19 即每天 19 点开领）。逗号分隔可填多个小时（如 19,20,21）；留空或 * 表示全天。修改后即时生效。</div>
+      <input class="input" id="claim-round-hours" type="text" placeholder="19,20,21（留空 = 全天）">
     </div>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
       <button onclick="saveSettings()" class="dialog-btn dialog-btn-primary">保存</button>
@@ -82,6 +87,7 @@ async function load(){
     document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
     document.getElementById('account-concurrency').value=d.account_concurrency??2;
     document.getElementById('claim-round-interval').value=d.claim_round_interval??600;
+    document.getElementById('claim-round-hours').value=d.claim_round_hours??'';
     const hint=document.getElementById('admin-key-default-hint');
     if(hint) hint.style.display=d.admin_key_is_default?'block':'none';
   }catch(e){showToast('加载失败: '+e.message,'error');}
@@ -101,7 +107,11 @@ async function saveSettings(){
   if(isNaN(account_concurrency)||account_concurrency<0)return showToast('账号并发必须是非负整数（0 = 不限）','error');
   const claim_round_interval=parseInt(document.getElementById('claim-round-interval').value,10);
   if(isNaN(claim_round_interval)||claim_round_interval<0)return showToast('自动领取轮间隔必须是非负整数（0 = 关闭）','error');
-  const payload={quota_refresh_interval,account_concurrency,claim_round_interval};
+  const claim_round_hours=document.getElementById('claim-round-hours').value.trim();
+  if(claim_round_hours && claim_round_hours!=='*' &&
+     !claim_round_hours.replace('，',',').split(',').every(p=>{const n=parseInt(p,10);return !p.trim()||(!isNaN(n)&&n>=0&&n<=23);}))
+    return showToast('领取窗口必须是 0-23 的小时，逗号分隔（留空 = 全天）','error');
+  const payload={quota_refresh_interval,account_concurrency,claim_round_interval,claim_round_hours};
   if(!_isSecretMask(admin_key)) payload.admin_key=admin_key;
   if(!_isSecretMask(gateway_key)) payload.gateway_key=gateway_key;
   try{

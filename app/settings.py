@@ -127,6 +127,9 @@ ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
 # 时触发；10 分钟轮次 + 每轮 app_launch 上报是标记不消退的帮凶。0 = 关闭轮次，
 # 仅入池/手动触发。运行期可在后台设置改（meta 表即时生效）
 CLAIM_ROUND_INTERVAL = _int("ZCODE_CLAIM_ROUND_INTERVAL", 3600)
+# 领取窗口（北京时间小时，逗号分隔；空/"*" = 全天）。上游套餐按天投放，
+# 用户侧实证每天 19:00 放量——窗口外轮询只会空转 preview。
+CLAIM_ROUND_HOURS = os.getenv("ZCODE_CLAIM_ROUND_HOURS", "19")
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 # 上游端点：默认值统一收口在 constants.py，环境变量仅作覆盖
@@ -146,7 +149,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.9"
+APP_VERSION = "2.7.10"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

@@ -432,7 +432,8 @@ class ClaimRoundManager:
     1005（今日名额用完）按服务端 next_at 退避：等待期该套餐不打 claim
     （省 captcha 求解与上游写流量），preview 照常保留新套餐发现
     （docs/development/05「按服务端 next window 退避」语义落地）。
-    轮间隔运行期读 meta 设置（0 = 关闭，仍周期回看便于随时启用）；
+    轮间隔与**领取窗口**（claim_round_hours，北京时间小时）运行期读 meta 设置
+    （interval 0 = 关闭；窗口外只睡不跑、到点准时醒来；空窗口 = 全天）；
     单账号异常不中断整轮，后台任务异常全部自兜。
     """
 
@@ -521,18 +522,63 @@ class ClaimRoundManager:
 
         while not self._stop.is_set():
             interval = store.claim_round_interval()  # 实时读取设置，改后即生效
-            if interval > 0:
+            hours = store.claim_round_hours()
+            if interval > 0 and self._in_window(hours):
                 try:
                     await self._round()
                 except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
                     logs.err("claim", f"自动领取轮出错: {err}")
             # interval<=0 视为关闭：仍周期性回看设置，便于随时启用
-            wait = interval if interval > 0 else 30
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=wait)
+                await asyncio.wait_for(self._stop.wait(), timeout=self._next_wait(interval, hours))
                 return
             except TimeoutError:
                 continue
+
+    # ── 领取窗口调度（北京时间）─────────────────────────────────────────────
+    # 上游套餐按天投放，用户侧实证每天 19:00 放量。窗口锚定北京时钟而非 host
+    # 时区（host 换成 UTC 也不漂）；中国无夏令时，固定 +8 即精确，无 tzdata 依赖。
+
+    @staticmethod
+    def _beijing_hour_frac(now: float | None = None) -> float:
+        """当前北京时间的小时（含小数，19.5 = 19:30）。"""
+        lt = time.gmtime((now if now is not None else time.time()) + 8 * 3600)
+        return lt.tm_hour + lt.tm_min / 60 + lt.tm_sec / 3600
+
+    @classmethod
+    def _in_window(cls, hours: list[int], now: float | None = None) -> bool:
+        """当前北京时间小时是否在领取窗口内（空窗口 = 全天不限时）。"""
+        if not hours:
+            return True
+        return int(cls._beijing_hour_frac(now)) in hours
+
+    @classmethod
+    def _seconds_until_window(cls, hours: list[int], now: float | None = None) -> float:
+        """距下一个窗口起点（北京时间整点）的秒数；已在窗口内返回 0。"""
+        frac = cls._beijing_hour_frac(now)
+        if int(frac) in hours:
+            return 0.0  # 恰逢整点（frac == hour）也属于窗口内，不能落进「今天已过」
+        for hour in sorted(hours):
+            if frac < hour:
+                return (hour - frac) * 3600
+        return (24 - frac + min(hours)) * 3600  # 今天窗口已过 → 明天第一个窗口
+
+    @classmethod
+    def _next_wait(cls, interval: int, hours: list[int], now: float | None = None) -> float:
+        """下一次唤醒秒数。
+
+        interval<=0：关闭态 30s 回看设置（随时可启用）；
+        无窗口：interval 节拍；有窗口：窗口内 interval 节拍，窗口外最迟 30min
+        回看一次设置、并在窗口开始时准时醒来（19:00 放量即领，不空转一天）。
+        """
+        if interval <= 0:
+            return 30.0
+        if not hours:
+            return float(interval)
+        now = now if now is not None else time.time()
+        if cls._in_window(hours, now):
+            return float(interval)
+        return max(30.0, min(1800.0, cls._seconds_until_window(hours, now)))
 
     def start(self) -> None:
         if self._task is None:

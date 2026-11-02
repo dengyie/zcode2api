@@ -179,6 +179,27 @@ class Store:
         except (TypeError, ValueError):
             return settings.CLAIM_ROUND_INTERVAL
 
+    def claim_round_hours(self) -> list[int]:
+        """自动领取窗口：北京时间小时升序列表；空 = 全天（不限时）。运行时可改。
+
+        上游套餐按天投放（用户侧实证：每天 19:00 放量），窗口外轮询只会空转
+        preview。窗口锚定**北京时钟**而非 host 时区（host 换成 UTC 也不漂）；
+        中国无夏令时，固定 +8 即精确。
+        """
+        raw = str(self.get_setting("claim_round_hours", settings.CLAIM_ROUND_HOURS) or "").strip()
+        if raw in ("", "*"):
+            return []
+        hours: list[int] = []
+        for part in raw.replace("，", ",").split(","):
+            part = part.strip()
+            try:
+                hour = int(part)
+            except ValueError:
+                continue  # 脏值跳过，不让一个坏配置挂掉领取轮
+            if 0 <= hour <= 23 and hour not in hours:
+                hours.append(hour)
+        return sorted(hours)
+
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:
         with self._lock:
