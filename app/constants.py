@@ -166,6 +166,11 @@ CAPTCHA_BODY_MARKERS = ('"code":3007', '"code": 3007')
 # 处置：账号指数退避冷却 + 暂停验证码池预热（池预热本身即上游流量，会加剧风控）。
 RISK_CONTROL_HTTP_STATUSES = (405,)
 RISK_BUSINESS_CODE = 3012
+# 429 承载的「模型并发已满」（2026-11-02 实测 {"code":3009,"msg":"model
+# concurrency limit exceeded"}）：并发争用是瞬态，短退避重试，不等 Retry-After。
+# ⚠️ 判定必须解析业务码，不能用裸子串——响应体里的 logid 是 20 位随机数字，
+# 裸子串 "3009" 会撞车（与 EXHAUST 裸子串教训同款，见上方 EXHAUST_KEYWORDS 注）。
+CONCURRENCY_BUSINESS_CODE = 3009
 RISK_CONTROL_MARKERS = (
     '"code":3012', '"code": 3012',
     "unusual activity",

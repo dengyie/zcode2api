@@ -105,6 +105,11 @@ def apply_start_plan_system(body: dict, model: str | None = None) -> bool:
     return True
 
 
+def _is_date_turn_text(text: object) -> bool:
+    """注入的「当前日期」user 轮的标记（幂等判定与会话指纹共用同一真相源）。"""
+    return isinstance(text, str) and "<system-reminder>" in text and "Today's date is" in text
+
+
 def apply_current_date_turn(body: dict) -> bool:
     """把官方 meta_user 的「当前日期」附件补进首条 user 轮（3.17.1 起不在 system 块里）。
 
@@ -118,8 +123,7 @@ def apply_current_date_turn(body: dict) -> bool:
     if isinstance(first, dict) and first.get("role") == "user":
         content = first.get("content")
         if isinstance(content, list) and content and isinstance(content[0], dict):
-            text = content[0].get("text")
-            if isinstance(text, str) and "<system-reminder>" in text and "Today's date is" in text:
+            if _is_date_turn_text(content[0].get("text")):
                 return False
     date_text = f"<system-reminder>\nToday's date is {time.strftime('%Y-%m-%d')}.\n</system-reminder>"
     body["messages"] = [
@@ -194,6 +198,12 @@ def conversation_session_id(body: dict, account_id: str = "") -> str | None:
 
     加入 account_id 隔离命名空间，避免不同账号/不同租户撞同一个 id
     （id 会随请求上报给上游，跨号相同是额外的关联信号）。
+
+    ⚠️ 必须跳过注入的日期轮（2026-11-03 复现的缺陷）：`transform_body` 会把
+    日期轮插到 messages[0] 且**原地**改写 body，而重试/换号路径会对同一个
+    body 对象再次调用 `build_request`——不跳过的话，第二次起指纹就落在日期
+    文本上，同一账号同一天所有会话撞成同一个 id（跨会话关联信号 + cache 键
+    漂移）。跳过规则对「前插任意个匹配轮」幂等，指纹与首次调用一致。
     """
     messages = body.get("messages")
     if not isinstance(messages, list):
@@ -204,13 +214,19 @@ def conversation_session_id(body: dict, account_id: str = "") -> str | None:
             continue
         content = msg.get("content")
         if isinstance(content, str):
-            text = content
+            candidate = content
         elif isinstance(content, list):
+            candidate = ""
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text" \
                         and isinstance(block.get("text"), str):
-                    text = block["text"]
+                    candidate = block["text"]
                     break
+        else:
+            candidate = ""
+        if _is_date_turn_text(candidate):
+            continue  # 日期轮（自己的或同形前插轮）：不是会话内容
+        text = candidate
         break
     if not text.strip():
         return None

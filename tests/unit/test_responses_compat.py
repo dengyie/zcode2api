@@ -160,9 +160,9 @@ class TestResponsesStreamConverter:
         assert types[-1] == "response.completed"
         assert types[-2] == "response.output_item.done"
 
-        # sequence_number 单调递增
+        # sequence_number 从 0 起严格连续递增（对齐 OpenAI Responses SSE）
         seqs = [d["sequence_number"] for _, d in pairs]
-        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+        assert seqs == list(range(len(seqs)))
 
         final = pairs[-1][1]["response"]
         assert final["output_text"] == "你好"
@@ -232,3 +232,67 @@ class TestEstimateInputTokens:
             ],
         })
         assert n >= 1
+
+
+class TestStreamInvariants:
+    """序列号与 output_index 的协议不变量（2026-11-03 review 修复项）。"""
+
+    def test_text_first_output_indices(self):
+        conv = ResponsesStreamConverter("m")
+        events = conv.start()
+        events += conv.feed_chunk({"choices": [{"delta": {"content": "你"}}]})
+        events += conv.feed_chunk({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        events += conv.done()
+        pairs = _lines(events)
+        added = [d["output_index"] for t, d in pairs if t == "response.output_item.added"]
+        assert added == [0]
+        deltas = [d["output_index"] for t, d in pairs if t == "response.output_text.delta"]
+        assert deltas == [0]
+        done_idx = [d["output_index"] for t, d in pairs if t == "response.output_item.done"]
+        assert done_idx == [0]
+
+    def test_tool_first_creation_order_indices(self):
+        """tool 先于 text 出现时，编号按 item 创建顺序：tool=0、message=1。
+
+        旧实现对 message 写死 0、tool 写死 idx+1，tool-first 流会产出乱序编号
+        且 added/delta/done 三处不一致。
+        """
+        conv = ResponsesStreamConverter("m")
+        events = conv.start()
+        events += conv.feed_chunk({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "type": "function", "function": {"name": "f", "arguments": ""}},
+        ]}}]})
+        events += conv.feed_chunk({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": '{"a":1}'}},
+        ]}}]})
+        events += conv.feed_chunk({"choices": [{"delta": {"content": "hi"}}]})
+        events += conv.done()
+        pairs = _lines(events)
+        added = [d["output_index"] for t, d in pairs if t == "response.output_item.added"]
+        assert added == [0, 1]  # added 事件严格递增（创建顺序）
+        args_delta = [d for t, d in pairs if t == "response.function_call_arguments.delta"][0]
+        assert args_delta["output_index"] == 0  # 与该工具 added 时一致
+        done_by_type = {d["item"]["type"]: d["output_index"]
+                        for t, d in pairs if t == "response.output_item.done"}
+        assert done_by_type == {"function_call": 0, "message": 1}
+        final = pairs[-1][1]["response"]
+        assert [i["type"] for i in final["output"]] == ["function_call", "message"]  # output 数组同序
+
+    def test_two_tools_indices(self):
+        conv = ResponsesStreamConverter("m")
+        events = conv.start()
+        for i, name in enumerate(("f1", "f2")):
+            events += conv.feed_chunk({"choices": [{"delta": {"tool_calls": [
+                {"index": i, "id": f"c{i}", "type": "function", "function": {"name": name, "arguments": "{}"}},
+            ]}}]})
+        events += conv.done()
+        pairs = _lines(events)
+        added = [d["output_index"] for t, d in pairs if t == "response.output_item.added"]
+        assert added == [0, 1]
+        final = pairs[-1][1]["response"]
+        assert [i["call_id"] for i in final["output"]] == ["c0", "c1"]
+
+    def test_no_payload_param(self):
+        """构造器不再接收 request_payload（review Nit：存而不用）。"""
+        import inspect
+        assert list(inspect.signature(ResponsesStreamConverter.__init__).parameters) == ["self", "model"]

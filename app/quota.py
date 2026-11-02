@@ -187,10 +187,10 @@ async def fetch_quota(account: Account) -> dict:
                 if bal_plans and not account.plans:
                     account.plans = bal_plans
                     account.plan = bal_plans[0]
-                # 真正把 quota 快照刷新成功的时刻：只有它能把「全部窗口过期」从
-                # 未知升级为已确认（见 models.Account.quota_expired）。放在这里而不是
-                # 请求发起处，避免「查了一圈全业务错误」也把账号判死。
-                account.quota_verified_at = now
+                # 注意：quota_verified_at **不在这里**打点。balance 200 但 balances
+                # 为空（新号 billing 全空形态，见下方注释）时什么也没确认——此时
+                # 打点会把旧的过期快照误升格为「过期后实查确认」，正好把 2.7.8
+                # 要救的号从另一扇门判死。打点在下方 quota_map 非空分支。
             for bal in [b for b in (data.get("data") or {}).get("balances") or []
                         if code is None]:
                 name = bal.get("show_name") or bal.get("model") or "model"
@@ -232,6 +232,9 @@ async def fetch_quota(account: Account) -> dict:
 
     if quota_map:
         account.quota = quota_map
+        # 快照真实写库的时刻 = 「过期后实查」的证据点（见 models.Account.quota_expired）。
+        # 绑在 quota_map 非空上：只有真的取到窗口，才谈得上「确认」它们的状态。
+        account.quota_verified_at = now
         # 额度耗尽判定：逐窗口算「有效余量」（remaining > 0 且未过期）。
         # 原实现只看 remaining <= 0，把**已过期窗口**当可用 —— 2026-10-31 实证：
         # 老号 GLM-5.3-Flash 本地 remaining=1e8、expires_at 在 28 天前，上游对

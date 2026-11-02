@@ -197,7 +197,7 @@ class TestResponsesEndpoint:
         assert events[-1] == "response.completed"
         datas = [json.loads(ln[6:]) for ln in res.text.splitlines() if ln.startswith("data: ")]
         seqs = [d["sequence_number"] for d in datas]
-        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+        assert seqs == list(range(len(seqs)))  # 从 0 起严格连续（对齐 Responses SSE）
         text = "".join(d["delta"] for d in datas if d["type"] == "response.output_text.delta")
         assert "chunk-0" in text
 

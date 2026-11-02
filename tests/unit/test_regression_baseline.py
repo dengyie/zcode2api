@@ -15,6 +15,7 @@ from app.models import Account, Status
 from app.routes.gateway import (
     _detect_provider,
     _is_captcha_error,
+    _is_concurrency_hit,
     _is_exhausted,
     _normalize_body,
 )
@@ -346,3 +347,22 @@ def fresh_account(secret: str) -> Account:
     """向当前 store 注入账号（gateway_client 用 fresh_app 的 store 单例）。"""
     from app.store import store
     return store.add_account("zai", "t", secret)
+
+
+# ── 3009 并发识别（2026-11-03 review：禁止裸子串，logid 会撞车）───────────────
+class TestConcurrencyHit:
+    def test_business_code_3009(self):
+        body = '{"code":3009,"msg":"model concurrency limit exceeded","logid":"202611030003009"}'
+        assert _is_concurrency_hit(body) is True
+
+    def test_logid_substring_alone_is_not_enough(self):
+        """20 位随机 logid 含 "3009" 子串（真实 429 形态）不得误判为并发。"""
+        body = '{"code":1302,"msg":"rate limited","logid":"202611030003009xxxx"}'
+        assert _is_concurrency_hit(body) is False
+
+    def test_text_fallback_for_non_json(self):
+        assert _is_concurrency_hit("model concurrency limit exceeded") is True
+
+    def test_other_codes_are_not_concurrency(self):
+        assert _is_concurrency_hit('{"code":1113,"msg":"insufficient balance"}') is False
+        assert _is_concurrency_hit("server busy") is False

@@ -237,11 +237,17 @@ class ResponsesStreamConverter:
 
     输入是 `StreamConverter.feed_events()` 产出的 chunk dict；输出是
     `event: <type>\\ndata: <json>\\n\\n` 行（Responses 协议要求带 event 名）。
+
+    不变量（对齐 OpenAI Responses SSE）：
+      - `sequence_number` 从 **0** 起单调递增；
+      - `output_index` 按 item **创建顺序**分配（message 与 function_call 一视
+        同仁）——added/delta/done 三处同值，且与最终 `response.output` 数组
+        顺序一致。不能对 message 写死 0、对 tool 写死 idx+1：上游块序若为
+        tool→text，那样会产出乱序编号。
     """
 
-    def __init__(self, model: str, request_payload: dict | None = None) -> None:
+    def __init__(self, model: str) -> None:
         self.model = model
-        self.req = request_payload or {}
         self.response_id = _resp_id()
         self.created_at = int(time.time())
         self.message_item_id = _item_id("msg")
@@ -250,7 +256,10 @@ class ResponsesStreamConverter:
         self.tool_items: dict[int, dict] = {}
         self.finish_reason: str | None = None
         self.usage: dict = {"prompt_tokens": None, "completion_tokens": None}
-        self._sequence = 0
+        self._sequence = -1  # 首个 _event() 自增后为 0
+        self._next_output = 0
+        self.message_output_index: int | None = None
+        self.tool_output_index: dict[int, int] = {}
 
     def _event(self, etype: str, payload: dict) -> str:
         self._sequence += 1
@@ -292,6 +301,8 @@ class ResponsesStreamConverter:
         if self.message_open:
             return []
         self.message_open = True
+        self.message_output_index = self._next_output
+        self._next_output += 1
         item = {
             "type": "message",
             "id": self.message_item_id,
@@ -300,10 +311,11 @@ class ResponsesStreamConverter:
             "content": [],
         }
         return [
-            self._event("response.output_item.added", {"output_index": 0, "item": item}),
+            self._event("response.output_item.added", {
+                "output_index": self.message_output_index, "item": item}),
             self._event("response.content_part.added", {
                 "item_id": self.message_item_id,
-                "output_index": 0,
+                "output_index": self.message_output_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": "", "annotations": []},
             }),
@@ -324,7 +336,7 @@ class ResponsesStreamConverter:
             self.text_parts.append(text)
             out.append(self._event("response.output_text.delta", {
                 "item_id": self.message_item_id,
-                "output_index": 0,
+                "output_index": self.message_output_index,
                 "content_index": 0,
                 "delta": text,
             }))
@@ -343,15 +355,17 @@ class ResponsesStreamConverter:
                     "status": "in_progress",
                 }
                 self.tool_items[idx] = item
+                self.tool_output_index[idx] = self._next_output
+                self._next_output += 1
                 out.append(self._event("response.output_item.added", {
-                    "output_index": len(self.tool_items), "item": dict(item),
+                    "output_index": self.tool_output_index[idx], "item": dict(item),
                 }))
             args = fn.get("arguments")
             if isinstance(args, str) and args:
                 self.tool_items[idx]["arguments"] += args
                 out.append(self._event("response.function_call_arguments.delta", {
                     "item_id": self.tool_items[idx]["id"],
-                    "output_index": idx + 1,
+                    "output_index": self.tool_output_index[idx],
                     "delta": args,
                 }))
         if choice.get("finish_reason"):
@@ -361,20 +375,21 @@ class ResponsesStreamConverter:
     def done(self) -> list[str]:
         out: list[str] = []
         text = "".join(self.text_parts)
+        final_items: list[tuple[int, dict]] = []
         if self.message_open:
             out.append(self._event("response.output_text.done", {
                 "item_id": self.message_item_id,
-                "output_index": 0,
+                "output_index": self.message_output_index,
                 "content_index": 0,
                 "text": text,
             }))
             out.append(self._event("response.content_part.done", {
                 "item_id": self.message_item_id,
-                "output_index": 0,
+                "output_index": self.message_output_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": text, "annotations": []},
             }))
-            final_item = {
+            message_item = {
                 "type": "message",
                 "id": self.message_item_id,
                 "status": "completed",
@@ -382,29 +397,24 @@ class ResponsesStreamConverter:
                 "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
             out.append(self._event("response.output_item.done", {
-                "output_index": 0, "item": final_item,
+                "output_index": self.message_output_index, "item": message_item,
             }))
+            final_items.append((self.message_output_index, message_item))
         for idx, item in sorted(self.tool_items.items()):
             out.append(self._event("response.function_call_arguments.done", {
                 "item_id": item["id"],
-                "output_index": idx + 1,
+                "output_index": self.tool_output_index[idx],
                 "arguments": item["arguments"],
             }))
             item["status"] = "completed"
+            final_items.append((self.tool_output_index[idx], dict(item)))
             out.append(self._event("response.output_item.done", {
-                "output_index": idx + 1, "item": dict(item),
+                "output_index": self.tool_output_index[idx], "item": dict(item),
             }))
 
-        output_items: list[dict] = []
-        if self.message_open:
-            output_items.append({
-                "type": "message",
-                "id": self.message_item_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
-            })
-        output_items.extend(dict(i) for _, i in sorted(self.tool_items.items()))
+        # 最终 output 数组按 output_index 排序（= item 创建顺序）
+        final_items.sort(key=lambda pair: pair[0])
+        output_items = [item for _, item in final_items]
         status = "incomplete" if self.finish_reason == "length" else "completed"
         final = self._response_skeleton(status, output_items)
         if status == "incomplete":

@@ -148,3 +148,39 @@ class TestPlanKind:
 
     def test_unknown(self):
         assert Account.create("zai", "t", "a.b.c").plan_kind() == ""
+
+
+class TestSessionIdUnderRetries:
+    """重试/换号路径的指纹稳定性（2026-11-03 复现的缺陷）。
+
+    `transform_body` 原地把日期轮插到 messages[0]，而 gateway 会对**同一个
+    body 对象**在验证码重试 / 429 重试 / 换号时再次调用 `build_request` →
+    `conversation_session_id`。指纹若落在日期文本上，同一账号同一天的所有
+    会话会撞成同一个 id（跨会话关联信号 + cache 键漂移）。
+    """
+
+    def test_id_stable_after_transform(self):
+        body = _body(text="帮我写个脚本")
+        before = body_transform.conversation_session_id(body, "acc-1")
+        body_transform.transform_body(body)  # 日期轮已前插
+        assert body_transform.conversation_session_id(body, "acc-1") == before
+
+    def test_distinct_conversations_distinct_after_transform(self):
+        a, b = _body(text="会话甲"), _body(text="会话乙")
+        body_transform.transform_body(a)
+        body_transform.transform_body(b)
+        assert body_transform.conversation_session_id(a, "acc-1") \
+            != body_transform.conversation_session_id(b, "acc-1")
+
+    def test_skips_only_leading_date_turns(self):
+        """只跳过日期轮本身；客户端真实的首轮文本始终是指纹来源。"""
+        body = _body(text="<system-reminder>\nToday's date is 2026-11-03.\n</system-reminder>")
+        body_transform.transform_body(body)  # 我们的前插轮在它前面
+        # 两个日期形态轮都被跳过后没有真实文本 → None（而不是把日期当指纹）
+        assert body_transform.conversation_session_id(body, "acc-1") is None
+
+    def test_date_turn_helper_is_single_source(self):
+        assert body_transform._is_date_turn_text(
+            "<system-reminder>\nToday's date is 2026-11-03.\n</system-reminder>")
+        assert not body_transform._is_date_turn_text("<system-reminder>别的提醒</system-reminder>")
+        assert not body_transform._is_date_turn_text(None)

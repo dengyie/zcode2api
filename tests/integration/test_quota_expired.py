@@ -194,3 +194,40 @@ async def test_new_account_without_quota_fails_once_then_exhausted(gateway_clien
     assert after.use_count == 0
     assert after.status == Status.EXHAUSTED
     assert after.is_selectable() is False
+
+
+async def test_empty_balance_does_not_verify_expiry(gateway_client, fresh_app):
+    """billing 200 但 `balances` 为空（新号 billing 全空形态）≠「过期已确认」。
+
+    2026-11-03 review：quota_verified_at 曾在 balance 业务码为 None 时就打点，
+    空响应会把旧的过期快照误升格为「过期后实查确认」，把 2.7.8 要救的号从
+    另一扇门判死。现在打点绑定在 quota_map 真实写库上。
+    """
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, "emptybal01.payload.signature", name="a-empty")
+    # 预置「窗口已过期的旧快照」（模拟日窗翻新后未刷新的本地状态）
+    acc.quota = {"GLM-5.3": {"remaining": 100, "expires_at": time.time() - 600}}
+    mock.state.sequences[acc.jwt_token[:16]] = ["billing_empty"]
+
+    res = await quota.fetch_quota(acc)
+
+    assert "error" not in res
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.quota_verified_at is None          # 空 balances 没确认任何东西
+    assert after.status == Status.ACTIVE            # 未知 → 不判死
+    assert after.is_selectable() is True            # 放行让上游定生死
+
+
+async def test_real_windows_still_stamp_verified_at(gateway_client, fresh_app):
+    """对照：balances 非空时打点照常（「过期后实查」证据链不被破坏）。"""
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, "emptybal02.payload.signature", name="a-verified")
+    acc.quota = {"GLM-5.3": {"remaining": 100, "expires_at": time.time() - 600}}
+    mock.state.sequences[acc.jwt_token[:16]] = ["balance_expired"]
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.quota_verified_at is not None and after.quota_verified_at > time.time() - 60
+    assert after.status == Status.EXHAUSTED         # 有余额但过期，且过期后实查过 → 判死
+    assert after.is_selectable() is False
