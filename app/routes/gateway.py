@@ -15,6 +15,7 @@ import time
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from .. import business_error, constants, egress, logs, reqlog, settings
 from ..agent import build_request
@@ -25,7 +26,7 @@ from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anth
 from ..quota import fetch_quota
 from ..responses_compat import ResponsesStreamConverter, chat_to_response, responses_to_chat
 from ..store import store
-from ..token_estimate import estimate_input_tokens
+from ..token_estimate import estimate_input_tokens_after_transform
 
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
 
@@ -209,7 +210,7 @@ async def list_models():
 async def messages(request: Request):
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except (ClientDisconnect, json.JSONDecodeError, ValueError):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse(
@@ -262,7 +263,9 @@ async def _run_compat_endpoint(request: Request, kind: str, translate,
     """
     try:
         payload = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except (ClientDisconnect, json.JSONDecodeError, ValueError):
+        # ClientDisconnect：客户端在读请求体阶段断开——回包无人收，仅为不刷
+        # starlette 完整堆栈（err.log 曾每次断开一条 Traceback）
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request_error"}}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}, status_code=400)
@@ -365,10 +368,14 @@ async def count_tokens(request: Request):
     上游（Plan 通道与 api.z.ai）**没有**这个端点（2026-11-02 实测 404），但
     Anthropic SDK / Claude Code 会先调它做上下文预算，缺了会直接中断会话。
     这里只做估算：不占账号额度、不打上游、不需要可用账号（池空也能回）。
+
+    估算对象是 **transform 之后**的形状（含官方 system 三块 + 日期轮，
+    线上标定固定开销 ≈400 tok）——2026-11-03 实测：只算客户端原始 body 时
+    6 tok 的请求实际计费 341，预算严重失真。
     """
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except (ClientDisconnect, json.JSONDecodeError, ValueError):
         return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse(
@@ -378,7 +385,7 @@ async def count_tokens(request: Request):
     model = body.get("model")
     if not isinstance(model, str) or not model.strip():
         return JSONResponse({"error": {"message": "必须提供 model 参数", "type": "invalid_request_error"}}, status_code=400)
-    return {"input_tokens": estimate_input_tokens(_normalize_body(body))}
+    return {"input_tokens": estimate_input_tokens_after_transform(_normalize_body(body), model)}
 
 
 def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:

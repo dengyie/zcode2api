@@ -296,3 +296,42 @@ class TestStreamInvariants:
         """构造器不再接收 request_payload（review Nit：存而不用）。"""
         import inspect
         assert list(inspect.signature(ResponsesStreamConverter.__init__).parameters) == ["self", "model"]
+
+
+class TestEstimateAfterTransform:
+    """count_tokens 必须估算 transform 后形状（2026-11-03 线上标定：固定开销 ≈400 tok）。
+
+    实测：6 tok 的原始请求上游计费 341——只算原始 body 对小请求低估近百倍。
+    """
+
+    def test_includes_transform_overhead(self):
+        from app.token_estimate import estimate_input_tokens, estimate_input_tokens_after_transform
+
+        body = {"model": "GLM-5.3-Flash",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "你好"}]}]}
+        raw = estimate_input_tokens(body)
+        after = estimate_input_tokens_after_transform(body, "GLM-5.3-Flash")
+        assert after - raw >= 300  # 官方三块 + 日期轮 ≈ 400 tok
+        assert after >= 300
+
+    def test_deterministic(self):
+        from app.token_estimate import estimate_input_tokens_after_transform
+
+        body = {"model": "GLM-5.3", "messages": [{"role": "user", "content": "hi"}]}
+        assert estimate_input_tokens_after_transform(body, "GLM-5.3") \
+            == estimate_input_tokens_after_transform(body, "GLM-5.3")
+
+    def test_scales_with_content(self):
+        from app.token_estimate import estimate_input_tokens_after_transform
+
+        small = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        big = {"model": "m", "messages": [{"role": "user", "content": "长" * 500}]}
+        assert estimate_input_tokens_after_transform(big, "m") \
+            > estimate_input_tokens_after_transform(small, "m")
+
+    def test_original_body_not_mutated(self):
+        from app.token_estimate import estimate_input_tokens_after_transform
+
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        estimate_input_tokens_after_transform(body, "m")
+        assert "system" not in body  # transform 在副本上做，调用方 body 不被污染

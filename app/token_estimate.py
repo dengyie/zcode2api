@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 
@@ -76,3 +77,20 @@ def estimate_input_tokens(body: dict) -> int:
             if isinstance(tool, dict):
                 total += _text_tokens(json.dumps(tool, ensure_ascii=False))
     return max(total, 1)
+
+
+def estimate_input_tokens_after_transform(body: dict, model: str) -> int:
+    """估算 **transform 之后**（上游实际计费形状）的 input tokens。
+
+    Plan 通道的请求会被 `body_transform` 注入官方 system 三块 + 日期轮 +
+    attribution blob——2026-11-03 线上标定：这笔固定开销 ≈400 tok，count_tokens
+    若只算客户端原始 body，对小请求低估近百倍（6 tok 的请求实际 341）。
+    attribution 用定长代表值（实际 device_mid/session_id 同量级，差 <1 tok）。
+    Key 回退通道不做 transform，此估算对其略偏高——预算场景偏高是安全方向。
+    """
+    from . import body_transform
+
+    transformed = copy.deepcopy(body)
+    body_transform.transform_body(transformed, None, model,
+                                  device_mid="0" * 32, session_id="0" * 36)
+    return estimate_input_tokens(transformed)
