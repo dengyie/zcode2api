@@ -241,6 +241,25 @@ class Account:
         now = now or time.time()
         return bool(self.cooling_until and now < self.cooling_until)
 
+    def plan_kind(self) -> str:
+        """当前套餐类型：start-plan（体验/免费档）/ coding-plan / ""（未知）。
+
+        上游 plan_id 形如 `zcode-v3-start-plan-0817` / `zcode-v3-coding-plan-…`，
+        取自 billing 的 plans[]（`quota.fetch_quota` 落库到 account.plans）。
+        后台据此区分体验号与付费号；路由/限流如需按套餐分流也从这里取。
+        """
+        for plan in [self.plan, *(self.plans or [])]:
+            if not isinstance(plan, dict):
+                continue
+            blob = " ".join(
+                str(plan.get(k) or "").lower() for k in ("plan_id", "name", "description")
+            )
+            if "start-plan" in blob or "start plan" in blob:
+                return "start-plan"
+            if "coding-plan" in blob or "coding plan" in blob:
+                return "coding-plan"
+        return ""
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -280,6 +299,7 @@ class Account:
             "quota": self.quota,
             "plan": self.plan,
             "plans": self.plans,
+            "plan_kind": self.plan_kind(),
             "use_count": self.use_count,
             "fail_count": self.fail_count,
             "risk_strikes": self.risk_strikes,

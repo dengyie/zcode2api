@@ -179,6 +179,14 @@ async def fetch_quota(account: Account) -> dict:
             code = business_error.business_code(data)
             if code is not None:
                 errors["balance"] = code
+            else:
+                # balance 也带 plans[]（含 plan_id）。`/billing/current` 偶发失败时
+                # 这里就是套餐类型的唯一来源——少了它 trial 号会退化成「未知套餐」，
+                # 拿不到体验档的并发收紧（见 models.Account.plan_kind）。
+                bal_plans = (data.get("data") or {}).get("plans") or []
+                if bal_plans and not account.plans:
+                    account.plans = bal_plans
+                    account.plan = bal_plans[0]
             for bal in [b for b in (data.get("data") or {}).get("balances") or []
                         if code is None]:
                 name = bal.get("show_name") or bal.get("model") or "model"
@@ -272,6 +280,57 @@ async def fetch_quota(account: Account) -> dict:
         logs.warn("quota", f"账号 {account.name} billing 全业务错误（{detail}）")
         return {"error": f"上游业务错误（{detail}）"}
     return result or {"error": "无法获取额度数据"}
+
+
+def _normalize_limits(data: dict) -> list[dict]:
+    """`data.limits[]` → 紧凑快照（TOKENS_LIMIT / TIME_LIMIT 两类窗口混排）。"""
+    out: list[dict] = []
+    for item in (data.get("data") or {}).get("limits") or []:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "type": item.get("type"),
+            "unit": item.get("unit"),
+            "number": item.get("number"),
+            "usage": item.get("usage"),
+            "remaining": item.get("remaining"),
+            "percentage": item.get("percentage"),
+            "next_reset_time": item.get("next_reset_time"),
+        })
+    return out
+
+
+async def fetch_coding_limits(account: Account) -> dict:
+    """拉取 Coding 平面额度（api.z.ai monitor 端点）。
+
+    与 `fetch_quota` 是**两套独立账本**：Plan 通道额度来自 zcode.z.ai 的
+    billing 族；Coding 平面（API Key 直连 api.z.ai）的额度完全不在那套账里。
+    体验套餐号在 billing 侧常全空/全拒，但这里能给出真实上限表——作为第二
+    额度源补盲，只读、不写账号状态（避免与 billing 判定打架）。
+
+    返回 {"limits": [...], "raw": {...}} 或 {"error": ...}
+    """
+    api_key = (account.api_key or "").strip()
+    if not api_key:
+        return {"error": "该账号没有 API Key，无法查询 Coding 平面额度"}
+    headers = {"authorization": api_key, "accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(constants.CODING_LIMIT_URL, headers=headers)
+    except httpx.HTTPError as err:
+        return {"error": f"请求上游失败: {err}"}
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"error": f"上游返回非 JSON（HTTP {resp.status_code}）"}
+    if not isinstance(data, dict):
+        return {"error": "上游返回结构异常"}
+    code = business_error.business_code(data)
+    if code is not None:
+        return {"error": str(data.get("msg") or f"业务错误 code={code}"), "code": code}
+    if resp.status_code >= 400:
+        return {"error": f"HTTP {resp.status_code}"}
+    return {"limits": _normalize_limits(data), "raw": data}
 
 
 async def refresh_accounts(accounts: list[Account]) -> dict:

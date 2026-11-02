@@ -134,6 +134,21 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
         else:  # user 及未知角色一律按 user 处理
             out_msgs.append({"role": "user", "content": _blocks_from_user_content(content)})
 
+    # 结构化输出：anthropic wire 没有 response_format，用 system 指令逼近。
+    # 只对显式要求 JSON 的调用生效；不改变普通对话的提示词。
+    fmt = payload.get("response_format")
+    if isinstance(fmt, dict):
+        ftype = fmt.get("type")
+        if ftype == "json_object":
+            system_parts.append("Respond with a single valid JSON object and nothing else.")
+        elif ftype == "json_schema":
+            js = fmt.get("json_schema")
+            schema = js.get("schema") if isinstance(js, dict) else None
+            directive = "Respond with a single JSON value conforming to this JSON Schema and nothing else."
+            if isinstance(schema, dict):
+                directive += " Schema: " + json.dumps(schema, ensure_ascii=False)
+            system_parts.append(directive)
+
     body: dict = {
         "model": model,
         "messages": out_msgs,
@@ -141,6 +156,15 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
     }
     if system_parts:
         body["system"] = "\n\n".join(system_parts)
+
+    # 思考强度：OpenAI `reasoning_effort` / Responses `reasoning.effort`
+    # → anthropic wire 的 `output_config.effort`（官方客户端同形态）。
+    effort = payload.get("reasoning_effort")
+    if not isinstance(effort, str):
+        reasoning = payload.get("reasoning")
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    if isinstance(effort, str) and effort.lower() in ("low", "medium", "high", "max"):
+        body["output_config"] = {"effort": effort.lower()}
     try:
         if payload.get("temperature") is not None:
             body["temperature"] = float(payload["temperature"])
@@ -226,6 +250,9 @@ class StreamConverter:
 
     用法：先 start() 产出 role 首 chunk，逐条 feed(event_dict) 收输出行，
     流结束后追加 done()（"data: [DONE]"）。
+
+    `feed_events` / `start_event` 返回 **chunk dict**：`/v1/responses` 需要把
+    chunk 再翻译成 Responses 事件，不能只拿到已经序列化的 SSE 行。
     """
 
     def __init__(self, model: str) -> None:
@@ -241,13 +268,19 @@ class StreamConverter:
         p, c = self.usage["prompt_tokens"], self.usage["completion_tokens"]
         self.usage["total_tokens"] = (p or 0) + (c or 0) if p is not None or c is not None else None
 
+    def start_event(self) -> dict:
+        return self._chunk_event({"role": "assistant", "content": ""})
+
     def start(self) -> str:
-        return self._chunk({"role": "assistant", "content": ""})
+        return _sse(self.start_event())
 
     def done(self) -> str:
         return "data: [DONE]\n\n"
 
     def feed(self, evt: dict) -> list[str]:
+        return [_sse(c) for c in self.feed_events(evt)]
+
+    def feed_events(self, evt: dict) -> list[dict]:
         etype = evt.get("type")
         if etype == "message_start":
             msg = evt.get("message") or {}
@@ -264,7 +297,7 @@ class StreamConverter:
             if block.get("type") == "tool_use":
                 idx = self._tool_seq
                 self._tool_seq += 1
-                return [self._chunk({"tool_calls": [{
+                return [self._chunk_event({"tool_calls": [{
                     "index": idx,
                     "id": str(block.get("id") or ""),
                     "type": "function",
@@ -274,9 +307,9 @@ class StreamConverter:
         if etype == "content_block_delta":
             delta = evt.get("delta") or {}
             if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-                return [self._chunk({"content": delta["text"]})]
+                return [self._chunk_event({"content": delta["text"]})]
             if delta.get("type") == "input_json_delta" and isinstance(delta.get("partial_json"), str):
-                return [self._chunk({"tool_calls": [{
+                return [self._chunk_event({"tool_calls": [{
                     "index": max(self._tool_seq - 1, 0),
                     "function": {"arguments": delta["partial_json"]},
                 }]})]
@@ -288,11 +321,10 @@ class StreamConverter:
             if out is not None:
                 self.usage["completion_tokens"] = out
                 self._sync_usage_total()
-            chunk = self._chunk({}, finish_reason=self.finish_reason)
-            return [chunk]
+            return [self._chunk_event({}, finish_reason=self.finish_reason)]
         return []  # content_block_stop / message_stop / ping / error 等无需产出
 
-    def _chunk(self, delta: dict, finish_reason: str | None = None) -> str:
+    def _chunk_event(self, delta: dict, finish_reason: str | None = None) -> dict:
         payload: dict = {
             "id": self.chunk_id,
             "object": "chat.completion.chunk",
@@ -302,4 +334,8 @@ class StreamConverter:
         }
         if finish_reason is not None:
             payload["usage"] = dict(self.usage)
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        return payload
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"

@@ -256,7 +256,10 @@ class TestBuildRequest:
         })
         # 客户端的鉴权/身份头被丢弃，authorization 保留的是账号自身凭证
         assert headers["Authorization"] == "Bearer a.b.c"
-        assert "x-api-key" not in {h.lower() for h in headers}
+        # x-api-key 恒为本账号 JWT 自身（官方 anthropic SDK 与 Bearer 同值双发，
+        # vlelyanin 实证：缺失会被 start-plan 网关判为非客户端流量），
+        # 绝不是客户端透传的 "leak"
+        assert headers["x-api-key"] == "a.b.c"
         assert headers.get("x-zcode-foo") is None
         assert headers["User-Agent"] != "UA/1"
         assert headers.get("x-custom") == "keep"

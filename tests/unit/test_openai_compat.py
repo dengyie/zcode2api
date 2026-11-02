@@ -223,3 +223,55 @@ class TestStreamConverter:
         conv.start()
         assert conv.feed({"type": "ping"}) == []
         assert conv.feed({"type": "content_block_stop", "index": 0}) == []
+
+
+class TestJsonModeAndEffort:
+    """结构化输出与思考强度：anthropic wire 没有 response_format，用 system 指令逼近。"""
+
+    def test_json_object_appends_directive(self):
+        body, err = openai_to_anthropic({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        })
+        assert err is None
+        assert "JSON object" in body["system"]
+
+    def test_json_schema_includes_schema(self):
+        body, err = openai_to_anthropic({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object", "properties": {"a": {"type": "integer"}}}},
+            },
+        })
+        assert err is None
+        assert "JSON Schema" in body["system"]
+        assert '"a"' in body["system"]
+
+    def test_no_format_leaves_system_absent(self):
+        body, _ = openai_to_anthropic({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        assert "system" not in body
+
+    def test_reasoning_effort_maps_to_output_config(self):
+        for effort in ("low", "medium", "high", "max"):
+            body, _ = openai_to_anthropic({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": effort,
+            })
+            assert body["output_config"] == {"effort": effort}
+
+    def test_responses_style_reasoning_object(self):
+        body, _ = openai_to_anthropic({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "HIGH"},
+        })
+        assert body["output_config"] == {"effort": "high"}
+
+    def test_invalid_effort_ignored(self):
+        body, _ = openai_to_anthropic({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "unlimited",
+        })
+        assert "output_config" not in body

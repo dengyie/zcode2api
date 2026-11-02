@@ -103,8 +103,12 @@ def build_identity_headers(account=None) -> dict[str, str]:
     return headers
 
 
-def build_trace_headers() -> dict[str, str]:
+def build_trace_headers(session_id: str | None = None) -> dict[str, str]:
     """追踪头：每请求全新 UUID（对齐官方 3.16.3 attribution 构造器）。
+
+    session_id 传入时复用为 x-session-id —— 官方同一会话内 x-session-id 与
+    metadata.user_id blob 的 session_id 是同值，二者必须一致（不一致会构成
+    指纹矛盾）。未传入则新生成。
 
     历史注记：旧实现按 zapi（3.10.2 时代）静态分析做 start-plan/coding-plan
     分级——start-plan 只发 request-id/session-type/trace-id 三件，理由是
@@ -127,5 +131,5 @@ def build_trace_headers() -> dict[str, str]:
         "x-zcode-trace-id": str(uuid.uuid4()),
         "x-query-id": str(uuid.uuid4()),
         "x-zcode-query-source": "main_turn",
-        "x-session-id": str(uuid.uuid4()),
+        "x-session-id": session_id or str(uuid.uuid4()),
     }

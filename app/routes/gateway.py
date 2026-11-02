@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import secrets
 import time
 
@@ -22,7 +23,9 @@ from ..captcha import captcha_manager
 from ..models import Account, Status
 from ..openai_compat import StreamConverter, anthropic_to_openai, openai_to_anthropic
 from ..quota import fetch_quota
+from ..responses_compat import ResponsesStreamConverter, chat_to_response, responses_to_chat
 from ..store import store
+from ..token_estimate import estimate_input_tokens
 
 _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染全局 asyncio
 
@@ -301,6 +304,102 @@ async def chat_completions(request: Request):
     return JSONResponse(anthropic_to_openai(data, model))
 
 
+@router.post("/v1/messages/count_tokens", dependencies=[Depends(verify_gateway_key)])
+async def count_tokens(request: Request):
+    """Anthropic count_tokens 端点：本地确定性估算。
+
+    上游（Plan 通道与 api.z.ai）**没有**这个端点（2026-11-02 实测 404），但
+    Anthropic SDK / Claude Code 会先调它做上下文预算，缺了会直接中断会话。
+    这里只做估算：不占账号额度、不打上游、不需要可用账号（池空也能回）。
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request"}}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}},
+            status_code=400,
+        )
+    model = body.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return JSONResponse({"error": {"message": "必须提供 model 参数", "type": "invalid_request_error"}}, status_code=400)
+    return {"input_tokens": estimate_input_tokens(_normalize_body(body))}
+
+
+@router.post("/v1/responses", dependencies=[Depends(verify_gateway_key)])
+async def responses(request: Request):
+    """OpenAI Responses API 兼容端点（入站 Responses → chat → anthropic，出站反向）。
+
+    调度、重试、换号、验证码与 /v1/chat/completions 完全一致，只在两头做形状翻译。
+    """
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": {"message": "请求体不是合法 JSON", "type": "invalid_request_error"}}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}, status_code=400)
+
+    chat, err = responses_to_chat(payload)
+    if err or chat is None:
+        return JSONResponse({"error": {"message": err or "请求体不合法", "type": "invalid_request_error"}}, status_code=400)
+    body, err = openai_to_anthropic(chat)
+    if err or body is None:
+        return JSONResponse({"error": {"message": err or "请求体不合法", "type": "invalid_request_error"}}, status_code=400)
+
+    incoming_headers = dict(request.headers)
+    provider = _detect_provider(body, request.headers)
+    body = _normalize_body(body)
+
+    req_id = secrets.token_hex(8)
+    logs.req(req_id, str(body.get("model") or "-"), bool(payload.get("stream")), _last_user_text(body))
+    reqlog.begin(req_id, "responses", str(body.get("model") or "-"),
+                 bool(payload.get("stream")), _last_user_text(body))
+
+    try:
+        result = await _dispatch(req_id, body, incoming_headers, provider)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499)
+        raise
+    except Exception as err:  # noqa: BLE001 - 调度层意外异常也要收口监控条目
+        reqlog.finish_error(req_id, f"网关内部错误: {err}", status=500)
+        return JSONResponse(
+            {"error": {"message": "网关内部错误", "type": "internal_error"}},
+            status_code=500,
+        )
+    if not isinstance(result, _Upstream):
+        return result
+
+    model = str(body.get("model") or "")
+    if payload.get("stream"):
+        try:
+            return _responses_stream_response(result, model, req_id, payload)
+        except asyncio.CancelledError:
+            await result.close()
+            raise
+
+    try:
+        raw = await result.resp.aread()
+        logs.req_ok(req_id)
+    except asyncio.CancelledError:
+        reqlog.finish_error(req_id, "客户端断开", status=499, t_first=result.t_first)
+        raise
+    except Exception as err:  # noqa: BLE001
+        logs.req_err(req_id, f"读取上游响应失败: {err}")
+        reqlog.finish_error(req_id, f"读取上游响应失败: {err}", status=502)
+        return JSONResponse({"error": {"message": f"读取上游响应失败: {err}", "type": "upstream_error"}}, status_code=502)
+    finally:
+        await result.close()
+    data = _safe_json(raw.decode("utf-8", "ignore"))
+    if not isinstance(data, dict) or data.get("type") != "message":
+        reqlog.finish_error(req_id, "上游响应格式异常", status=502, t_first=result.t_first)
+        return JSONResponse({"error": {"message": "上游响应格式异常", "type": "upstream_error"}}, status_code=502)
+    usage = data.get("usage") or {}
+    reqlog.finish_ok(req_id, t_first=result.t_first, status=result.resp.status_code,
+                     input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))
+    return JSONResponse(chat_to_response(anthropic_to_openai(data, model), model))
+
+
 def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> StreamingResponse:
     """把上游 Anthropic SSE 事件流转换为 OpenAI chunk 流。"""
     conv = StreamConverter(model)
@@ -323,6 +422,47 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
             reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
                              input_tokens=conv.usage.get("prompt_tokens"),
                              output_tokens=conv.usage.get("completion_tokens"))
+        except asyncio.CancelledError:
+            reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
+            raise
+        except Exception as err:  # noqa: BLE001
+            logs.req_err(req_id, f"流传输中断: {err}")
+            reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
+        finally:
+            await up.close()
+
+    return StreamingResponse(_iter(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
+
+
+def _responses_stream_response(up: _Upstream, model: str, req_id: str,
+                               payload: dict) -> StreamingResponse:
+    """上游 Anthropic SSE → Responses 事件族（经 chat chunk 中转，复用两套转换器）。"""
+    chat_conv = StreamConverter(model)
+    resp_conv = ResponsesStreamConverter(model, payload)
+
+    async def _iter():
+        try:
+            for out in resp_conv.start():
+                yield out
+            async for line in up.resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str:
+                    continue
+                evt = _safe_json(data_str)
+                if not isinstance(evt, dict):
+                    continue
+                for chunk in chat_conv.feed_events(evt):
+                    for out in resp_conv.feed_chunk(chunk):
+                        yield out
+            for out in resp_conv.done():
+                yield out
+            logs.req_ok(req_id)
+            reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
+                             input_tokens=chat_conv.usage.get("prompt_tokens"),
+                             output_tokens=chat_conv.usage.get("completion_tokens"))
         except asyncio.CancelledError:
             reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
             raise
@@ -791,12 +931,28 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 #（与上方 3012/401/403 切回退同一语义）
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
-                    wait = _parse_retry_after(resp.headers.get("retry-after")) or settings.RETRY_429_WAIT
-                    logs.warn(
-                        req_id,
-                        f"账号 {account.name} 被限流 429，{wait}s 后重试"
-                        f"（{retries_429}/{settings.RETRY_429_TIMES}）",
-                    )
+                    # 3009「model concurrency limit exceeded」= 并发争用，不是频控：
+                    # 上游不给 Retry-After，槽位通常几秒内释放。等默认 60s 会把
+                    # 客户端白白吊死。短退避 + 抖动打散重试。
+                    concurrency_hit = "3009" in text or "concurrency limit" in text.lower()
+                    wait = _parse_retry_after(resp.headers.get("retry-after"))
+                    if wait is None:
+                        if concurrency_hit:
+                            wait = settings.RETRY_429_CONCURRENCY_WAIT + random.randint(0, 2)
+                        else:
+                            wait = settings.RETRY_429_WAIT
+                    if concurrency_hit:
+                        logs.warn(
+                            req_id,
+                            f"账号 {account.name} 模型并发已满（3009），{wait}s 后重试"
+                            f"（{retries_429}/{settings.RETRY_429_TIMES}）",
+                        )
+                    else:
+                        logs.warn(
+                            req_id,
+                            f"账号 {account.name} 被限流 429，{wait}s 后重试"
+                            f"（{retries_429}/{settings.RETRY_429_TIMES}）",
+                        )
                     _park_slot(slot_box)
                     await _sleep(wait)
                     if not _reacquire_slot(account, slot_box):

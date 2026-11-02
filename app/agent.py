@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from . import body_transform, constants, settings
 from .identity import build_identity_headers, build_trace_headers
@@ -92,16 +93,33 @@ def build_request(
 
     if provider == "zai" and account.uses_plan_channel() and not force_fallback:
         # JWT 通道：全量身份头 + 追踪头（对齐官方客户端 pio + trace 头序）
+        from .fingerprint import profile_for
+
+        profile = profile_for(account)
+        # 会话粘性：同首轮文本 → 同 session_id（官方会话内稳定，cache 依赖它）。
+        # 必须在 transform_body 之前算——日期轮会被插到 messages[0]。
+        session_id = body_transform.conversation_session_id(body, account.id) or str(uuid.uuid4())
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None
-        body = body_transform.transform_body(body, user_id, model)
+        body = body_transform.transform_body(
+            body, user_id, model,
+            device_mid=profile.device_mid,
+            session_id=session_id,
+        )
         headers = {
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
+            # start-plan 网关的 harness 要求：mid-conversation system 能力位，
+            # 官方客户端 LLM 调用恒带（vlelyanin / TriDefender 双源一致）。
+            "anthropic-beta": "mid-conversation-system-2026-04-07",
             **build_identity_headers(account),
-            **build_trace_headers(),
+            **build_trace_headers(session_id),
         }
+        # 官方 anthropic SDK 同时下发 x-api-key（与 Bearer 同值）；
+        # 缺失会被 start-plan 网关视为非客户端流量（vlelyanin 实证）。
+        if account.jwt_token:
+            headers["x-api-key"] = account.jwt_token
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集
         headers = {

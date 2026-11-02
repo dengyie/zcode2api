@@ -37,6 +37,11 @@ BILLING_BALANCE_PATH = "/billing/balance"
 USAGE_PATH = "/usage"
 # WAF 风险点：billing/* 连续查询易触发拦截，轮询必须错峰（docs 05 §风险控制）
 
+# Coding 平面额度：api.z.ai 自有端点（与 billing 族是两套独立账本）。
+# 鉴权用 `authorization: <api_key>`（裸值，无 Bearer，也不是 JWT）。
+# 2026-11-02 实测：体验套餐号返回 {"code":500,"msg":"当前用户不存在coding plan"}。
+CODING_LIMIT_URL = f"{ZAI_API_ORIGIN}/api/monitor/usage/quota/limit"
+
 # ── OAuth ────────────────────────────────────────────────────────────────────
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}

@@ -23,7 +23,7 @@ from ..claim import (
 from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
-from ..quota import fetch_quota, refresh_accounts
+from ..quota import fetch_coding_limits, fetch_quota, refresh_accounts
 from ..store import store
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
@@ -202,6 +202,20 @@ async def refresh_one(account_id: str):
         return {"ok": False, "message": blocked, "account": acc.public_view()}
     res = await fetch_quota(acc)
     return {"ok": "error" not in res, "result": res, "account": acc.public_view()}
+
+
+@router.get("/accounts/{account_id}/coding_limits")
+async def coding_limits(account_id: str):
+    """Coding 平面额度（api.z.ai monitor 端点，按 API Key 鉴权）。
+
+    与 billing 族是两套账本：Plan 通道额度看 `quota` 快照，API Key 直连
+    api.z.ai 的额度只能从这里看。体验套餐号常返回「当前用户不存在 coding plan」。
+    """
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    res = await fetch_coding_limits(acc)
+    return {"ok": "error" not in res, **res}
 
 
 # ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
