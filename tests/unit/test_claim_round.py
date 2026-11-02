@@ -377,3 +377,21 @@ async def test_auto_claim_skip_plan_ids_skips_claim_only(monkeypatch):
     assert claimed == ["p-new"], "退避中的套餐不得打 claim"
     assert [o["plan_id"] for o in outcomes] == ["p-new"]
     assert all(o["ok"] for o in outcomes)
+
+
+def test_activation_err_text_empty_message_uses_class_name():
+    """httpx 部分异常 str 为空 → 回退类名（2026-11-03 线上：日志只剩「上报失败: 」）。"""
+    import httpx
+
+    import app.claim as claim_module
+
+    err = claim_module._activation_err_text("app_daily_active", httpx.ReadError(""))
+    assert err == "激活事件 app_daily_active 上报失败: ReadError"
+
+
+def test_activation_err_text_keeps_nonempty_detail():
+    import app.claim as claim_module
+
+    err = claim_module._activation_err_text(
+        "app_launch", RuntimeError("event/report app_launch HTTP 500: boom"))
+    assert err == "激活事件 app_launch 上报失败: event/report app_launch HTTP 500: boom"

@@ -192,8 +192,15 @@ async def report_activation_events(account: Account) -> str | None:
         try:
             await post_activation_event(profile, user_id, element)
         except (httpx.HTTPError, RuntimeError) as err:
-            return f"激活事件 {element} 上报失败: {err}"
+            return _activation_err_text(element, err)
     return None
+
+
+def _activation_err_text(element: str, err: Exception) -> str:
+    """激活失败文案。httpx 的部分异常（ReadError 等）str 为空——空串时回退
+    异常类名，否则日志只剩「上报失败: 」查无可查（2026-11-03 线上实锤）。"""
+    detail = str(err).strip() or type(err).__name__
+    return f"激活事件 {element} 上报失败: {detail}"
 
 
 # 激活上报每日去重门：账号 id → 最近一次**成功**上报的本地日期。
