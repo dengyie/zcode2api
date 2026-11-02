@@ -86,7 +86,7 @@ async function load(){
     document.getElementById('gateway-key').value=d.gateway_key_masked||'';
     document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
     document.getElementById('account-concurrency').value=d.account_concurrency??2;
-    document.getElementById('claim-round-interval').value=d.claim_round_interval??600;
+    document.getElementById('claim-round-interval').value=d.claim_round_interval??3600;
     document.getElementById('claim-round-hours').value=d.claim_round_hours??'';
     const hint=document.getElementById('admin-key-default-hint');
     if(hint) hint.style.display=d.admin_key_is_default?'block':'none';
@@ -109,7 +109,7 @@ async function saveSettings(){
   if(isNaN(claim_round_interval)||claim_round_interval<0)return showToast('自动领取轮间隔必须是非负整数（0 = 关闭）','error');
   const claim_round_hours=document.getElementById('claim-round-hours').value.trim();
   if(claim_round_hours && claim_round_hours!=='*' &&
-     !claim_round_hours.replace('，',',').split(',').every(p=>{const n=parseInt(p,10);return !p.trim()||(!isNaN(n)&&n>=0&&n<=23);}))
+     !claim_round_hours.replace(/，/g,',').split(',').every(p=>{const n=parseInt(p,10);return !p.trim()||(!isNaN(n)&&n>=0&&n<=23);}))
     return showToast('领取窗口必须是 0-23 的小时，逗号分隔（留空 = 全天）','error');
   const payload={quota_refresh_interval,account_concurrency,claim_round_interval,claim_round_hours};
   if(!_isSecretMask(admin_key)) payload.admin_key=admin_key;

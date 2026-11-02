@@ -523,7 +523,7 @@ class ClaimRoundManager:
         while not self._stop.is_set():
             interval = store.claim_round_interval()  # 实时读取设置，改后即生效
             hours = store.claim_round_hours()
-            if interval > 0 and self._in_window(hours):
+            if self._should_run(interval, hours):
                 try:
                     await self._round()
                 except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
@@ -534,6 +534,11 @@ class ClaimRoundManager:
                 return
             except TimeoutError:
                 continue
+
+    @classmethod
+    def _should_run(cls, interval: int, hours: list[int], now: float | None = None) -> bool:
+        """本轮是否执行：轮次启用（interval>0）且（无窗口限制 或 当前在窗口内）。"""
+        return interval > 0 and cls._in_window(hours, now)
 
     # ── 领取窗口调度（北京时间）─────────────────────────────────────────────
     # 上游套餐按天投放，用户侧实证每天 19:00 放量。窗口锚定北京时钟而非 host

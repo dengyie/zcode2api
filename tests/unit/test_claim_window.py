@@ -81,3 +81,44 @@ class TestStoreParsing:
     def test_env_override_for_fresh_store(self, fresh_app, monkeypatch):
         monkeypatch.setattr(settings, "CLAIM_ROUND_HOURS", "8,22")
         assert Store().claim_round_hours() == [8, 22]
+
+
+class TestShouldRun:
+    """_loop 门控的组合语义（review：门控表达式此前内联不可测）。"""
+
+    def test_disabled_interval_never_runs(self):
+        noon = _utc(2026, 11, 3, 11, 0, 0)  # 北京 19:00
+        for hours in ([], [19], [1]):
+            assert ClaimRoundManager._should_run(0, hours, noon) is False
+
+    def test_runs_only_inside_window(self):
+        assert ClaimRoundManager._should_run(1800, [19], TestWindowMath.BJ_19) is True
+        assert ClaimRoundManager._should_run(1800, [19], TestWindowMath.BJ_18) is False
+        assert ClaimRoundManager._should_run(1800, [19, 20, 21], TestWindowMath.BJ_20) is True
+
+    def test_no_window_runs_always_when_enabled(self):
+        assert ClaimRoundManager._should_run(1800, [], TestWindowMath.BJ_18) is True
+
+
+class TestDirtyHoursFallback:
+    """全脏值配置回落默认（review P3：坏配置不得静默升级成「全天轮询」）。"""
+
+    def test_all_dirty_falls_back_to_default(self, fresh_app):
+        fresh_app.set_setting("claim_round_hours", "abc")
+        assert fresh_app.claim_round_hours() == [19]  # settings.CLAIM_ROUND_HOURS 默认 "19"
+
+    def test_mixed_still_keeps_valid_tokens(self, fresh_app):
+        fresh_app.set_setting("claim_round_hours", "19, abc, 25, -1, 7")
+        assert fresh_app.claim_round_hours() == [7, 19]
+
+    def test_explicit_empty_is_full_day_not_fallback(self, fresh_app):
+        """显式空/* = 用户主动全天，不走回落。"""
+        for raw in ("", "*"):
+            fresh_app.set_setting("claim_round_hours", raw)
+            assert fresh_app.claim_round_hours() == []
+
+    def test_dirty_default_env_falls_to_full_day(self, fresh_app, monkeypatch):
+        """默认值本身也坏（env 笔误）：回落解析结果 [] = 全天，且有日志可查。"""
+        monkeypatch.setattr(settings, "CLAIM_ROUND_HOURS", "xyz")
+        fresh_app.set_setting("claim_round_hours", "abc")
+        assert fresh_app.claim_round_hours() == []
