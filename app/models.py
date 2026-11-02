@@ -111,6 +111,10 @@ class Account:
     recent_results: list = field(default_factory=list)  # 最近请求结果 tick（True 成功/False 失败），最新在末尾
     last_used_at: float | None = None
     last_checked_at: float | None = None
+    # 额度快照的「可信时间」：只在 billing/balance **成功取到数据**、quota 被真正
+    # 写过的那一刻更新。与 last_checked_at（含失败/去抖，仅用于节流）区分开——
+    # 过期判定只认这个（见 quota_expired：过期后还没成功查过 = 未知，不封号）。
+    quota_verified_at: float | None = None
     cooling_until: float | None = None
     last_error: str | None = None
     created_at: float = field(default_factory=time.time)
@@ -197,11 +201,30 @@ class Account:
 
         口径：`quota` 为空 = **未知**（新号/尚未刷新），不判过期，否则会把可用
         账号挡在门外；只有取到记录且**每一个**窗口都不可用时才判 True。
+
+        追加口径（2026-11-03）：额度窗口是**滚动日窗**，快照天然会过时——快照若
+        取自最新到期时间**之前**，它没有资格判死。「有余额但全部过期」必须由
+        **过期之后的一次成功查询**确认（`quota_verified_at > 最新 expires_at`），
+        否则按未知处理、继续让账号参与轮询。实证：trial 号日窗
+        `expires_at=11-02 23:59:59`，11-03 00:39 上游照回 200（新窗到 11-03
+        23:59:59），而本地因 `quota_refresh_interval=0` 永不刷新，旧逻辑把能用的号
+        永久封成 503。反例（要保住的行为）：老号 `expires_at` 在 28 天前、且过期后
+        成功查过 → 仍判过期，不会每次请求先撞一次必然失败的 1005。
         """
         if not self.quota:
             return False
         now = now or time.time()
-        return not any(window_usable(w, now) for w in self.quota.values())
+        if any(window_usable(w, now) for w in self.quota.values()):
+            return False
+        # 余额本身已归零 = 确定耗尽，与快照新旧无关（赠送池由调用方另判）
+        if not any((w.get("remaining") or 0) > 0 for w in self.quota.values()):
+            return True
+        # 有余额、但每个窗口都过了期：可能只是快照停在上一轮日窗 → 需确认
+        ends = [e for e in (expires_epoch(w.get("expires_at")) for w in self.quota.values()) if e]
+        if not ends:
+            return True
+        verified = self.quota_verified_at
+        return bool(verified and verified > max(ends))
 
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
         """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。
@@ -306,6 +329,10 @@ class Account:
             "recent_results": self.recent_results,
             "last_used_at": self.last_used_at,
             "last_checked_at": self.last_checked_at,
+            "quota_verified_at": self.quota_verified_at,
+            # 轮询是否会选中它（额度判死/冷却/停用都在这里体现）：后台排障时
+            # 「状态 active 但不发请求」最常见的原因就是这一项为 false
+            "selectable": self.is_selectable(),
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
             "created_at": self.created_at,

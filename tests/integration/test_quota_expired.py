@@ -38,6 +38,8 @@ async def test_expired_windows_mark_exhausted(gateway_client, fresh_app):
     assert after.last_error == "额度已过期"
     # 快照照常落库（前端要能看到「已过期但还有 X 余额」）
     assert after.quota["GLM-5.3"]["remaining"] == 2_000_000
+    # 判死必须带「过期后成功查过」的证据（滚动日窗：没查过的过期快照不封号）
+    assert after.quota_verified_at and after.quota_verified_at > time.time() - 60
     assert after.is_selectable() is False
 
 

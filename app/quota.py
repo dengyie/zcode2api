@@ -187,6 +187,10 @@ async def fetch_quota(account: Account) -> dict:
                 if bal_plans and not account.plans:
                     account.plans = bal_plans
                     account.plan = bal_plans[0]
+                # 真正把 quota 快照刷新成功的时刻：只有它能把「全部窗口过期」从
+                # 未知升级为已确认（见 models.Account.quota_expired）。放在这里而不是
+                # 请求发起处，避免「查了一圈全业务错误」也把账号判死。
+                account.quota_verified_at = now
             for bal in [b for b in (data.get("data") or {}).get("balances") or []
                         if code is None]:
                 name = bal.get("show_name") or bal.get("model") or "model"

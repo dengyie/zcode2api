@@ -61,11 +61,26 @@ class TestQuotaExpired:
         assert _acc().quota_expired(_NOW) is False
 
     def test_all_windows_expired(self):
+        """2026-10-31 线上形态：快照是过期**之后**取的 → 已确认，判死。"""
         acc = _acc({
             "GLM-5.3": {"remaining": 0, "expires_at": _NOW - 10},
             "GLM-5.3-Flash": {"remaining": 100_000_000, "expires_at": _NOW - 86400},
-        })
+        }, quota_verified_at=_NOW - 5)
         assert acc.quota_expired(_NOW) is True
+
+    def test_expired_snapshot_without_post_expiry_check_is_unknown(self):
+        """2026-11-03 线上形态：日窗滚动，快照停在上一轮 → 不能据此判死。
+
+        实证：trial 号 `expires_at=11-02 23:59:59`，11-03 00:39 上游照回 200
+        （新窗到 11-03 23:59:59）。快照取自过期之前，等于没有「过期后」的证据。
+        """
+        acc = _acc({"GLM-5.3-Flash": {"remaining": 100_000_000, "expires_at": _NOW - 600}},
+                   quota_verified_at=_NOW - 3600)  # 查询发生在到期之前
+        assert acc.quota_expired(_NOW) is False
+
+    def test_never_refreshed_expired_snapshot_is_unknown(self):
+        acc = _acc({"GLM-5.3-Flash": {"remaining": 100, "expires_at": _NOW - 600}})
+        assert acc.quota_expired(_NOW) is False
 
     def test_one_live_window_is_enough(self):
         acc = _acc({
@@ -75,14 +90,28 @@ class TestQuotaExpired:
         assert acc.quota_expired(_NOW) is False
 
     def test_all_zero_remaining_is_expired_too(self):
+        """余额归零是确定耗尽，与快照新旧无关（不需要过期后确认）。"""
         acc = _acc({"GLM-5.3": {"remaining": 0, "expires_at": _NOW + 60}})
+        assert acc.quota_expired(_NOW) is True
+
+    def test_iso_expiry_parsed(self):
+        import time as _t
+
+        iso = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(_NOW - 60))
+        acc = _acc({"GLM-5.3": {"remaining": 10, "expires_at": iso}}, quota_verified_at=_NOW)
         assert acc.quota_expired(_NOW) is True
 
 
 class TestSelectable:
     def test_expired_quota_not_selectable(self):
-        acc = _acc({"GLM-5.3-Flash": {"remaining": 100_000_000, "expires_at": _NOW - 86400}})
+        acc = _acc({"GLM-5.3-Flash": {"remaining": 100_000_000, "expires_at": _NOW - 86400}},
+                   quota_verified_at=_NOW - 60)
         assert acc.is_selectable(_NOW) is False
+
+    def test_stale_expired_quota_still_selectable(self):
+        """快照过时（查询早于到期）不算判死——让请求去问上游，而不是 503。"""
+        acc = _acc({"GLM-5.3-Flash": {"remaining": 100, "expires_at": _NOW - 60}})
+        assert acc.is_selectable(_NOW) is True
 
     def test_live_quota_selectable(self):
         acc = _acc({"GLM-5.3-Flash": {"remaining": 10, "expires_at": _NOW + 60}})
@@ -100,6 +129,11 @@ class TestSelectable:
         assert acc.is_selectable(_NOW) is True
 
     def test_expired_quota_defaults_to_real_now(self):
-        """不传 now 时用真实时钟（回归：曾把 expires_at 当秒数比较而漏判）。"""
-        acc = _acc({"GLM-5.3": {"remaining": 10, "expires_at": time.time() - 10}})
+        """不传 now 时用真实时钟（回归：曾把 expires_at 当秒数比较而漏判）。
+
+        需要「过期后成功查过」才判死（滚动日窗，见 quota_expired）。
+        """
+        now = time.time()
+        acc = _acc({"GLM-5.3": {"remaining": 10, "expires_at": now - 10}},
+                   quota_verified_at=now)
         assert acc.is_selectable() is False
