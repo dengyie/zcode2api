@@ -84,7 +84,7 @@ async function load(){
     const d=await api('GET','/settings');
     document.getElementById('admin-key').value=d.admin_key_masked||'';
     document.getElementById('gateway-key').value=d.gateway_key_masked||'';
-    document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
+    document.getElementById('quota-interval').value=d.quota_refresh_interval??1800;
     document.getElementById('account-concurrency').value=d.account_concurrency??2;
     document.getElementById('claim-round-interval').value=d.claim_round_interval??3600;
     document.getElementById('claim-round-hours').value=d.claim_round_hours??'';
