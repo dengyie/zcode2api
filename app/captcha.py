@@ -106,25 +106,41 @@ class CaptchaManager:
             if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
                 return self._config_cache[tag]
             err: Exception | None = None
-            for _ in range(2):  # 15s 走 US 代理偶发 ReadTimeout，重试一次（err 的 str 常为空）
+
+            async def _try_fetch(use_proxy: bool) -> dict | None:
+                """单次拉取（trust_env 按 use_proxy）；成功返回 captcha 配置。"""
                 try:
-                    async with httpx.AsyncClient(
-                        timeout=30, trust_env=tag == egress.PROXY
-                    ) as client:
+                    async with httpx.AsyncClient(timeout=30, trust_env=use_proxy) as client:
                         res = await client.get(
                             f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
                         )
                     res.raise_for_status()
-                    captcha = ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
-                    if captcha:
-                        self._config_cache[tag] = captcha
-                        self._config_cache_at[tag] = _now_ms()
-                        return captcha
+                    return ((res.json().get("data") or {}).get("configs") or {}).get("captcha")
                 except (httpx.HTTPError, ValueError) as exc:
+                    nonlocal err
                     err = exc
+                    return None
+
+            captcha: dict | None = None
+            for _ in range(2):  # 15s 走 US 代理偶发 ReadTimeout，同出口重试一次
+                captcha = await _try_fetch(tag == egress.PROXY)
+                if captcha:
+                    break
+            if not captcha:
+                # 主出口两连败 → 另一条出口兜底（2026-11-04 线上实锤：proxy 整晚
+                # 超时而 direct 稳定；配置拿不到会误开「模型请求带码」→ 3012）
+                alt = egress.DIRECT if tag == egress.PROXY else egress.PROXY
+                captcha = await _try_fetch(alt == egress.PROXY)
+                if captcha:
+                    logs.info("captcha", f"出口 {tag} 拉取失败，已用 {alt} 兜底")
+            if captcha:
+                self._config_cache[tag] = captcha
+                self._config_cache_at[tag] = _now_ms()
+                return captcha
             logs.warn(
                 "captcha",
-                f"获取配置失败（出口={tag}），使用默认: {type(err).__name__ if err else '无响应'}: {err}",
+                f"获取配置失败（出口={tag}，含兜底），使用默认: "
+                f"{type(err).__name__ if err else '无响应'}: {err}",
             )
             return dict(constants.CAPTCHA_DEFAULTS)
 

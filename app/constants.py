@@ -94,13 +94,17 @@ ACTIVATION_ELEMENTS = ("app_launch", "app_daily_active")
 ACTIVATION_SCREEN_RESOLUTION = "2560x1440"
 
 # ── 验证码默认配置（client/configs 拉取失败时的兜底；region 实测线上为 cn）────
-# skip_model_request 缺省 False：官方无配置时按「模型请求也要验证码」处理
+# skip_model_request 缺省 True（2026-11-04 线上实锤）：真实配置是
+# skip_model_request=true（官方客户端模型请求不带码）；拉取失败时若误按
+# 「带码」处理，会给 messages 挂上官方客户端不会带的验证码 token —— 上游直接
+# 3012 unusual activity，且每号 4 次自动升级禁用。fail-safe 方向 = 官方形态
+# （不带码）；上游若真挑战（3007/响应头/文案），gateway 已有补码重试兜底。
 CAPTCHA_DEFAULTS = {
     "enabled": True,
     "prefix": "no8xfe",
     "region": "cn",
     "sceneId": "11xygtvd",
-    "skip_model_request": False,
+    "skip_model_request": True,
 }
 
 # ── 模型名 ───────────────────────────────────────────────────────────────────

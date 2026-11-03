@@ -253,8 +253,9 @@ class TestModelRequestCaptchaGating:
         mgr = self._manager(monkeypatch, config)
         assert await mgr.model_requests_need_captcha(egress.PROXY) is expected
 
-    async def test_fetch_failure_falls_back_to_requiring_captcha(self, monkeypatch):
-        """拉取失败兜底也必须「要码」：兜底字典里 skip_model_request 显式为 False。"""
+    async def test_fetch_failure_falls_back_to_official_shape(self, monkeypatch):
+        """拉取失败兜底按官方形态「不带码」（2026-11-04 线上实锤：误带码 → 3012
+        风控 → 账号升级禁用；上游若真挑战另有补码重试兜底）。"""
         mgr = CaptchaManager()
 
         class _BoomClient:
@@ -273,5 +274,43 @@ class TestModelRequestCaptchaGating:
         monkeypatch.setattr("app.captcha.httpx.AsyncClient", _BoomClient)
         config = await mgr.fetch_config(egress.PROXY)
         assert config == constants.CAPTCHA_DEFAULTS
-        assert config["skip_model_request"] is False
-        assert await mgr.model_requests_need_captcha(egress.PROXY) is True
+        assert config["skip_model_request"] is True
+        assert await mgr.model_requests_need_captcha(egress.PROXY) is False
+
+    async def test_fetch_failure_falls_over_to_other_egress(self, monkeypatch):
+        """主出口两连败后必须用另一条出口兜底拉取，而不是直接落默认配置。"""
+        mgr = CaptchaManager()
+        calls: list[bool] = []
+
+        class _FlakyClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **kw):
+                calls.append(bool(kw.get("trust_env")))
+                if len(calls) <= 2:  # 主出口两次全败
+                    raise httpx.ConnectError("boom")
+                return _FakeResp({"data": {"configs": {"captcha": {
+                    "enabled": True, "skip_model_request": True}}}})
+
+        class _FakeResp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        monkeypatch.setattr("app.captcha.httpx.AsyncClient", _FlakyClient)
+        config = await mgr.fetch_config(egress.PROXY)
+        assert len(calls) == 3  # 主出口×2 + 兜底出口×1
+        assert config.get("skip_model_request") is True
+        assert await mgr.model_requests_need_captcha(egress.PROXY) is False
