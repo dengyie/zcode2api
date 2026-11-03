@@ -141,6 +141,8 @@ UPSTREAM = {
 
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
+# 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
+ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）
 ZCODE_EVENT_REPORT_URL = os.getenv("ZCODE_EVENT_REPORT_URL", constants.EVENT_REPORT_URL)
 
@@ -149,7 +151,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.14"
+APP_VERSION = "2.7.15"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

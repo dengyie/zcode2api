@@ -40,6 +40,7 @@ def claim_env(gateway_client, fresh_app, monkeypatch):
     monkeypatch.setattr(claim_module, "captcha_manager", stub)
     monkeypatch.setattr(captcha_module, "captcha_manager", stub)
     mock.state.claim_scenario = None  # session 级 mock，防止场景跨用例残留
+    mock.state.marketing_scenario = None
     acc = seed_account(fresh_app, GOOD_JWT, name="claim-a")
     return client, mock, stub, acc
 
@@ -59,6 +60,34 @@ class TestClaim:
         assert [g["name"] for g in plan["grants"]] == ["GLM-5.3"]
         assert plan["grants"][0]["units"] == 3_000_000
         assert plan["grants"][0]["period"] == "daily"
+
+    async def test_preview_merges_marketing_touch_plans(self, claim_env):
+        client, mock, _stub, _acc = claim_env
+        mock.state.marketing_scenario = "marketing_plan"
+        res = await client.get("/admin/api/claim/preview",
+                               headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        entry = res.json()["preview"][0]
+        assert entry["error"] is None
+        plan_ids = [p["plan_id"] for p in entry["plans"]]
+        # 优先级: mock-marketing-plan(120) > mock-claim-plan(100)
+        assert plan_ids == ["mock-marketing-plan", "mock-claim-plan"]
+        marketing_plan = entry["plans"][0]
+        assert marketing_plan["name"] == "Mock Marketing Plan"
+        assert marketing_plan["grants"][0]["name"] == "GLM-5.3-Flash"
+        assert marketing_plan["grants"][0]["units"] == 300_000_000
+
+    async def test_preview_discovers_marketing_plan_when_billing_preview_empty(self, claim_env):
+        client, mock, _stub, _acc = claim_env
+        mock.state.claim_scenario = "claim_none"
+        mock.state.marketing_scenario = "marketing_plan"
+        res = await client.get("/admin/api/claim/preview",
+                               headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        entry = res.json()["preview"][0]
+        assert entry["error"] is None
+        assert len(entry["plans"]) == 1
+        assert entry["plans"][0]["plan_id"] == "mock-marketing-plan"
 
     async def test_preview_business_failure_surfaced(self, claim_env):
         client, mock, _stub, _acc = claim_env

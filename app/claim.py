@@ -127,15 +127,90 @@ def parse_plan(raw: dict) -> dict | None:
     }
 
 
+def extract_plans_from_marketing_deliveries(deliveries: list) -> list[dict]:
+    """从 marketing/touch 的 deliveries 载荷中提取待领取套餐。
+
+    官方客户端结构实证（2026-11-03 逆向 + 线上实测）：
+    delivery.banner.buttons[].action: {"type": "claim_zcode_plan", "args": {"plan_id": "..."}}
+    delivery.banner.args.zcode_plan: {"plan_id": "...", "name": "...", "priority": ..., "entitlements": [...]}
+    """
+    plans: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def _scan(obj: object) -> None:
+        if isinstance(obj, dict):
+            # 1. 优先提取挂在 args 里的完整 zcode_plan
+            zp = obj.get("zcode_plan") or obj.get("zcodePlan")
+            if isinstance(zp, dict):
+                parsed = parse_plan(zp)
+                if parsed:
+                    pid = parsed["plan_id"]
+                    existing = next((p for p in plans if p["plan_id"] == pid), None)
+                    if existing is not None:
+                        existing.update(parsed)
+                    else:
+                        plans.append(parsed)
+                        seen_ids.add(pid)
+            # 2. 检查 claim_zcode_plan 按钮动作
+            action = obj.get("action")
+            if isinstance(action, dict) and action.get("type") == "claim_zcode_plan":
+                args = action.get("args") or {}
+                pid = str(args.get("plan_id") or args.get("planId") or "").strip()
+                if pid and pid not in seen_ids:
+                    plans.append({
+                        "plan_id": pid,
+                        "name": pid,
+                        "description": "活动投放套餐",
+                        "priority": 100,
+                        "grants": [],
+                    })
+                    seen_ids.add(pid)
+            for v in obj.values():
+                _scan(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _scan(item)
+
+    for delivery in deliveries or []:
+        _scan(delivery)
+
+    return plans
+
+
+async def fetch_marketing_touch_plans(account: Account) -> list[dict]:
+    """拉取 marketing/touch 接口下发的活动套餐（2026-11 官方实证）。
+
+    失败时仅记录并返回空列表，不阻断主流程。
+    """
+    from .quota import _auth_headers
+
+    try:
+        body = await _billing_request(
+            account, "GET", settings.ZCODE_MARKETING_TOUCH_URL,
+            headers=_auth_headers(account),
+            params={"seq": "0"},
+        )
+    except Exception as err:
+        logs.info("claim", f"账号 {account.name} marketing/touch 查询跳过（{err}）")
+        return []
+
+    code = _business_code(body)
+    if code != 0:
+        return []
+    deliveries = (body.get("data") or {}).get("deliveries") or []
+    return extract_plans_from_marketing_deliveries(deliveries)
+
+
 async def _billing_request(account: Account, method: str, path: str, **kwargs) -> dict:
     headers = dict(kwargs.pop("headers"))
+    url = path if path.startswith("http") else f"{settings.ZCODE_BILLING_BASE}{path}"
     try:
         # trust_env=False：billing 全家桶直连。实测「解码直连 + claim 直连」才能过
         # 上游风控（claim 走 US 出口被拒「unusual activity」，直连 code:0）；
         # messages 端点与此相反（直连曾被 3012 风控），仍走 env 的 US 代理。
         async with httpx.AsyncClient(timeout=25, trust_env=False) as client:
             res = await client.request(
-                method, f"{settings.ZCODE_BILLING_BASE}{path}",
+                method, url,
                 headers=headers, **kwargs,
             )
     except httpx.HTTPError as err:
@@ -286,7 +361,13 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
 
 
 async def preview_plans(account: Account) -> list[dict]:
-    """拉取账号当前可领取套餐，按优先级降序。"""
+    """拉取账号当前可领取套餐，按优先级降序。
+
+    双通道发现：
+    1. /billing/preview（常规预览端点）
+    2. /api/v1/marketing/touch（活动投放端点，2026-11 官方实证）
+    两者套餐按 plan_id 去重合并并按优先级降序排列。
+    """
     blocked = billing_block_reason(account, action="上游查询")
     if blocked:
         raise ClaimError(blocked)
@@ -306,6 +387,18 @@ async def preview_plans(account: Account) -> list[dict]:
         raise _fail_error(code, body)
     raw_plans = (body.get("data") or {}).get("plans") or []
     plans = [parsed for parsed in (parse_plan(p) for p in raw_plans) if parsed]
+
+    # 合并 marketing/touch 活动投放通道（官方客户端实证：活动套餐由此下发）
+    try:
+        marketing_plans = await fetch_marketing_touch_plans(account)
+        seen_ids = {p["plan_id"] for p in plans}
+        for mp in marketing_plans:
+            if mp["plan_id"] not in seen_ids:
+                plans.append(mp)
+                seen_ids.add(mp["plan_id"])
+    except Exception as err:
+        logs.warn("claim", f"账号 {account.name} marketing/touch 套餐合并异常: {err}")
+
     plans.sort(key=lambda p: (-p["priority"], p["plan_id"]))
     return plans
 
@@ -362,10 +455,12 @@ def _claim_outcome(body: dict, plan_id: str, plan_name: str, grants: list) -> di
         return int(val * 1000) if isinstance(val, (int, float)) and val > 0 else None
 
     server_time = data.get("server_time")
+    resp_name = str(plan.get("name") or "").strip()
+    parsed_grants = grants or (parse_plan(plan) or {}).get("grants", [])
     return {
         "plan_id": plan_id,
-        "plan_name": plan_name,
-        "grants": grants,
+        "plan_name": resp_name or plan_name or plan_id,
+        "grants": parsed_grants,
         "starts_at": _ms("starts_at"),
         "ends_at": _ms("ends_at"),
         "server_time": int(server_time * 1000) if isinstance(server_time, (int, float)) and server_time > 0 else None,

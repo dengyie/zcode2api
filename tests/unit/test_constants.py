@@ -19,27 +19,28 @@ def test_messages_urls():
 
 def test_billing_base():
     assert constants.BILLING_BASE == "https://zcode.z.ai/api/v1/zcode-plan"
+    assert constants.MARKETING_TOUCH_URL == "https://zcode.z.ai/api/v1/marketing/touch"
 
 
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
     # 实测带 platform 参数上游 3001，只允许 app_version
-    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.16.3"
+    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.17.1"
 
 
 def test_client_version_single_source():
-    # 官方客户端 3.16.3（2026-10-29 本机 mitm 实抓 + bundle 核对；前值 3.14.4）
+    # 官方客户端 3.17.1（2026-11-03 本机 app.asar 核对 + 逆向；前值 3.16.3 / 3.14.4）
     # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
-    assert constants.CLIENT_APP_VERSION == "3.16.3"
+    assert constants.CLIENT_APP_VERSION == "3.17.1"
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
     assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
     assert constants.CLIENT_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
 
 
 def test_billing_version_and_activation():
-    # billing 族与 messages 指纹版本同源（官方现行版 3.16.3）；zcode-switch 的
+    # billing 族与 messages 指纹版本同源（官方现行版 3.17.1）；zcode-switch 的
     # 「读注册表真实版」在 Linux hub 上收敛为钉常量，升级时改此处即可
-    assert constants.BILLING_APP_VERSION == "3.16.3"
+    assert constants.BILLING_APP_VERSION == "3.17.1"
     assert constants.BILLING_TITLE == "Z Code@electron"
     assert constants.BILLING_RELEASE_CHANNEL == "production"
     assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"

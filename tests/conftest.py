@@ -131,6 +131,7 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     })
     # 后台额度刷新也指向 Mock（billing/current|balance|usage）
     monkeypatch.setattr(settings, "ZCODE_BILLING_BASE", f"{base}/api/v1/zcode-plan")
+    monkeypatch.setattr(settings, "ZCODE_MARKETING_TOUCH_URL", f"{base}/api/v1/marketing/touch")
     # 激活事件上报也指向 Mock
     monkeypatch.setattr(settings, "ZCODE_EVENT_REPORT_URL", f"{base}/api/v1/event/report")
     # OAuth（cli init/poll + api-key 兑换链）全部收敛到 Mock —— 测试永不打真网

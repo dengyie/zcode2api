@@ -46,25 +46,33 @@ CODING_LIMIT_URL = f"{ZAI_API_ORIGIN}/api/monitor/usage/quota/limit"
 OAUTH_CLI_INIT_PATH = "/api/v1/oauth/cli/init"
 OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 
-# ── 客户端版本（单一真相源：官方客户端 3.16.3，2026-10-29 跟进）────────────────
+# ── 客户端版本（单一真相源：官方客户端 3.17.1，2026-11-03 跟进）────────────────
 # 客户端 claim 头实测缺版本/平台头 → 上游 3007；client/configs 带 platform 参数 → 3001
-# 出处：2026-10-29 本机官方客户端 mitm 实抓（User-Agent/X-ZCode-App-Version 均为
-# 3.16.3；app bundle zcode.cjs 同版）。前值 3.14.4（2026-10-02 注册表实测）。
+# 出处：2026-11-03 本机官方客户端（CFBundleShortVersionString 3.17.1，内部版本 3.17.1.9553；
+# asar bundle En="3.17.1"）。前值 3.16.3（2026-10-29）、3.14.4（2026-10-02）。
 # zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
 # billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，钉此常量为唯一真相源。
-# ⚠️ 上游疑似按客户端版本门槛投放活动套餐：钉旧版（3.11.2）时 preview 恒空，
-# 跟进官方现行版后恢复——发现 preview 为空时优先核对此常量是否落后于官方。
-CLIENT_APP_VERSION = "3.16.3"
+# ⚠️ 上游按客户端版本门槛投放活动套餐：2026-11-03 实测旧版（3.16.3）打 claim 报
+# 1004「不符合领取条件（no permission）」，跟进 3.17.1 立即成功领取 3 亿 token。
+# 发现 preview 为空或 1004 时优先核对此常量是否落后于官方客户端。
+CLIENT_APP_VERSION = "3.17.1"
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
-# bundle 实证（3.16.3）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
+# bundle 实证（3.17.1）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
 # mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
 
+# ── 营销触达 / 活动投放端点（2026-11-03 官方客户端逆向实证）───────────────────────
+# 官方活动套餐（如 zcode-v3-start-plan-MMDD）经由此服务（marketing-touch）下发，
+# 常规 billing/preview 端点保持为空。返回 deliveries[].banner/popup 中包含
+# action.type="claim_zcode_plan" 及 args.zcode_plan。
+MARKETING_TOUCH_PATH = "/api/v1/marketing/touch"
+MARKETING_TOUCH_URL = f"{ZCODE_ORIGIN}{MARKETING_TOUCH_PATH}"
+
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
-BILLING_APP_VERSION = "3.16.3"
+BILLING_APP_VERSION = "3.17.1"
 BILLING_TITLE = "Z Code@electron"        # bundle：sourceTitle 缺省即 electron（CLI surface 才覆盖 cli）
 BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_ENV=test 才 test）；
                                          # 旧值 stable 系 3.11.2 时代 zcode-switch 静态对齐，已过时
