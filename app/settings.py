@@ -141,6 +141,12 @@ UPSTREAM = {
 
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
+# 官方更新清单端点（测试时指向 Mock 上游）
+ZCODE_MANIFEST_URL = os.getenv("ZCODE_MANIFEST_URL", constants.ELECTRON_MANIFEST_URL)
+# 官方版本自动探测间隔（秒，默认 12 小时）
+VERSION_CHECK_INTERVAL = _int("ZCODE_VERSION_CHECK_INTERVAL", 43200)
+# 是否自动将客户端伪装对齐至官方最新版本
+AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
 # 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
 ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）
@@ -151,7 +157,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.15"
+APP_VERSION = "2.7.16"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

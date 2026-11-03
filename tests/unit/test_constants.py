@@ -20,6 +20,32 @@ def test_messages_urls():
 def test_billing_base():
     assert constants.BILLING_BASE == "https://zcode.z.ai/api/v1/zcode-plan"
     assert constants.MARKETING_TOUCH_URL == "https://zcode.z.ai/api/v1/marketing/touch"
+    assert constants.ELECTRON_MANIFEST_URL == "https://zcode.z.ai/api/v1/releases/electron/manifest?platform=darwin-aarch64&channel=1"
+
+
+def test_set_active_version():
+    orig = constants.CLIENT_APP_VERSION
+    try:
+        constants.set_active_version("3.18.0")
+        assert constants.CLIENT_APP_VERSION == "3.18.0"
+        assert constants.BILLING_APP_VERSION == "3.18.0"
+        assert constants.USER_AGENT == "ZCode/3.18.0"
+        assert constants.X_ZCODE_APP_VERSION == "3.18.0"
+        assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.18.0"
+        # v/V 前缀必须剥离（官方 X-ZCode-App-Version 为纯数字形态，"ZCode/v3"
+        # 是指纹漂移）；空串/裸 v 不改动现状
+        constants.set_active_version("v3.19.0")
+        assert constants.CLIENT_APP_VERSION == "3.19.0"
+        assert constants.USER_AGENT == "ZCode/3.19.0"
+        constants.set_active_version("V4.0.0")
+        assert constants.CLIENT_APP_VERSION == "4.0.0"
+        cur = constants.CLIENT_APP_VERSION
+        constants.set_active_version("")
+        constants.set_active_version("v")
+        assert constants.CLIENT_APP_VERSION == cur
+    finally:
+        constants.set_active_version(orig)
+
 
 
 def test_client_configs():

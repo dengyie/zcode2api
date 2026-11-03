@@ -415,6 +415,33 @@ def build_app() -> FastAPI:
         return Response(json.dumps({"code": 0, "msg": "", "data": {"deliveries": []}}),
                         media_type="application/json")
 
+    async def _releases_electron_manifest(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        scenario = getattr(app.state, "manifest_scenario", None) or headers.get("x-mock-manifest-scenario")
+        if scenario == "fail_500":
+            return Response("Internal Server Error", status_code=500)
+        ver = getattr(app.state, "mock_manifest_version", "3.17.2")
+        yaml_content = f"""version: {ver}
+releaseDate: "2026-11-02T06:43:49.471Z"
+releaseName: Release v{ver}
+releaseNotes: |-
+    ## 新功能
+    - 官方发布新版
+releaseNotesByLocale:
+    zh-CN:
+        title: ""
+        markdown: |-
+            ## 新功能
+            - 官方测试新功能
+    en-US:
+        title: ""
+        markdown: |-
+            ## New Features
+            - Official test features
+"""
+        return Response(yaml_content, media_type="application/x-yaml")
+
     async def _billing_claim(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
         body = await request.body()
@@ -557,6 +584,7 @@ def build_app() -> FastAPI:
     app.get("/api/v1/zcode-plan/billing/balance")(_billing_balance)
     app.get("/api/v1/zcode-plan/billing/preview")(_billing_preview)
     app.get("/api/v1/marketing/touch")(_marketing_touch)
+    app.get("/api/v1/releases/electron/manifest")(_releases_electron_manifest)
     app.post("/api/v1/zcode-plan/billing/claim")(_billing_claim)
     app.get("/api/v1/zcode-plan/usage")(_usage)
     app.get("/api/v1/client/configs")(_client_configs)

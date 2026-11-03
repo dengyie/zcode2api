@@ -40,6 +40,14 @@ _STORE_BINDING_MODULES = (
 )
 
 
+@pytest.fixture(autouse=True)
+def reset_constants_version():
+    """每次测试前后将客户端伪装版本重置为基线版本，防止跨用例污染。"""
+    constants.set_active_version(constants.DEFAULT_CLIENT_APP_VERSION)
+    yield
+    constants.set_active_version(constants.DEFAULT_CLIENT_APP_VERSION)
+
+
 @pytest.fixture(scope="session")
 def mock_server():
     """真实端口上的 Mock 上游。返回 (app, port)。
@@ -132,6 +140,8 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     # 后台额度刷新也指向 Mock（billing/current|balance|usage）
     monkeypatch.setattr(settings, "ZCODE_BILLING_BASE", f"{base}/api/v1/zcode-plan")
     monkeypatch.setattr(settings, "ZCODE_MARKETING_TOUCH_URL", f"{base}/api/v1/marketing/touch")
+    # 官方更新清单也指向 Mock
+    monkeypatch.setattr(settings, "ZCODE_MANIFEST_URL", f"{base}/api/v1/releases/electron/manifest?platform=darwin-aarch64&channel=1")
     # 激活事件上报也指向 Mock
     monkeypatch.setattr(settings, "ZCODE_EVENT_REPORT_URL", f"{base}/api/v1/event/report")
     # OAuth（cli init/poll + api-key 兑换链）全部收敛到 Mock —— 测试永不打真网

@@ -570,10 +570,22 @@ def _mask_secret(value: str) -> str:
 
 @router.get("/settings")
 async def get_settings():
+    from .. import constants
     from .. import settings as app_settings
+    from ..version_tracker import is_newer_version, version_tracker
 
     admin_key = store.admin_key()
     gateway_key = store.gateway_key()
+    auto_sync = (
+        store.get_setting(
+            "auto_sync_client_version", str(app_settings.AUTO_SYNC_CLIENT_VERSION).lower()
+        )
+        == "true"
+    )
+    latest = version_tracker.latest_info
+    latest_ver = latest.version if latest else constants.CLIENT_APP_VERSION
+    has_update = bool(latest and is_newer_version(latest.version, constants.CLIENT_APP_VERSION))
+
     return {
         "admin_key_set": bool(admin_key),
         "admin_key_masked": _mask_secret(admin_key),
@@ -584,6 +596,14 @@ async def get_settings():
         "account_concurrency": store.account_concurrency(),
         "claim_round_interval": store.claim_round_interval(),
         "claim_round_hours": ",".join(map(str, store.claim_round_hours())),
+        "auto_sync_client_version": auto_sync,
+        "zcode_client_version": constants.CLIENT_APP_VERSION,
+        "zcode_latest_version": latest_ver,
+        "zcode_version_has_update": has_update,
+        "zcode_release_date": latest.release_date if latest else "",
+        "zcode_release_name": latest.release_name if latest else "",
+        "zcode_release_notes": latest.release_notes if latest else "",
+        "zcode_version_checked_at": latest.checked_at if latest else 0.0,
     }
 
 
@@ -639,7 +659,23 @@ async def update_settings(payload: dict = Body(...)):
                 if hour not in hours:
                     hours.append(hour)
         store.set_setting("claim_round_hours", ",".join(map(str, sorted(hours))))
+    if "auto_sync_client_version" in payload:
+        enabled = bool(payload["auto_sync_client_version"])
+        store.set_setting("auto_sync_client_version", "true" if enabled else "false")
     return {"ok": True}
+
+
+# ── ZCode 官方版本与更新日志 ────────────────────────────────────────────────
+# 版本状态（当前/最新/更新日志）由 GET /settings 统一返回（前端 settings.html
+# 直接消费）；此处只保留手动核验动作接口。版本伪装值完全由 version_tracker
+# 自动对齐官方 manifest，不提供手工改写入口（避免脱离单一真相源）。
+@router.post("/version/zcode/check")
+async def check_zcode_version_now():
+    from ..version_tracker import version_tracker
+
+    # force=True：管理后台「立即核验」语义，跳过新鲜度缓存强制拉取
+    res = await version_tracker.check_and_sync(force=True)
+    return res
 
 
 # ── 导入 / 导出 ─────────────────────────────────────────────────────────────

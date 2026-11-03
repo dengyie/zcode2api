@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import os
+
 # ── 上游 origin ──────────────────────────────────────────────────────────────
 # Plan 通道（JWT + 验证码）：zcode.z.ai 的 coding-plan 代理端点
 ZCODE_ORIGIN = "https://zcode.z.ai"
@@ -51,16 +53,23 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # 出处：2026-11-03 本机官方客户端（CFBundleShortVersionString 3.17.1，内部版本 3.17.1.9553；
 # asar bundle En="3.17.1"）。前值 3.16.3（2026-10-29）、3.14.4（2026-10-02）。
 # zcode-switch 在 Windows 上经 `zcode_app_version()` 读注册表本机真实版去打
-# billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，钉此常量为唯一真相源。
+# billing（官方升版即自动跟进）；hub 跑 Linux 无注册表，静态基线钉此处，
+# 运行期由 version_tracker 轮询官方 manifest 接口自动更新活跃版本。
 # ⚠️ 上游按客户端版本门槛投放活动套餐：2026-11-03 实测旧版（3.16.3）打 claim 报
 # 1004「不符合领取条件（no permission）」，跟进 3.17.1 立即成功领取 3 亿 token。
 # 发现 preview 为空或 1004 时优先核对此常量是否落后于官方客户端。
-CLIENT_APP_VERSION = "3.17.1"
+DEFAULT_CLIENT_APP_VERSION = "3.17.1"
+CLIENT_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 # bundle 实证（3.17.1）：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
 # mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
+
+# ── 官方更新清单端点（2026-11-03 官方桌面端逆向实证）────────────────────────────
+# 官方客户端检查更新直连端点，返回 YAML 格式的最新版本、发布时间与原生 Markdown 更新日志
+ELECTRON_MANIFEST_PATH = "/api/v1/releases/electron/manifest"
+ELECTRON_MANIFEST_URL = f"{ZCODE_ORIGIN}{ELECTRON_MANIFEST_PATH}?platform=darwin-aarch64&channel=1"
 
 # ── 营销触达 / 活动投放端点（2026-11-03 官方客户端逆向实证）───────────────────────
 # 官方活动套餐（如 zcode-v3-start-plan-MMDD）经由此服务（marketing-touch）下发，
@@ -72,7 +81,7 @@ MARKETING_TOUCH_URL = f"{ZCODE_ORIGIN}{MARKETING_TOUCH_PATH}"
 # ── billing 族版本 / 激活上报（zcode-switch v1.5.4 实证，2026-09-06 移植）─────
 # billing 族（preview/claim/balance/current/usage/configs/event）用官方桌面端
 # 现行版（对齐 zcode-switch Windows 路径读到的本机真实版；hub 钉常量，见上）
-BILLING_APP_VERSION = "3.17.1"
+BILLING_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 BILLING_TITLE = "Z Code@electron"        # bundle：sourceTitle 缺省即 electron（CLI surface 才覆盖 cli）
 BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_ENV=test 才 test）；
                                          # 旧值 stable 系 3.11.2 时代 zcode-switch 静态对齐，已过时
@@ -130,6 +139,32 @@ ANTHROPIC_VERSION = "2023-06-01"
 USER_AGENT = f"ZCode/{CLIENT_APP_VERSION}"
 X_ZCODE_APP_VERSION = CLIENT_APP_VERSION
 X_ZCODE_AGENT = "glm"
+
+
+def set_active_version(new_version: str) -> None:
+    """动态更新客户端与 billing 伪装版本号（当自动探测发现新版本时）。
+
+    规范化：剥离首尾空白与前导 v/V——官方 CFBundleShortVersionString 与
+    X-ZCode-App-Version 头均为纯数字形态，"v3.17.2" 会使 UA 变成
+    "ZCode/v3.17.2" 产生指纹漂移。
+    """
+    global CLIENT_APP_VERSION, BILLING_APP_VERSION, USER_AGENT, X_ZCODE_APP_VERSION, CLIENT_CONFIGS_QUERY
+    v = str(new_version or "").strip().lstrip("vV").strip()
+    if not v:
+        return
+    CLIENT_APP_VERSION = v
+    BILLING_APP_VERSION = v
+    USER_AGENT = f"ZCode/{v}"
+    X_ZCODE_APP_VERSION = v
+    CLIENT_CONFIGS_QUERY = f"app_version={v}"
+    try:
+        from . import settings
+
+        if not os.getenv("UPSTREAM_USER_AGENT"):
+            settings.USER_AGENT = USER_AGENT
+    except (ImportError, AttributeError):
+        pass
+
 # 无尾斜杠：与 zcode-switch（billing 实证形态）及本服务 billing 头统一，
 # 消除 messages/billing 通道间 Referer 形状抖动
 HTTP_REFERER = "https://zcode.z.ai"
