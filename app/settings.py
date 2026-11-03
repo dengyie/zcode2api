@@ -147,6 +147,12 @@ ZCODE_MANIFEST_URL = os.getenv("ZCODE_MANIFEST_URL", constants.ELECTRON_MANIFEST
 VERSION_CHECK_INTERVAL = _int("ZCODE_VERSION_CHECK_INTERVAL", 43200)
 # 是否自动将客户端伪装对齐至官方最新版本
 AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
+# messages 通道强制直连（2026-11-04 线上实证：env 代理出口 GCP IP 被上游持续
+# 标记——messages 走代理 17h+ 零成功（3012 unusual activity），而同账号
+# billing/claim/telemetry 直连全部正常。切直连统一全链路出口，消除
+# 「CN billing + US messages」双 IP 异常信号；captcha 签发出口由 gateway
+# 的同一 egress tag 驱动自动对齐（app/egress.py「token 出口=请求出口」）。
+MESSAGES_FORCE_DIRECT = _bool("ZCODE_MESSAGES_FORCE_DIRECT", False)
 # 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
 ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）

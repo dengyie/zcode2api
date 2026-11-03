@@ -41,6 +41,20 @@ AVAILABLE_MODELS = constants.AVAILABLE_MODELS
 _EXHAUST_KEYWORDS = constants.EXHAUST_KEYWORDS
 
 
+def _messages_egress() -> str:
+    """messages 通道有效出口 tag（同时驱动 captcha 签发出口，见 app/egress.py）。
+
+    ZCODE_MESSAGES_FORCE_DIRECT=true 强制直连：2026-11-04 线上实证 env 代理
+    出口（GCP IP）被上游持续标记——messages 走代理 17h+ 零成功（3012
+    unusual activity），而同账号 billing/claim/telemetry 直连全部正常。
+    统一全链路出口，消除「CN billing + US messages」双 IP 异常信号；
+    置 false 恢复历史行为（走 env 代理）。
+    """
+    if settings.MESSAGES_FORCE_DIRECT:
+        return egress.DIRECT
+    return egress.egress_for(settings.UPSTREAM["zai"])
+
+
 def _detect_provider(body: dict, headers) -> str:
     model = body.get("model") or ""
     if model.startswith("bigmodel/") or headers.get("x-provider") == "bigmodel":
@@ -490,7 +504,7 @@ async def _dispatch(req_id, body, incoming_headers, provider):
         # _try_account 会补码重试。
         plan_channel = provider == "zai" and account.uses_plan_channel()
         needs_captcha = plan_channel and await captcha_manager.model_requests_need_captcha(
-            egress.egress_for(settings.UPSTREAM["zai"])
+            _messages_egress()
         )
 
         slot_box: list[str | None] = [None]
@@ -705,7 +719,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     model_name = str(body.get("model") or "-")
     # 结构上是否 Plan 通道（决定「能不能用验证码」）；needs_captcha 只表示「这一趟带不带」
     # 验证码必须与本次 Plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
-    captcha_egress = egress.egress_for(settings.UPSTREAM["zai"]) if plan_channel else None
+    captcha_egress = _messages_egress() if plan_channel else None
     while True:
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
@@ -716,7 +730,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
                 # 换出口使用会被上游判 unusual activity（3012）。
                 verify_param, verify_region = await captcha_manager.get_verify_param(
-                    egress_tag=egress.egress_for(settings.UPSTREAM["zai"])
+                    egress_tag=_messages_egress()
                 )
             except Exception as err:  # noqa: BLE001
                 logs.req_err(req_id, f"人机校验失败: {err}")
@@ -739,7 +753,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
-        client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0))
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=30.0, read=None, write=120.0, pool=30.0),
+            # ZCODE_MESSAGES_FORCE_DIRECT：直连出口须绕过 env/系统代理（与
+            # _messages_egress 的 DIRECT tag 一致，否则 captcha 出口错配 3012）
+            trust_env=not settings.MESSAGES_FORCE_DIRECT,
+        )
         cm = client.stream("POST", url, headers=headers, content=payload)
         try:
             resp = await cm.__aenter__()
@@ -792,7 +811,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             # 即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
             challenge = _detect_captcha_challenge(resp, text) if plan_channel and not force_fallback else None
             if challenge:
-                captcha_manager.invalidate(egress.egress_for(settings.UPSTREAM["zai"]))
+                captcha_manager.invalidate(_messages_egress())
                 captcha_retries += 1
                 if captcha_retries >= MAX_CAPTCHA_RETRIES:
                     account.record_result(False, "验证码挑战连续失败")
