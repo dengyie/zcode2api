@@ -240,6 +240,13 @@ async def messages(request: Request):
     logs.req(req_id, str(body.get("model") or "-"), bool(body.get("stream")), _last_user_text(body))
     reqlog.begin(req_id, "messages", str(body.get("model") or "-"),
                  bool(body.get("stream")), _last_user_text(body))
+    # 客户端指纹（2026-11-04 排障加装）：周期短探测打线上时无法定位来源——
+    # CF 隧道绕过 nginx 无访问日志、hub 也不记录调用方。真实客户端 IP 以
+    # CF-Connecting-IP 为准（经 cloudflared），直连本机时回退 X-Forwarded-For /
+    # 本地环回。UA 截断防日志爆炸。
+    _client_ip = (incoming_headers.get("cf-connecting-ip")
+                  or incoming_headers.get("x-forwarded-for") or "local")
+    logs.info(req_id, f"client={_client_ip} ua={incoming_headers.get('user-agent', '?')[:72]}")
 
     try:
         result = await _dispatch(req_id, body, incoming_headers, provider)
