@@ -5,7 +5,9 @@
   - 5xx 等一般错误：重试（默认 3 次），耗尽后账号冷却 COOLING_SECONDS 并换号
   - 3012/405「unusual activity」：指数退避冷却（base 900s × 2^(strikes-1)，封顶 24h）；
     累计 4 次升级为 DISABLED（人工确认恢复），避免持续向上游产生流量
-  - 冷却期内零上游流量：monitor 跳过、后台手动路径跳过、验证码池关门
+  - 冷却期内零**对话**流量：messages 轮询不选、验证码池关门；
+    billing 链（preview/claim/查额度）不设冷却闸——领取与使用是两条链
+    （2026-11-04 口径：号停着/冷却中也必须能把投放领进账）
 """
 
 from __future__ import annotations
@@ -496,8 +498,8 @@ class TestCooldownBehavior:
         assert after.last_error is None
         assert after.cooling_until is None
 
-    async def test_quota_refresh_respects_active_cooldown(self, gateway_client, fresh_app):
-        """冷却期内 monitor 不打 billing、fetch_quota 不提前解除冷却。"""
+    async def test_quota_refresh_includes_cooling_billing_chain(self, gateway_client, fresh_app):
+        """冷却期 billing 照查（领取/监控与对话是两条链），但 fetch_quota 不提前解除冷却。"""
         from app import quota
         from tests.conftest import seed_account
 
@@ -505,10 +507,10 @@ class TestCooldownBehavior:
         _set_cooling(acc)
         fresh_app.update_account(acc)
 
-        # monitor 的账号筛选跳过冷却中账号
+        # monitor 的账号筛选包含冷却中账号（billing 链不设冷却闸）
         selected = [a for a in fresh_app.list_accounts("zai")
                     if a.mode == "jwt" and a.allows_billing()]
-        assert selected == []
+        assert [a.id for a in selected] == [acc.id]
 
         # fetch_quota 拿到额度恢复也不解除冷却（兜底分支）
         acc.quota = {}
@@ -516,8 +518,8 @@ class TestCooldownBehavior:
         assert acc.status == Status.COOLING
         assert acc.is_cooling() is True
 
-    async def test_fetch_quota_skips_invalid_and_disabled(self, gateway_client, fresh_app):
-        """废 JWT / 风控禁用直调 fetch_quota 也不得打 billing、不得洗成 active。"""
+    async def test_fetch_quota_skips_invalid_but_not_disabled(self, gateway_client, fresh_app):
+        """只有废 JWT 不打 billing；风控禁用 / 人工停用照查，且额度数字不得改状态。"""
         from app import quota
         from tests.conftest import seed_account
 
@@ -533,22 +535,25 @@ class TestCooldownBehavior:
         assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
         assert acc.status == Status.INVALID
 
+        # 风控禁用：billing 照查，状态绝不被额度数字洗掉（防 DISABLED→EXHAUSTED→ACTIVE）
         acc.status = Status.DISABLED
         acc.enabled = True
         fresh_app.update_account(acc)
         before = len(mock.state.calls)
         res = await quota.fetch_quota(acc)
-        assert "error" in res
-        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+        assert "error" not in res
+        assert [c for c in mock.state.calls[before:] if "/billing" in c[1]]
         assert acc.status == Status.DISABLED
 
+        # 人工停放（enabled=False）：照查，仍然不可选
         acc.status = Status.ACTIVE
         acc.enabled = False
         fresh_app.update_account(acc)
         before = len(mock.state.calls)
         res = await quota.fetch_quota(acc)
-        assert "error" in res
-        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+        assert "error" not in res
+        assert [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+        assert acc.is_selectable() is False
 
     async def test_captcha_refill_gate_follows_account_state(self, fresh_app):
         """refill 门控：存在可选 jwt 账号才预热；全冷却/封禁（含重启后，状态已落库）关门。"""
@@ -616,10 +621,29 @@ class TestBillingRefreshDebounce:
 
 
 @pytest.mark.integration
-class TestAdminEndpointsRespectCooldown:
-    """后台手动路径与 QuotaMonitor 同一不变量：冷却期零上游流量。"""
+class TestAdminBillingChainIgnoresCooldown:
+    """后台 billing 路径（刷新/领取）不设冷却闸：只有废 JWT / 无 JWT 被拦。
 
-    async def test_refresh_all_skips_cooling(self, gateway_client, fresh_app):
+    领取与使用两条链（2026-11-04 口径）：号停着或冷却中照样要能查额度、领投放；
+    "冷却期零上游流量" 只约束 messages 通道。
+    """
+
+    @pytest.fixture
+    def claim_spy(self, monkeypatch):
+        """替换 admin 侧的 do_claim，只验证门控放行（不污染 mock 的 claim 调用账本）。"""
+        from app.routes import admin_api
+
+        calls: list[str] = []
+
+        async def fake_do_claim(acc, plan_id=None):
+            calls.append(acc.id)
+            return {"plan_id": "mock-claim-plan", "plan_name": "Mock Daily Plan",
+                    "grants": []}
+
+        monkeypatch.setattr(admin_api, "do_claim", fake_do_claim)
+        return calls
+
+    async def test_refresh_all_includes_cooling(self, gateway_client, fresh_app):
         client, mock = gateway_client
         from tests.conftest import seed_account
 
@@ -632,11 +656,12 @@ class TestAdminEndpointsRespectCooldown:
                                 json={"all": True}, headers=ADMIN_AUTH)
         assert res.status_code == 200
         body = res.json()
-        assert body["count"] == 0
-        assert body["skipped_cooling"] == 1
-        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+        assert body["count"] == 1
+        assert body["cooling"] == 1
+        assert body["skipped_invalid"] == 0
+        assert [c for c in mock.state.calls[before:] if "/billing" in c[1]]  # 照查
 
-    async def test_refresh_one_skips_cooling(self, gateway_client, fresh_app):
+    async def test_refresh_one_works_for_cooling(self, gateway_client, fresh_app):
         client, mock = gateway_client
         from tests.conftest import seed_account
 
@@ -647,8 +672,10 @@ class TestAdminEndpointsRespectCooldown:
         res = await client.post(f"/admin/api/accounts/{acc.id}/refresh", headers=ADMIN_AUTH)
         assert res.status_code == 200
         body = res.json()
-        assert body["ok"] is False
-        assert "冷却" in body["message"]
+        assert body["ok"] is True
+        assert "冷却" not in body.get("message", "")
+        # 冷却态保持（billing 成功不得洗成 active）
+        assert fresh_app.find("zai", acc.id).status == Status.COOLING
 
     async def test_refresh_all_skips_invalid(self, gateway_client, fresh_app):
         client, mock = gateway_client
@@ -665,26 +692,43 @@ class TestAdminEndpointsRespectCooldown:
         assert res.status_code == 200
         body = res.json()
         assert body["count"] == 0
-        assert body.get("skipped_invalid") == 1
+        assert body["skipped_invalid"] == 1
         assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
 
-    async def test_claim_skips_cooling(self, gateway_client, fresh_app):
-        client, mock = gateway_client
+    async def test_claim_reaches_cooling_account(self, gateway_client, fresh_app,
+                                                 claim_spy):
+        """冷却号照领：旧版会回「冷却中，已跳过」，现在必须真的走到 do_claim。"""
+        client, _mock = gateway_client
         from tests.conftest import seed_account
 
         acc = seed_account(fresh_app, _RISK_JWT, name="a-cool")
         _set_cooling(acc)
         fresh_app.update_account(acc)
 
-        before = len(mock.state.calls)
-        res = await client.post("/admin/api/claim", json={}, headers=ADMIN_AUTH)
+        res = await client.post("/admin/api/claim",
+                                json={"account_ids": [acc.id]}, headers=ADMIN_AUTH)
         assert res.status_code == 200
-        outcomes = res.json()["outcomes"]
-        assert len(outcomes) == 1
-        assert outcomes[0]["ok"] is False
-        assert "冷却" in outcomes[0]["message"]
-        # billing/claim 未被打到
-        assert not [c for c in mock.state.calls[before:] if "/billing" in c[1]]
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is True, outcome
+        assert "冷却" not in outcome.get("message", "")
+        assert claim_spy == [acc.id]
+
+    async def test_claim_reaches_parked_account(self, gateway_client, fresh_app,
+                                                claim_spy):
+        """人工停放（enabled=false / DISABLED）号照领。"""
+        client, _mock = gateway_client
+        from tests.conftest import seed_account
+
+        acc = seed_account(fresh_app, _GOOD_JWT, name="a-parked")
+        acc.enabled = False
+        acc.status = Status.DISABLED
+        fresh_app.update_account(acc)
+
+        res = await client.post("/admin/api/claim",
+                                json={"account_ids": [acc.id]}, headers=ADMIN_AUTH)
+        outcome = res.json()["outcomes"][0]
+        assert outcome["ok"] is True, outcome
+        assert claim_spy == [acc.id]
 
     async def test_refresh_still_works_for_active_accounts(self, gateway_client, fresh_app):
         """非冷却账号不受门控影响（防修过头）。"""
@@ -697,7 +741,7 @@ class TestAdminEndpointsRespectCooldown:
         assert res.status_code == 200
         body = res.json()
         assert body["count"] == 1
-        assert body["skipped_cooling"] == 0
+        assert body["cooling"] == 0
         assert body["summary"]["ok"] == 1
 
 

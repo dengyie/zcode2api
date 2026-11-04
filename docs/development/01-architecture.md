@@ -125,7 +125,7 @@ client → 鉴权 → [循环: attempt ≤ MAX_ACCOUNT_ATTEMPTS=5]
 
 ### 4.3 额度监控
 
-后台任务按 `quota_refresh_interval`（默认 60s，meta 表可改，0 = 关）刷新池内 JWT 账号；冷却 / invalid / 风控禁用 / 手动停用不打 billing。每个账号探测 `billing/current` + `billing/balance` + `usage`。日窗口耗尽且无赠送池 → EXHAUSTED；额度恢复且非冷却 → 回 ACTIVE。废 JWT / 风控禁用绝不能因额度数字复活 Plan 通道。成功对话后的 billing 刷新有 `BILLING_REFRESH_MIN_INTERVAL`（默认 60s）去抖。
+后台任务按 `quota_refresh_interval`（默认 60s，meta 表可改，0 = 关）刷新池内 JWT 账号；**只有无 JWT / invalid 不打 billing**——冷却 / 风控禁用 / 手动停用照常刷新（billing 链与对话链解耦，2026-11-04：号停着也必须能查额度/领投放）。每个账号探测 `billing/current` + `billing/balance` + `usage`。日窗口耗尽且无赠送池 → EXHAUSTED；额度恢复且非冷却 → 回 ACTIVE（billing 成功不得提前解除冷却）。废 JWT / 风控禁用绝不能因额度数字复活 Plan 对话通道。成功对话后的 billing 刷新有 `BILLING_REFRESH_MIN_INTERVAL`（默认 60s）去抖。
 
 ### 4.4 活动领取
 

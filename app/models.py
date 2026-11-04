@@ -148,8 +148,9 @@ class Account:
 
         实测（2026-10-01）上游对 messages 端点的 3012 是频道级瞬时频控：
         同号同刻 billing 全部正常、数小时自愈——硬禁用会让健康的 billing/claim
-        陪葬（领取轮两度因此停摆）。冷却自动恢复且冷却期零上游流量
-        （is_cooling 全通道门禁），既避免对真封禁账号持续施压，也不拖死领取轮。
+        陪葬（领取轮两度因此停摆）。冷却自动恢复且冷却期零对话流量
+        （is_selectable 挡住 messages 轮询），避免对真封禁账号持续施压；
+        billing 链不设冷却闸（2026-11-04 起领取/查额度照跑，两条链互不搭桥）。
 
         strikes 仅在 decay_seconds 窗口内累计：距上次命中超过窗口视为无关的
         新事件，重新起算——避免跨月偶发命中累积成禁用。Plan 通道成功（gateway
@@ -176,10 +177,11 @@ class Account:
         return self.mode == "jwt" and bool((self.api_key or "").strip())
 
     def uses_plan_channel(self) -> bool:
-        """当前是否允许走 Coding Plan JWT 通道（messages + billing）。
+        """是否允许走 Coding Plan JWT 对话通道（messages）。
 
-        invalid / 风控 disabled / 手动停用 都视为 JWT 不可用；有 Key 时对话
-        走回退通道，但 billing/claim 仍必须停（Key 通道没有套餐领取）。
+        invalid / 风控 disabled / 手动停用 都视为对话通道不可用；有 Key 时
+        对话走回退通道。**注意这只管「用」**——领取/查询额度看
+        `allows_billing()`，两者互不搭桥（2026-11-04 用户口径）。
         """
         if self.mode != "jwt" or not (self.jwt_token or "").strip():
             return False
@@ -188,8 +190,17 @@ class Account:
         return self.status not in (Status.INVALID, Status.DISABLED)
 
     def allows_billing(self, now: float | None = None) -> bool:
-        """是否允许打 billing 全家桶（preview/claim/current/balance/usage）。"""
-        return self.uses_plan_channel() and not self.is_cooling(now)
+        """是否允许打 billing 全家桶（preview/claim/current/balance/usage）。
+
+        **领取/查额度与「能不能发对话」是两条独立的链**（2026-11-04 用户口径）：
+        上游 3012/unusual activity 只拦 messages，billing 族照常 200。因此
+        风控禁用（DISABLED）、人工停放（enabled=False）、冷却中都不是理由——
+        只要 JWT 还在（非 INVALID）就允许领取，避免「号停着就领不到投放」。
+        代价是冷却期会多出 billing 读/写流量，这是刻意取舍。
+        """
+        if self.mode != "jwt" or not (self.jwt_token or "").strip():
+            return False
+        return self.status != Status.INVALID
 
     def quota_expired(self, now: float | None = None) -> bool:
         """权益是否已全部失效（每个额度窗口都「过期」或「剩余为 0」）。
@@ -258,7 +269,12 @@ class Account:
         return True
 
     def is_cooling(self, now: float | None = None) -> bool:
-        """冷却是否仍在生效（含风控指数退避）。冷却期内不应产生任何上游流量。"""
+        """冷却是否仍在生效（含风控指数退避）。
+
+        冷却期不该产生**对话（messages）**流量；billing 链（领取/查额度）不受
+        此闸约束（2026-11-04 两条链解耦），因此不要把 is_cooling 塞进
+        `allows_billing()`——它只用来挡 messages 选号与验证码池预热。
+        """
         if self.status != Status.COOLING:
             return False
         now = now or time.time()

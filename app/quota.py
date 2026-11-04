@@ -102,9 +102,9 @@ async def fetch_quota(account: Account) -> dict:
         return {"error": "账号已删除"}
     if live is not account:
         account = live
-    if not account.allows_billing() and not account.is_cooling():
-        # 与 admin/monitor 同一扇门。冷却账号仍允许查询（测试与兜底约定：
-        # 拿额度不得提前解除冷却）；废 JWT / 风控 / 手动停用一律不打 billing。
+    if not account.allows_billing():
+        # 与 admin/monitor 同一扇门。只有无 JWT / JWT 失效（INVALID）才拦：
+        # 停用、风控禁用、冷却中照常查询（领取与使用分离，2026-11-04 口径）。
         from .claim import AUTH_EXPIRED_MESSAGE, billing_block_reason
 
         return {
@@ -247,7 +247,11 @@ async def fetch_quota(account: Account) -> dict:
             _bonus_active(p, now) for p in account.plans
         )
         has_daily = bool(usable)
-        if not has_daily and not has_bonus:
+        # 风控禁用 / 废 JWT：billing 数据照写（领取链要用），但**绝不**用额度数字改
+        # 状态——否则 DISABLED→EXHAUSTED→（额度恢复）→ACTIVE 会绕过人工/风控封禁。
+        if account.status in (Status.INVALID, Status.DISABLED):
+            pass
+        elif not has_daily and not has_bonus:
             account.status = Status.EXHAUSTED
             account.last_error = "额度已过期" if all_expired else "额度已用完"
         elif account.status in (Status.EXHAUSTED, Status.COOLING) and (

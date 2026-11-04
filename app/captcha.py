@@ -173,13 +173,15 @@ class CaptchaManager:
         self._refill_task = None
 
     def _gate_open(self) -> bool:
-        """是否允许预热：存在可走 Plan 对话的 jwt 账号才预热。
+        """是否允许**预热**：存在可走 Plan 对话的 jwt 账号才预热。
 
-        apiKey 回退 / 废 JWT / 风控禁用 / 额度用完 / 冷却 都不需要验证码。
-        账号冷却状态随 store 落库，重启后全冷却期间此门保持关闭。
+        预热本身就是上游流量，因此只跟着「能服务对话」的号走：apiKey 回退 /
+        废 JWT / 风控禁用 / 额度用完 / 冷却 都不预热，重启后全冷却期间保持关门。
+        注意这只管预热——领取（billing 链）不受此门约束：冷却/停放号要领取时，
+        `get_verify_param` 池空会现解（不依赖预热池，见 2026-11-04 两条链口径）。
         """
         return any(
-            a.allows_billing() and a.is_selectable()
+            a.uses_plan_channel() and a.is_selectable()
             for a in store.list_accounts("zai")
         )
 

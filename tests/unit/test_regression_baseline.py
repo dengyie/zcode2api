@@ -127,23 +127,28 @@ class TestAccountStateMachine:
         assert not acc.allows_billing()
         assert acc.uses_plan_channel() is False
 
-    def test_risk_cooling_jwt_not_selectable(self):
-        """风控冷却期整号不可选（即使有 Key 回退；同请求回退由 force_fallback 保证）。"""
+    def test_risk_cooling_jwt_not_selectable_but_claimable(self):
+        """风控冷却期整号不可选（即使有 Key 回退；同请求回退由 force_fallback 保证），
+        但 billing/claim 照常（领取与使用两条链，2026-11-04 口径）。"""
         acc = self._acc()
         acc.api_key = "sk-fallback"
         acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
         assert acc.status == Status.COOLING
         assert acc.enabled is True
         assert not acc.is_selectable()
-        assert not acc.allows_billing()
+        # plan 通道名义可用（uses_plan_channel 只管 enabled/invalid/disabled），
+        # 冷却靠 is_selectable 挡选号——所以 messages 不会打到它。
+        assert acc.uses_plan_channel() is True
+        assert acc.allows_billing() is True
 
-    def test_manual_disable_never_selectable(self):
+    def test_manual_disable_never_selectable_but_claimable(self):
         acc = self._acc()
         acc.api_key = "sk-fallback"
         acc.enabled = False
         acc.status = Status.DISABLED
         assert not acc.is_selectable()
-        assert not acc.allows_billing()
+        assert acc.uses_plan_channel() is False
+        assert acc.allows_billing() is True
 
     def test_exhausted_jwt_not_selectable_but_plan_alive(self):
         acc = self._acc()
@@ -273,14 +278,14 @@ class TestBuildRequest:
             build_request(acc, {}, None)
 
 
-# ── billing 阻断文案 ──────────────────────────────────────────────────────────
+# ── billing 阻断文案（只拦「JWT 不可用」；领取 ≠ 使用）────────────────────────
 class TestBillingBlockReason:
-    def test_cooling(self):
+    def test_cooling_not_blocked(self):
         from app.claim import billing_block_reason
         acc = Account.create("zai", "t", "a.b.c")
         acc.status = Status.COOLING
         acc.cooling_until = time.time() + 100
-        assert "冷却" in (billing_block_reason(acc) or "")
+        assert billing_block_reason(acc) is None
 
     def test_invalid_jwt(self):
         from app.claim import AUTH_EXPIRED_MESSAGE, billing_block_reason
@@ -288,30 +293,30 @@ class TestBillingBlockReason:
         acc.status = Status.INVALID
         assert billing_block_reason(acc) == AUTH_EXPIRED_MESSAGE
 
-    def test_manual_disable(self):
+    def test_manual_disable_not_blocked(self):
         from app.claim import billing_block_reason
         acc = Account.create("zai", "t", "a.b.c")
         acc.enabled = False
-        msg = billing_block_reason(acc, action="上游刷新") or ""
-        assert "停用" in msg
-        assert "重新授权" not in msg
+        acc.status = Status.DISABLED
+        assert billing_block_reason(acc, action="上游刷新") is None
 
-    def test_risk_cooling(self):
-        from app.claim import billing_block_reason
-        acc = Account.create("zai", "t", "a.b.c")
-        acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
-        msg = billing_block_reason(acc) or ""
-        assert "冷却" in msg
-        assert "重新授权" not in msg
-
-    def test_risk_disabled_after_strikes(self):
+    def test_risk_disabled_not_blocked(self):
         from app.claim import billing_block_reason
         acc = Account.create("zai", "t", "a.b.c")
         for _ in range(4):
             acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
-        msg = billing_block_reason(acc) or ""
-        assert "风控封禁" in msg
-        assert "重新授权" not in msg
+        assert acc.status == Status.DISABLED
+        # 风控封禁只掐对话通道；billing/claim 照跑（2026-11-04 两条链）
+        assert billing_block_reason(acc) is None
+        assert acc.uses_plan_channel() is False
+
+    def test_no_jwt_blocked(self):
+        from app.claim import billing_block_reason
+        acc = Account.create("zai", "t", "not-a-jwt")  # 纯 apiKey
+        assert "非 Coding Plan" in (billing_block_reason(acc) or "")
+        acc2 = Account.create("zai", "t", "a.b.c")
+        acc2.jwt_token = None
+        assert "非 Coding Plan" in (billing_block_reason(acc2) or "")
 
 
 # ── 网关主流程（HTTP 层，走 Mock 上游；夹具见 conftest.py）────────────────────

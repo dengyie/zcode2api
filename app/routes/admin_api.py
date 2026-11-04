@@ -177,15 +177,15 @@ async def refresh(payload: dict = Body(default=None)):
     else:
         ids = set(payload.get("ids") or [])
         pool = [a for a in store.list_accounts() if a.id in ids and a.mode == "jwt"]
-    # 失效 / 风控禁用 / 冷却 一律不打 billing（冷却期零上游流量 + 废 JWT 不再 401）
+    # 冷却 / 风控禁用 / 停用同样刷新（billing 链与对话链无关）；只有无 JWT / 废 JWT 不打
     targets = [a for a in pool if a.allows_billing()]
-    skipped_cooling = sum(1 for a in pool if a.is_cooling())
-    skipped_invalid = len(pool) - len(targets) - skipped_cooling
+    cooling = sum(1 for a in targets if a.is_cooling())
+    skipped_invalid = len(pool) - len(targets)
     summary = await refresh_accounts(targets)
     return {
         "summary": summary,
         "count": len(targets),
-        "skipped_cooling": skipped_cooling,
+        "cooling": cooling,
         "skipped_invalid": skipped_invalid,
     }
 
@@ -469,7 +469,7 @@ async def claim(payload: dict = Body(default=None)):
     if not candidates:
         return {"outcomes": [], "summary": {"ok": 0, "fail": 0}}
 
-    # 冷却 / 失效 JWT 不领取（billing/claim 是上游写流量，废票只会 401）
+    # 废 JWT 不领取（billing/claim 打过去只会 401）；冷却 / 风控禁用 / 停用照领
     outcomes = [
         {"account_id": a.id, "account_name": a.name, "ok": False,
          "message": billing_block_reason(a) or AUTH_EXPIRED_MESSAGE}

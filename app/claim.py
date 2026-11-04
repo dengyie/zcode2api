@@ -52,16 +52,15 @@ _CLAIM_FAIL = {
 
 
 def billing_block_reason(account: Account, *, action: str = "领取") -> str | None:
-    """JWT 不可打 billing 时的用户文案；可打则返回 None。"""
-    if account.is_cooling():
-        return f"账号冷却中（风控/限流），已跳过{action}"
+    """JWT 不可打 billing 时的用户文案；可打则返回 None。
+
+    只拦「JWT 本身不可用」：非 Coding Plan 账号 / 无 token / INVALID。
+    **冷却、风控 DISABLED、人工停用都不拦**——领取与使用是两条链，
+    账号停着也照样要能把投放领进账（2026-11-04 用户口径）。
+    """
     if account.mode != "jwt" or not (account.jwt_token or "").strip():
         return f"非 Coding Plan 账号，已跳过{action}"
-    if not account.enabled:
-        return f"账号已停用，已跳过{action}"
-    if account.status == Status.DISABLED:
-        return f"账号风控封禁，已跳过{action}"
-    if account.status == Status.INVALID or not account.uses_plan_channel():
+    if account.status == Status.INVALID:
         return AUTH_EXPIRED_MESSAGE
     return None
 
@@ -529,8 +528,10 @@ class ClaimRoundManager:
     """后台周期自动领取轮（默认 1 小时，2.6.5 整改；对齐 zcode-switch 用户触发语义）。
 
     每轮对全部可打 billing 的 JWT 账号执行 auto_claim_all_plans（每日一次激活
-    上报先于 preview + 逐个领取可领套餐）；冷却/停用/风控禁用/失效账号由
-    allows_billing() 先行过滤，保证「冷却期零上游 billing 流量」不变量。
+    上报先于 preview + 逐个领取可领套餐）；只有「无 JWT / JWT 失效（INVALID）」
+    会被 allows_billing() 先行过滤——**停用、风控禁用、冷却中的号照常参与领取**
+    （领取与使用两条链，2026-11-04 用户口径；冷却期会因此产生 billing 流量，
+    但绝不产生 messages 流量）。
     1005（今日名额用完）按服务端 next_at 退避：等待期该套餐不打 claim
     （省 captcha 求解与上游写流量），preview 照常保留新套餐发现
     （docs/development/05「按服务端 next window 退避」语义落地）。
@@ -561,7 +562,7 @@ class ClaimRoundManager:
         ]
         if not accounts:
             if not self._empty_warned:
-                logs.warn("claim", "无可服务账号（全部禁用/冷却/失效），本轮跳过")
+                logs.warn("claim", "无可领取账号（无 JWT 或 JWT 已失效），本轮跳过")
                 self._empty_warned = True
             return
         self._empty_warned = False

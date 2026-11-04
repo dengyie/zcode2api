@@ -54,7 +54,7 @@
 | `PUT /admin/api/accounts/{id}` | 改备注 / 换凭证（按形态自动判 jwt/apiKey） |
 | `POST /admin/api/accounts/{id}/enabled` | `{enabled}` 启用/禁用 |
 | `DELETE /admin/api/accounts` | body `[ids]` 批量移除 |
-| `POST /admin/api/accounts/refresh` | `{all?}` 或 `{ids}` 批量刷新额度（冷却/失效跳过 billing） |
+| `POST /admin/api/accounts/refresh` | `{all?}` 或 `{ids}` 批量刷新额度（仅无 JWT / JWT 失效跳过 billing；冷却/停用/风控禁用照刷） |
 | `POST /admin/api/accounts/{id}/refresh` | 立即刷新该账号额度 |
 | `POST /admin/api/accounts/{id}/fingerprint/rotate` | 换发客户端指纹（下一套成套桌面 SKU + 新 device_mid） |
 | `GET /admin/api/status` | provider 列表 + 网关 key 是否已配置 + 可选账号计数 |
