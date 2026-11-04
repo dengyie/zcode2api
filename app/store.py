@@ -302,21 +302,62 @@ class Store:
             self._persist_account(account)
             return True
 
-    # ── 轮询选择 ─────────────────────────────────────────────────────────────
-    def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
-        """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
+    # ── 负载均衡与亲和选择 ───────────────────────────────────────────────────
+    def select(
+        self,
+        provider: str,
+        skip_ids: set[str] | None = None,
+        inflight: dict[str, int] | None = None,
+        pinned_id: str | None = None,
+        max_inflight: int = settings.ACCOUNT_CONCURRENCY,
+    ) -> Account | None:
+        """选择下一个可用账号。
+
+        策略：
+        1. 亲和账号优先：若指定 pinned_id 且未满（inflight < max_inflight）且可用，直接选用。
+        2. 负载均衡分配（新请求 或 亲和号满载/不可用时溢出）：
+           - 过滤掉 is_selectable 为 False、在 skip_ids 中、或已达并发上限（inflight >= max_inflight）的账号；
+           - 主排序：当前在飞数 inflight 升序（最小负载优先）；
+           - 次排序：距离当前轮询指针的偏移量（保证在负载相同时均匀轮流分配到不同账号）；
+           - 更新轮询指针为选中账号的下一位。
+        """
         skip_ids = skip_ids or set()
+        inflight_map = inflight or {}
         now = time.time()
         with self._lock:
+            accounts = self._accounts.get(provider, [])
+            # 1. 亲和号尝试
+            if pinned_id and pinned_id not in skip_ids:
+                for a in accounts:
+                    if a.id == pinned_id:
+                        if a.is_selectable(now) and inflight_map.get(a.id, 0) < max_inflight:
+                            return a
+                        break
+
+            # 2. 候选池过滤
             pool = [
-                a for a in self._accounts.get(provider, [])
-                if a.is_selectable(now) and a.id not in skip_ids
+                a for a in accounts
+                if a.is_selectable(now)
+                and a.id not in skip_ids
+                and inflight_map.get(a.id, 0) < max_inflight
             ]
             if not pool:
                 return None
-            idx = self._rotation.get(provider, 0) % len(pool)
-            account = pool[idx]
-            self._rotation[provider] = (idx + 1) % len(pool)
+
+            cur_rot = self._rotation.get(provider, 0)
+            n = len(pool)
+
+            # 负载优先（最小在飞请求数），相同负载下按轮询偏移平局
+            best_idx = 0
+            best_tuple = (inflight_map.get(pool[0].id, 0), (0 - cur_rot) % n)
+            for i in range(1, n):
+                cur_tuple = (inflight_map.get(pool[i].id, 0), (i - cur_rot) % n)
+                if cur_tuple < best_tuple:
+                    best_tuple = cur_tuple
+                    best_idx = i
+
+            account = pool[best_idx]
+            self._rotation[provider] = (best_idx + 1) % n
             return account
 
     # ── 导入 / 导出 ─────────────────────────────────────────────────────────

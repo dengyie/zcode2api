@@ -189,6 +189,31 @@ def attribution_user_id(device_mid: str | None, session_id: str | None) -> str:
     return json.dumps(blob, separators=(",", ":"))
 
 
+def extract_first_user_text(body: dict) -> str:
+    """提取会话首条非日期注入的用户文本。无有效文本返回空字符串。"""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        candidate = ""
+        if isinstance(content, str):
+            candidate = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" \
+                        and isinstance(block.get("text"), str):
+                    candidate = block["text"]
+                    break
+        if _is_date_turn_text(candidate):
+            continue  # 日期轮（自己的或同形前插轮）：不是会话内容
+        if candidate.strip():
+            return candidate.strip()
+    return ""
+
+
 def conversation_session_id(body: dict, account_id: str = "") -> str | None:
     """同一会话的稳定 session_id（同首轮 → 同 id），无首轮文本返回 None。
 
@@ -205,32 +230,10 @@ def conversation_session_id(body: dict, account_id: str = "") -> str | None:
     文本上，同一账号同一天所有会话撞成同一个 id（跨会话关联信号 + cache 键
     漂移）。跳过规则对「前插任意个匹配轮」幂等，指纹与首次调用一致。
     """
-    messages = body.get("messages")
-    if not isinstance(messages, list):
+    text = extract_first_user_text(body)
+    if not text:
         return None
-    text = ""
-    for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            candidate = content
-        elif isinstance(content, list):
-            candidate = ""
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text" \
-                        and isinstance(block.get("text"), str):
-                    candidate = block["text"]
-                    break
-        else:
-            candidate = ""
-        if _is_date_turn_text(candidate):
-            continue  # 日期轮（自己的或同形前插轮）：不是会话内容
-        text = candidate
-        break
-    if not text.strip():
-        return None
-    digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"zcode-hub:{account_id}:{digest}"))
 
 
