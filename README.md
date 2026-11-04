@@ -13,7 +13,7 @@
 - **高可信桌面指纹池（一号一台）**：入池自动生成加权桌面成套 SKU（Mac Sequoia/Tahoe、Win11 主流分辨率等），每账号独立全新 UUIDv4 `device_mid`，杜绝宿主机云 Linux 内核共享导致的账号集群关联风险。
 - **官方首启安装序仿真**：入池与指纹轮换自动执行 `client/configs` 与激活事件上报（`app_launch` / `app_daily_active`），持久化 `install_id` 与 `installed_at`。
 - **反代与 CDN 基础设施头深度清洗**：自动剔除 `x-forwarded-*`、`forwarded`、`cf-*`、`cdn-loop`、`x-real-ip`、`via`、`cookie`、`referer`、`origin`、`accept-language` 等网络中间件头部，杜绝部署网络拓扑泄露与客户端伪装冲突。
-- **单账号精细化并发控制**：支持单账号并发上限（默认 2，可在后台运行时热改，0 不限）。满并发账号智能跳过，不计入重试轮数；客户端断开、异常与等待期间即时释放并发槽位。
+- **单账号精细化并发控制**：单账号并发上限写死为 2（2026-11-04 线上实测；env/后台设置一律无效）。满并发账号智能跳过，不计入重试轮数；客户端断开、异常与等待期间即时释放并发槽位。
 - **阶梯式故障转移与容灾策略**：
   - **429 智能退避重试**：优先根据上游 `Retry-After` 原地等待重试（等待期间释放并发槽位，防止阻塞）；重试耗尽无损换号且**不冷却账号**；Plan 通道 429 耗尽且同账号有 API Key 时自动切 `api.z.ai` 回退通道。
   - **5xx 熔断冷却**：重试 3 次后进入 300s 冷却，自动切下一个可用账号。
@@ -90,7 +90,7 @@ python cli.py import <file>          导入账号
 |------|------|
 | `/admin/login` | 后台登录（Bearer 密钥鉴权，连续失败 IP 锁定防护，凭证加密存于浏览器 localStorage）|
 | `/admin/accounts` | 账号池：新增/导入/导出、启用禁用、指纹换发、**实时额度与状态监控**、套餐领取（自动/手动）|
-| `/admin/settings` | 后台密码、网关 API Key（GET 脱敏掩码）、额度刷新间隔、单账号并发上限 |
+| `/admin/settings` | 后台密码、网关 API Key（GET 脱敏掩码）、额度刷新间隔、单账号并发上限（写死 2，只读展示）|
 | `/admin/monitoring` | 请求监控中心：实时请求耗时、状态码、上游模型、使用账号、失败原因 |
 
 账号池页实时展示每个账号的**状态（正常 / 额度用完 / 限流 / 异常 / 禁用）**、各模型剩余额度、
@@ -156,7 +156,6 @@ JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Ali
 | `ZCODE_DATA_DIR` | data | 数据目录（SQLite 存放处）|
 | `ZCODE_QUOTA_REFRESH_INTERVAL` | 60 | 后台刷新额度间隔（秒），0 关闭 |
 | `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
-| `ZCODE_ACCOUNT_CONCURRENCY` | 2 | 单账号并发上限，0 不限（运行时可在后台设置改，以库为准）|
 | `ZCODE_CLAIM_ROUND_INTERVAL` | 600 | 套餐自动领取轮间隔（秒），0 关闭（运行时可在后台设置改，以库为准）|
 | `ZCODE_NODE_PATH` | node | 验证码求解所用 Node 可执行文件 |
 | `ZCODE_CAPTCHA_RETRIES` | 4 | 单次求解失败重试次数 |

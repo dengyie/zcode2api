@@ -487,8 +487,8 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
 async def _dispatch(req_id, body, incoming_headers, provider):
     """多账号轮询调度：_Upstream（成功）或 JSONResponse（错误）。
 
-    单账号并发限制：选号后若该账号在飞请求已达上限（store.account_concurrency，
-    0 = 不限），跳过换下一个账号——不排队（流式请求可占槽位数分钟，排队会
+    单账号并发限制：选号后若该账号在飞请求已达上限（写死 2，2026-11-04 线上实测；
+    env/meta 一律无效），跳过换下一个账号——不排队（流式请求可占槽位数分钟，排队会
     放大延迟甚至吊死客户端）。满号跳过不计入 MAX_ACCOUNT_ATTEMPTS（只计真正
     进入 _try_account 的次数）。全满/无号 → 503。
     """
@@ -639,7 +639,7 @@ _inflight: dict[str, int] = {}
 
 
 def _limit() -> int:
-    """当前并发上限（0 = 不限），实时读取设置（后台改后即生效）。"""
+    """当前并发上限。写死 2（2026-11-04 线上实测），env/meta 一律无效。"""
     return store.account_concurrency()
 
 

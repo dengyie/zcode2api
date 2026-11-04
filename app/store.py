@@ -99,10 +99,6 @@ class Store:
                 (str(settings.QUOTA_REFRESH_INTERVAL),),
             )
             conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('account_concurrency', ?)",
-                (str(settings.ACCOUNT_CONCURRENCY),),
-            )
-            conn.execute(
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('claim_round_interval', ?)",
                 (str(settings.CLAIM_ROUND_INTERVAL),),
             )
@@ -115,7 +111,6 @@ class Store:
             self._settings.setdefault("admin_key", settings.DEFAULT_ADMIN_KEY)
             self._settings.setdefault("gateway_key", "")
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
-            self._settings.setdefault("account_concurrency", str(settings.ACCOUNT_CONCURRENCY))
             self._settings.setdefault("claim_round_interval", str(settings.CLAIM_ROUND_INTERVAL))
 
             self._accounts = {p: [] for p in PROVIDERS}
