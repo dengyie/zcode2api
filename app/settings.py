@@ -119,8 +119,10 @@ RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 7 * 86400)
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
-# 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
-ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
+# 单账号并发上限。2026-11-04 线上实测写死为 2（每个账号同一时刻最多 2 个在飞
+# 请求，超限自动切下一账号）：不再读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台
+# meta 覆盖，历史 meta 值一律作废
+ACCOUNT_CONCURRENCY = 2
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -163,7 +165,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.17"
+APP_VERSION = "2.7.18"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

@@ -81,9 +81,10 @@ class TestSettingsSecretMask:
         fresh_app.set_setting("admin_key", "keep-this-admin-key")
         res = await client.put(
             "/admin/api/settings",
+            # account_concurrency 已写死 2：PUT 携带该键被静默忽略
             json={"admin_key": "keep…key", "account_concurrency": 3},
             headers={"Authorization": "Bearer keep-this-admin-key"},
         )
         assert res.status_code == 200
         assert fresh_app.admin_key() == "keep-this-admin-key"
-        assert fresh_app.account_concurrency() == 3
+        assert fresh_app.account_concurrency() == 2

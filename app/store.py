@@ -187,11 +187,9 @@ class Store:
             return settings.QUOTA_REFRESH_INTERVAL
 
     def account_concurrency(self) -> int:
-        """单账号并发上限（0 = 不限）。运行时可改（meta 表），改后即生效。"""
-        try:
-            return max(0, int(self.get_setting("account_concurrency", settings.ACCOUNT_CONCURRENCY)))
-        except (TypeError, ValueError):
-            return settings.ACCOUNT_CONCURRENCY
+        """单账号并发上限。写死 2（2026-11-04 线上实测）：env 与后台 meta 覆盖
+        一律作废（历史 meta 值如 account_concurrency=4 自动失效）。"""
+        return settings.ACCOUNT_CONCURRENCY
 
     def claim_round_interval(self) -> int:
         """套餐自动领取轮间隔（0 = 关闭）。运行时可改（meta 表），改后即生效。"""

@@ -1,7 +1,8 @@
-"""账号并发限制集成测试（2026-09-13）：单账号默认 2，可配置，0 = 不限。
+"""账号并发限制集成测试（2026-09-13；2026-11-04 写死）：单账号恒为 2。
 
 依赖 mock 上游 slow 场景（0.3s 延迟）制造重叠；用 conc_max 仪表（按凭证）
-断言单账号同时刻在飞请求数不超过限制。
+断言单账号同时刻在飞请求数不超过限制。后台 meta / env 覆盖一律无效；
+需要 limit=1 等特殊场景的用例直接 monkeypatch settings.ACCOUNT_CONCURRENCY。
 """
 
 from __future__ import annotations
@@ -79,8 +80,8 @@ class TestAccountConcurrency:
         statuses = [t.result().status_code for t in tasks]
         assert statuses == [200, 200, 200]
 
-    async def test_zero_limit_unbounded(self, gateway_client, fresh_app):
-        """limit=0：并发不封顶（4 请求同飞全 200，单号 max_concurrent > 2）。"""
+    async def test_meta_zero_ignored(self, gateway_client, fresh_app):
+        """写死后 meta 覆盖作废：即使 meta=0（旧「不限」语义），仍按 2 封顶。"""
         client, mock = gateway_client
         fresh_app.set_setting("account_concurrency", "0")
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-zero")
@@ -88,12 +89,12 @@ class TestAccountConcurrency:
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
                      for _ in range(4)]
-        statuses = [t.result().status_code for t in tasks]
-        assert statuses == [200, 200, 200, 200]
-        assert _per_key_max(mock, acc.jwt_token[:16]) > 2
+        statuses = sorted(t.result().status_code for t in tasks)
+        assert statuses == [200, 200, 503, 503]
+        assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
 
-    async def test_runtime_setting_changes_limit(self, gateway_client, fresh_app):
-        """后台改 limit=1 即生效：第 3 个并发请求被拒（单号 4 并发只成 1）。"""
+    async def test_meta_one_ignored(self, gateway_client, fresh_app):
+        """写死后 meta 覆盖作废：即使 meta=1，仍按 2 放行。"""
         client, mock = gateway_client
         fresh_app.set_setting("account_concurrency", "1")
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-one")
@@ -101,9 +102,9 @@ class TestAccountConcurrency:
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
                      for _ in range(2)]
-        statuses = sorted(t.result().status_code for t in tasks)
-        assert statuses == [200, 503]
-        assert _per_key_max(mock, acc.jwt_token[:16]) <= 1
+        statuses = [t.result().status_code for t in tasks]
+        assert statuses == [200, 200]
+        assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
 
     def test_env_default_is_two(self):
         assert settings.ACCOUNT_CONCURRENCY == 2
@@ -117,7 +118,8 @@ class TestAccountConcurrency:
 
         client, mock = gateway_client
         mock.state.slow_all = False
-        fresh_app.set_setting("account_concurrency", "1")
+        # 写死后 meta 不再生效；本用例需要 limit=1 制造槽位稀缺，直接钉常量
+        monkeypatch.setattr(settings, "ACCOUNT_CONCURRENCY", 1)
         monkeypatch.setattr(settings, "RETRY_429_TIMES", 1)
         monkeypatch.setattr(settings, "RETRY_429_WAIT", 60)
         monkeypatch.setattr(gw, "_parse_retry_after", lambda _: None)
@@ -148,7 +150,7 @@ class TestAccountConcurrency:
         assert first_res.status_code == 200
 
     async def test_skip_full_does_not_consume_account_attempts(
-        self, gateway_client, fresh_app
+        self, gateway_client, fresh_app, monkeypatch
     ):
         """满号跳过不得计入 MAX_ACCOUNT_ATTEMPTS。
 
@@ -159,7 +161,8 @@ class TestAccountConcurrency:
 
         client, mock = gateway_client
         mock.state.slow_all = False
-        fresh_app.set_setting("account_concurrency", "1")
+        # 写死后 meta 不再生效；本用例需要 limit=1 制造「5 号全满」场景
+        monkeypatch.setattr(settings, "ACCOUNT_CONCURRENCY", 1)
         accounts = [
             _seed(fresh_app, f"h{i}.eyJzdWIiOiJjIn0.sig", f"a-skip-{i}")
             for i in range(6)
