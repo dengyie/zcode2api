@@ -154,6 +154,11 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
         "messages": out_msgs,
         "max_tokens": _as_int(payload.get("max_tokens") or payload.get("max_completion_tokens")) or 4096,
     }
+    if isinstance(payload.get("metadata"), dict):
+        body["metadata"] = dict(payload["metadata"])
+    for sid_key in ("session_id", "conversation_id"):
+        if sid_key in payload:
+            body[sid_key] = payload[sid_key]
     if system_parts:
         body["system"] = "\n\n".join(system_parts)
 

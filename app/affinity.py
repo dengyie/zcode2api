@@ -122,23 +122,26 @@ affinity_manager = SessionAffinity()
 def _extract_header_session_id(headers: dict[str, Any] | None) -> str | None:
     if not headers:
         return None
-    for k, v in headers.items():
-        if isinstance(k, str) and k.lower() in _SESSION_HEADER_KEYS:
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+    norm = {k.lower(): v for k, v in headers.items() if isinstance(k, str)}
+    for target in _SESSION_HEADER_KEYS:
+        val = norm.get(target)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
     return None
 
 
 def _extract_meta_session_id(body: dict[str, Any]) -> str | None:
     meta = body.get("metadata")
     if isinstance(meta, dict):
-        sid = meta.get("session_id") or meta.get("conversation_id")
+        for key in ("session_id", "conversation_id"):
+            sid = meta.get(key)
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+    # 根层兼容
+    for key in ("session_id", "conversation_id"):
+        sid = body.get(key)
         if isinstance(sid, str) and sid.strip():
             return sid.strip()
-    # 根层兼容
-    root_sid = body.get("session_id") or body.get("conversation_id")
-    if isinstance(root_sid, str) and root_sid.strip():
-        return root_sid.strip()
     return None
 
 
@@ -204,6 +207,8 @@ def extract_context_key(
     digest = hashlib.sha256(first_text.encode("utf-8")).hexdigest()[:32]
     key = f"{provider}:conv:{client_ip}:{digest}"
 
-    # 若含有 assistant 轮，则是明确的延续上下文；若缓存已有且未过期也是延续；否则是新请求
-    is_cont = has_history or manager.has(key)
+    # 指纹模式：必须包含 assistant 历史轮次才视为延续上下文（is_continuation=True）；
+    # 纯单轮请求（无 assistant 往返）一律按新请求对待（is_continuation=False），
+    # 确保相同 Prompt 的新请求（如多次发 "hello"）均匀负载均衡分流到不同账号。
+    is_cont = bool(has_history)
     return ContextInfo(key=key, is_continuation=is_cont)

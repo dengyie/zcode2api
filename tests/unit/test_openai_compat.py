@@ -130,6 +130,18 @@ class TestOpenaiToAnthropic:
         assert openai_to_anthropic({"model": "glm-5.3"})[1] is not None  # 缺 messages
         assert openai_to_anthropic({"model": "glm-5.3", "messages": "x"})[1] is not None
 
+    def test_metadata_and_session_id_preserved(self):
+        body, err = openai_to_anthropic({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"session_id": "meta-sess-1"},
+            "conversation_id": "conv-root-2",
+        })
+        assert err is None
+        assert body["metadata"] == {"session_id": "meta-sess-1"}
+        assert body["conversation_id"] == "conv-root-2"
+
+
 
 class TestAnthropicToOpenai:
     def test_text_response(self):

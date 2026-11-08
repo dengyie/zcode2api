@@ -343,13 +343,21 @@ _login_followup_tasks: set[asyncio.Task] = set()
 
 
 def _schedule_login_followup(account, flow, access_token: str | None) -> None:
-    """ready 后后台兑换 API Key 并刷新额度；失败只打日志，不影响已入池的 JWT。"""
+    """ready 后后台兑换 API Key 并刷新额度；失败只打日志，不影响已入池的 JWT。
+
+    同时把 OAuth access_token 落到 account.oauth_token：这是标准 Anthropic
+    端点（plan_std，Magpie 模式）的推理凭证，与 API Key 兑换互不依赖——
+    兑换失败也保留 token 供 plan_std 通道使用（绕过 zcode-plan WAF）。
+    """
 
     async def _job():
         live = store.find("zai", account.id)
         if live is None:
             return
         if access_token:
+            # 先落 oauth_token（标准端点凭证），再尝试兑换 API Key
+            live.oauth_token = access_token
+            store.update_account(live)
             try:
                 api_key = await asyncio.wait_for(
                     flow.exchange_api_key(access_token), timeout=LOGIN_EXCHANGE_TIMEOUT

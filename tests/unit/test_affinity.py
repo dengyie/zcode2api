@@ -117,3 +117,53 @@ class TestExtractContextKey:
         assert info.key is not None
         assert info.key.startswith("zai:conv:1.2.3.4:")
         assert info.is_continuation is True
+
+    def test_metadata_whitespace_fallback_to_conversation_id(self):
+        """验证 session_id 为全空白时能够正确回退到有效的 conversation_id。"""
+        aff = SessionAffinity(ttl=10.0)
+        body = {
+            "metadata": {"session_id": "   ", "conversation_id": "conv-real-999"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        info = extract_context_key(body, {}, provider="zai", manager=aff)
+        assert info.key == "zai:meta:conv-real-999"
+
+    def test_root_whitespace_fallback_to_conversation_id(self):
+        """验证根层 session_id 为空白或非字符串时能够正确回退到 conversation_id。"""
+        aff = SessionAffinity(ttl=10.0)
+        body = {
+            "session_id": "  \t ",
+            "conversation_id": "root-conv-888",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        info = extract_context_key(body, {}, provider="zai", manager=aff)
+        assert info.key == "zai:meta:root-conv-888"
+
+    def test_header_priority_deterministic(self):
+        """验证多 Header 存在时按 _SESSION_HEADER_KEYS 预定优先级稳定匹配。"""
+        aff = SessionAffinity(ttl=10.0)
+        headers = {
+            "conversation-id": "lower-priority",
+            "x-session-id": "higher-priority",
+        }
+        body = {"messages": [{"role": "user", "content": "test"}]}
+        info = extract_context_key(body, headers, provider="zai", manager=aff)
+        assert info.key == "zai:hdr:higher-priority"
+
+    def test_repeated_single_turn_fingerprint_treated_as_new_requests(self):
+        """验证无 Header 时，连续发送的纯单轮相同 Prompt 请求被判定为新请求，以便负载均衡均匀分流。"""
+        aff = SessionAffinity(ttl=10.0)
+        body = {"messages": [{"role": "user", "content": "common query"}]}
+        headers = {"cf-connecting-ip": "1.2.3.4"}
+        info1 = extract_context_key(body, headers, provider="zai", manager=aff)
+        assert info1.is_continuation is False
+
+        # 模拟第 1 轮调度成功并建立了绑定
+        aff.bind(info1.key, "acc_a")
+
+        # 客户端再次发起完全相同的单轮提问（无 assistant 轮）
+        info2 = extract_context_key(body, headers, provider="zai", manager=aff)
+        assert info2.key == info1.key
+        # 必须依然为 False，绝不能因为相同 Prompt 就粘滞在同一账号导致无法负载均衡
+        assert info2.is_continuation is False
+

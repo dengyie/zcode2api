@@ -236,6 +236,13 @@ def build_app() -> FastAPI:
             # 2026-10-30 实测形态：Plan 通道对额度拒绝回 **HTTP 200** +
             # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
             return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
+        if scenario == "quota_exhausted_1310":
+            # Magpie 模式实测形态：标准 Anthropic 端点对周/月使用上限回
+            # HTTP 200 + {"code":1310,"msg":"您已达到每周使用上限，将于 2026-11-15 23:59 重置"}
+            return 200, {
+                "code": 1310,
+                "msg": "您已达到每周使用上限，将于 2026-11-15 23:59 重置",
+            }, {}
         if scenario == "risk_control_3012_200":
             # 同形：风控拒绝也用 200 承载，最危险——当成功处理会洗掉 strikes
             return 200, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}

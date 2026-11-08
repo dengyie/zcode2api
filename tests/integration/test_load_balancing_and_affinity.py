@@ -280,3 +280,64 @@ class TestLoadBalancingAndAffinity:
         # mock 记录到的最大在飞请求数严格 <= 2
         assert mock.state.conc_max.get(a.jwt_token[:16], 0) <= 2
 
+    async def test_repeated_single_turn_requests_load_balance(self, gateway_client, fresh_app):
+        """纯单轮相同 Prompt 请求：无 Header 时必须交替负载均衡，不因内容相同被错误绑死。"""
+        client, mock = gateway_client
+        a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "acc-a")
+        b = _seed(fresh_app, "hB.eyJzdWIiOiJiIn0.sig", "acc-b")
+
+        # 连续发送 4 次完全相同的单轮提问（无 assistant 轮）
+        for _ in range(4):
+            resp = await client.post(
+                "/v1/messages",
+                json={"model": "GLM-5.2", "messages": [{"role": "user", "content": "hello world"}]},
+            )
+            assert resp.status_code == 200
+
+        auths = _get_call_auths(mock)
+        assert len(auths) == 4
+        assert auths == [
+            a.jwt_token[:16],
+            b.jwt_token[:16],
+            a.jwt_token[:16],
+            b.jwt_token[:16],
+        ]
+
+    async def test_openai_chat_completions_affinity_via_metadata(self, gateway_client, fresh_app):
+        """OpenAI /v1/chat/completions 端点：透传 metadata.session_id 维持会话亲和性。"""
+        client, mock = gateway_client
+        a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "acc-a")
+        _b = _seed(fresh_app, "hB.eyJzdWIiOiJiIn0.sig", "acc-b")
+
+        # 第 1 轮
+        r1 = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "glm-4",
+                "messages": [{"role": "user", "content": "question 1"}],
+                "metadata": {"session_id": "openai-sess-100"},
+            },
+        )
+        assert r1.status_code == 200
+
+        # 第 2 轮（携带 assistant 轮与相同 metadata）
+        r2 = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "glm-4",
+                "messages": [
+                    {"role": "user", "content": "question 1"},
+                    {"role": "assistant", "content": "answer 1"},
+                    {"role": "user", "content": "question 2"},
+                ],
+                "metadata": {"session_id": "openai-sess-100"},
+            },
+        )
+        assert r2.status_code == 200
+
+        auths = _get_call_auths(mock)
+        assert len(auths) == 2
+        assert auths[0] == a.jwt_token[:16]
+        assert auths[1] == a.jwt_token[:16]
+
+

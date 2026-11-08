@@ -198,19 +198,16 @@ def extract_first_user_text(body: dict) -> str:
         if not isinstance(msg, dict) or msg.get("role") != "user":
             continue
         content = msg.get("content")
-        candidate = ""
         if isinstance(content, str):
-            candidate = content
+            if not _is_date_turn_text(content) and content.strip():
+                return content.strip()
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text" \
                         and isinstance(block.get("text"), str):
                     candidate = block["text"]
-                    break
-        if _is_date_turn_text(candidate):
-            continue  # 日期轮（自己的或同形前插轮）：不是会话内容
-        if candidate.strip():
-            return candidate.strip()
+                    if not _is_date_turn_text(candidate) and candidate.strip():
+                        return candidate.strip()
     return ""
 
 

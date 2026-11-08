@@ -327,7 +327,11 @@ class TestGatewayHTTP:
         res = await client.get("/v1/models")
         assert res.status_code == 200
         ids = [m["id"] for m in res.json()["data"]]
-        assert ids == ["GLM-5.3-Flash", "GLM-5.3"]
+        # Magpie 命名空间前缀：`zai/` 与 `bigmodel/` 前缀供外部 Agent 选 provider
+        assert ids == [
+            "zai/GLM-5.3-Flash", "zai/GLM-5.3",
+            "bigmodel/GLM-5.3-Flash", "bigmodel/GLM-5.3",
+        ]
 
     async def test_messages_ok(self, gateway_client):
         client, upstream = gateway_client

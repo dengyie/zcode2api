@@ -125,6 +125,35 @@ class TestConversationSessionId:
         assert body_transform.conversation_session_id(second, "acc-1") == \
             body_transform.conversation_session_id(_body(text="首轮"), "acc-1")
 
+    def test_extract_first_user_text_multiple_blocks(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>\nToday's date is 2026-11-05.\n</system-reminder>"},
+                        {"type": "text", "text": "真正的首轮提示词"},
+                    ],
+                }
+            ]
+        }
+        assert body_transform.extract_first_user_text(body) == "真正的首轮提示词"
+
+    def test_extract_first_user_text_skips_whitespace_block(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "   \n\t  "},
+                        {"type": "text", "text": "有效内容"},
+                    ],
+                }
+            ]
+        }
+        assert body_transform.extract_first_user_text(body) == "有效内容"
+
+
 
 class TestPlanKind:
     """套餐类型判定（后台区分体验号/付费号用）。

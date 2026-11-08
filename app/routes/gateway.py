@@ -7,8 +7,10 @@ openai_compat 做双向格式转换，调度与错误处理策略完全一致。
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import random
+import re
 import secrets
 import time
 
@@ -39,6 +41,7 @@ MAX_ACCOUNT_ATTEMPTS = 5
 # 常量收口：模型表与被拒信号关键字统一在 app/constants.py
 MODEL_NAME_MAP = constants.MODEL_NAME_MAP
 AVAILABLE_MODELS = constants.AVAILABLE_MODELS
+MODEL_CATALOG = constants.MODEL_CATALOG
 _EXHAUST_KEYWORDS = constants.EXHAUST_KEYWORDS
 
 
@@ -57,9 +60,17 @@ def _messages_egress() -> str:
 
 
 def _detect_provider(body: dict, headers) -> str:
+    """入站 provider 识别（Magpie 模式命名空间：`provider/Model` 前缀）。
+
+    优先级：模型名前缀 > `x-provider` 请求头 > 默认 zai（裸名向后兼容）。
+    """
     model = body.get("model") or ""
-    if model.startswith("bigmodel/") or headers.get("x-provider") == "bigmodel":
-        return "bigmodel"
+    prefix = model.split("/", 1)[0].strip().lower() if "/" in model else ""
+    if prefix in ("bigmodel", "zai"):
+        return prefix
+    xp = (headers.get("x-provider") or "").strip().lower()
+    if xp in ("bigmodel", "zai"):
+        return xp
     return "zai"
 
 
@@ -211,12 +222,12 @@ def _last_user_text(body: dict) -> str:
 
 @router.get("/v1/models", dependencies=[Depends(verify_gateway_key)])
 async def list_models():
-    """列出可用模型（Anthropic /v1/models 风格）。"""
+    """列出可用模型（Anthropic /v1/models 风格，Magpie 命名空间前缀）。"""
     return {
         "object": "list",
         "data": [
             {"id": i, "type": "model", "display_name": i, "created_at": "2025-01-01T00:00:00Z"}
-            for i in AVAILABLE_MODELS
+            for i in MODEL_CATALOG
         ],
     }
 
@@ -485,6 +496,20 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
                              headers={"Cache-Control": "no-cache"})
 
 
+def _provider_chain(provider: str) -> list[str]:
+    """跨 provider 降级链（Magpie 模式）。
+
+    首选显式指定的 provider，其后按 `settings.PROVIDER_FALLBACK_ORDER` 里
+    位于它之后的 provider 补齐（默认 zai → bigmodel）。裸模型名与 `zai/`
+    前缀都落在 zai，zai 池没号时自动下沉 bigmodel；`bigmodel/` 前缀只在
+    bigmodel 池内调度（order 里它已是最后一站）。
+    """
+    order = list(settings.PROVIDER_FALLBACK_ORDER)
+    if provider in order:
+        return order[order.index(provider):]
+    return [provider]
+
+
 async def _dispatch(req_id, body, incoming_headers, provider):
     """多账号负载均衡调度：_Upstream（成功）或 JSONResponse（错误）。
 
@@ -492,7 +517,9 @@ async def _dispatch(req_id, body, incoming_headers, provider):
     1. 同一上下文亲和性：多轮请求绑定同一账号，提高 Cache 命中与局部性；
     2. 新请求多账号负载均衡：分配到在飞负载最低的账号（同负载轮询平局）；
     3. 单账号并发限制：写死 2，满载或故障时无缝溢出至其他可用账号；
-    4. 满载跳过不计入 MAX_ACCOUNT_ATTEMPTS；全满/无号 → 503。
+    4. 满载跳过不计入 MAX_ACCOUNT_ATTEMPTS；全满/无号 → 503；
+    5. 跨 provider 降级：当前 provider 池无可用号时，按 PROVIDER_FALLBACK_ORDER
+       下沉到下一 provider（Magpie 模式，zai 池空自动用 bigmodel）。
     """
     ctx_info = extract_context_key(body, incoming_headers, provider=provider)
     pinned_id = affinity_manager.get(ctx_info.key) if ctx_info.is_continuation else None
@@ -502,66 +529,75 @@ async def _dispatch(req_id, body, incoming_headers, provider):
     tried: set[str] = set()
     limit = _limit()
     attempts = 0
+    providers = _provider_chain(provider)
 
-    while attempts < MAX_ACCOUNT_ATTEMPTS:
-        account = store.select(
-            provider,
-            skip_ids=tried,
-            inflight=_inflight if limit > 0 else None,
-            pinned_id=pinned_id,
-            max_inflight=limit if limit > 0 else 2,
-        )
-        if account is None:
-            break
-        tried.add(account.id)
-        pinned_id = None
+    for pi, active_provider in enumerate(providers):
+        while attempts < MAX_ACCOUNT_ATTEMPTS:
+            account = store.select(
+                active_provider,
+                skip_ids=tried,
+                inflight=_inflight if limit > 0 else None,
+                pinned_id=pinned_id,
+                max_inflight=limit if limit > 0 else 2,
+            )
+            if account is None:
+                break  # 本 provider 池已无可选账号 → 下沉下一 provider
+            tried.add(account.id)
+            pinned_id = None
 
-        slot_box: list[str | None] = [None]
-        if limit > 0:
-            if _inflight.get(account.id, 0) >= limit:
-                logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
+            slot_box: list[str | None] = [None]
+            if limit > 0:
+                if _inflight.get(account.id, 0) >= limit:
+                    logs.warn(req_id, f"账号 {account.name} 并发已满（{_inflight.get(account.id, 0)}/{limit}），切换下一个")
+                    continue
+                # 在任何异步挂起点（await）前同步占槽，消除 Check-then-Act 竞态击穿上限
+                _inflight[account.id] = _inflight.get(account.id, 0) + 1
+                slot_box[0] = account.id
+
+            attempts += 1
+            # 结构上能否用到验证码（Plan 通道）；是否**真的带**由上游 captcha 配置决定：
+            # 线上 skip_model_request=true ⇒ 官方客户端模型请求不带验证码头，hub 也必须不带
+            # （带了就是「官方不会干的事」，3012 的结构性嫌疑）。上游若仍回 3007 要码，
+            # _try_account 会补码重试。渠道梯内 zcode-plan(`zai`) 才用验证码。
+            plan_channel = account.provider == "zai" and account.uses_plan_channel()
+            try:
+                needs_captcha = plan_channel and await captcha_manager.model_requests_need_captcha(
+                    _messages_egress()
+                )
+                result = await _try_account(
+                    req_id, account, body, incoming_headers, plan_channel, needs_captcha,
+                    slot_box,
+                )
+            except BaseException:
+                if slot_box[0] is not None:
+                    _release_slot(slot_box[0])
+                    slot_box[0] = None
+                raise
+            if result is _NEXT_ACCOUNT:
+                if slot_box[0] is not None:
+                    _release_slot(slot_box[0])
+                    slot_box[0] = None
                 continue
-            # 在任何异步挂起点（await）前同步占槽，消除 Check-then-Act 竞态击穿上限
-            _inflight[account.id] = _inflight.get(account.id, 0) + 1
-            slot_box[0] = account.id
-
-        attempts += 1
-        # 结构上能否用到验证码（Plan 通道）；是否**真的带**由上游 captcha 配置决定：
-        # 线上 skip_model_request=true ⇒ 官方客户端模型请求不带验证码头，hub 也必须不带
-        # （带了就是「官方不会干的事」，3012 的结构性嫌疑）。上游若仍回 3007 要码，
-        # _try_account 会补码重试。
-        plan_channel = provider == "zai" and account.uses_plan_channel()
-        try:
-            needs_captcha = plan_channel and await captcha_manager.model_requests_need_captcha(
-                _messages_egress()
-            )
-            result = await _try_account(
-                req_id, account, body, incoming_headers, plan_channel, needs_captcha,
-                slot_box,
-            )
-        except BaseException:
+            if isinstance(result, _Upstream):
+                if ctx_info.key:
+                    affinity_manager.bind(ctx_info.key, account.id)
+                held = slot_box[0]
+                slot_box[0] = None
+                if held is not None:
+                    result.on_close = _make_slot_releaser(held)
+                return result
             if slot_box[0] is not None:
                 _release_slot(slot_box[0])
                 slot_box[0] = None
-            raise
-        if result is _NEXT_ACCOUNT:
-            if slot_box[0] is not None:
-                _release_slot(slot_box[0])
-                slot_box[0] = None
-            continue
-        if isinstance(result, _Upstream):
-            if ctx_info.key:
-                affinity_manager.bind(ctx_info.key, account.id)
-            held = slot_box[0]
-            slot_box[0] = None
-            if held is not None:
-                result.on_close = _make_slot_releaser(held)
+            # 仅在上游流成功建立（_Upstream）时才记录会话亲和；4xx 等错误不建立绑定
             return result
-        if slot_box[0] is not None:
-            _release_slot(slot_box[0])
-            slot_box[0] = None
-        # 仅在上游流成功建立（_Upstream）时才记录会话亲和；4xx 等错误不建立绑定
-        return result
+
+        if pi + 1 < len(providers):
+            logs.info(
+                req_id,
+                f"provider {active_provider} 池无可选账号，跨 provider 降级 "
+                f"{providers[pi + 1]}",
+            )
 
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=503)
@@ -722,35 +758,117 @@ class _Upstream:
                                  headers={"Cache-Control": "no-cache"})
 
 
+def _channel_ladder(account: Account) -> list[str]:
+    """账号渠道优先梯（Magpie 模式）。
+
+    zai：plan_std（oauth access_token @ 标准 Anthropic，免验证码、免 zcode-plan
+         WAF）→ zcode_plan（jwt @ zcode-plan 代理）→ apikey（api.z.ai）；
+    bigmodel：bigmodel（api key）。仅当账号确持对应凭证才入梯。
+    """
+    if account.provider == "zai":
+        ladder: list[str] = []
+        if account.supports_plan_std():
+            ladder.append("zai_plan")
+        if account.uses_plan_channel():
+            ladder.append("zai")
+        if bool((account.api_key or "").strip()):
+            ladder.append("zai_fallback")
+        return ladder
+    if account.provider == "bigmodel":
+        return ["bigmodel"] if bool((account.api_key or "").strip()) else []
+    return []
+
+
+def _parse_exhaust_reset(text: str) -> float | None:
+    """从额度耗尽文案中尽力解析重置时间戳（仅未来时间）；解析不到返回 None。
+
+    1310「已达周/月使用上限」可能带下一次重置时间（ISO/日期时间形态）。
+    解析失败不阻塞主流程——额度恢复最终由 billing 刷新兜底。
+    """
+    m = re.search(
+        r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})(?:日|[T\s]+)?"
+        r"(?:(\d{1,2})[:时](\d{2})(?:[:分](\d{2}))?)?",
+        text,
+    )
+    if not m:
+        return None
+    try:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hh = int(m.group(4) or 0)
+        mm = int(m.group(5) or 0)
+        ss = int(m.group(6) or 0)
+        ts = datetime.datetime(y, mo, d, hh, mm, ss).timestamp()
+    except (ValueError, OSError):
+        return None
+    return ts if ts > time.time() else None
+
+
 async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                        needs_captcha, slot_box: list | None = None):
-    """尝试用单个账号转发，含验证码续期与可配置重试。
+    """尝试用单个账号转发，含渠道优先梯、验证码续期与可配置重试。
 
+    渠道梯（Magpie 模式，见 _channel_ladder）：
+      zai：plan_std（oauth @ 标准 Anthropic，免验证码/免 WAF）→ zcode_plan
+           （jwt @ zcode-plan 代理）→ apikey（api.z.ai）
     错误处理策略（参数见 settings，均可用环境变量调整）：
-      - 验证码挑战：清池换码重建请求，最多 MAX_CAPTCHA_RETRIES 次
+      - 验证码挑战：清池换码重建请求，最多 MAX_CAPTCHA_RETRIES 次（仅 zcode_plan）
       - 429 频控：**不冷却账号**，按上游 Retry-After（封顶 RETRY_429_WAIT_MAX）
         或 RETRY_429_WAIT 等待后原地重试，最多 RETRY_429_TIMES 次；
-        耗尽后换下一个账号，账号保持可用。Plan 通道耗尽且有 API Key 时切
-        回退通道重试（force_fallback 显式路由——429 不改账号状态，不能靠
-        status 推导通道；回退通道自己的 429 重试预算独立计满后再换号）
+        耗尽后下沉下一渠道（plan → apikey），再耗尽换号且账号保持可用
       - 5xx 等一般错误：重试最多 RETRY_5XX_TIMES 次；耗尽后账号冷却
         COOLING_SECONDS 并换下一个账号
       - 风控（3012/405「unusual activity」）：指数退避冷却（base 900s 起，封顶
         24h），累计 RISK_BAN_STRIKES 次升级禁用（UI 展示），人工确认恢复
+      - 1310（周/月使用上限）：额度耗尽信号，标记 EXHAUSTED 并尽力解析重置
+        时间写入 cooling_until（不是频控，不重试）
     """
+    ladder = _channel_ladder(account)
+    if not ladder:
+        account.record_result(False, "无可用渠道凭证")
+        _mark(account, Status.INVALID, "无可用渠道凭证")
+        logs.warn(req_id, f"账号 {account.name} 无可用渠道凭证，切换下一个")
+        return _NEXT_ACCOUNT
+
+    channel_idx = 0
+    channel = ladder[0]
     captcha_retries = 0
     retries_429 = 0
     retries_5xx = 0
-    force_fallback = False  # 本请求瞬态走 Key 回退（不改账号持久化状态）
     model_name = str(body.get("model") or "-")
-    # 结构上是否 Plan 通道（决定「能不能用验证码」）；needs_captcha 只表示「这一趟带不带」
-    # 验证码必须与本次 Plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
+    # 验证码必须与本次 zcode-plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
     captcha_egress = _messages_egress() if plan_channel else None
+
+    def _jump_to_channel(target: str | None = None) -> bool:
+        """下沉到渠道梯下一站（target 指定目标渠道）；无可达下一站返回 False。"""
+        nonlocal channel_idx, channel, captcha_retries, retries_429, retries_5xx
+        if target is None:
+            target_idx = channel_idx + 1
+        else:
+            if target not in ladder:
+                return False
+            target_idx = ladder.index(target)
+            if target_idx <= channel_idx:
+                return False  # 已在该渠道或其后，无可再降
+        if target_idx >= len(ladder):
+            return False
+        channel_idx = target_idx
+        channel = ladder[channel_idx]
+        captcha_retries = 0
+        retries_429 = 0
+        retries_5xx = 0
+        return True
+
+    def _jump_to_fallback() -> bool:
+        """风控/鉴权后跳过所有 plan 系渠道，直达 api-key 渠道（如持有）。"""
+        fallback = "zai_fallback" if account.provider == "zai" else "bigmodel"
+        return _jump_to_channel(target=fallback)
+
     while True:
         attempt_t0 = time.time()
         reqlog.mark_account(req_id, account.name, account.mode)
         verify_param = verify_region = None
-        if needs_captcha:
+        # 仅 zcode-plan（`zai`）渠道用验证码；plan_std / apikey 免码
+        if channel == "zai" and needs_captcha:
             _park_slot(slot_box)
             try:
                 # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
@@ -770,13 +888,17 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 return _NEXT_ACCOUNT
 
         try:
-            url, headers, payload = build_request(account, body, verify_param,
-                                                  incoming_headers, verify_region,
-                                                  force_fallback=force_fallback)
+            url, headers, payload = build_request(
+                account, body, verify_param, incoming_headers, verify_region,
+                upstream_key=channel,
+            )
         except RuntimeError as err:
-            account.record_result(False, f"凭证无效: {err}")
+            # 本渠道凭证缺失/无效：先下沉下一渠道，梯底才判死账号
+            account.record_result(False, f"渠道 {channel} 凭证无效: {err}")
+            logs.warn(req_id, f"账号 {account.name} 渠道 {channel} 凭证无效: {err}，下沉下一渠道")
+            if _jump_to_channel():
+                continue
             _mark(account, Status.INVALID, str(err))
-            logs.warn(req_id, f"账号 {account.name} 凭证无效，切换下一个")
             return _NEXT_ACCOUNT
 
         client = httpx.AsyncClient(
@@ -833,9 +955,9 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 await cm.__aexit__(None, None, None)
                 await client.aclose()
 
-            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）。Plan 通道上
-            # 即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
-            challenge = _detect_captcha_challenge(resp, text) if plan_channel and not force_fallback else None
+            # 验证码挑战：三形态任一命中即清池重试（不改账号状态）。zcode-plan
+            # 渠道上即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
+            challenge = _detect_captcha_challenge(resp, text) if channel == "zai" else None
             if challenge:
                 captcha_manager.invalidate(_messages_egress())
                 captcha_retries += 1
@@ -896,14 +1018,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     )
                     penalty_note = f"冷却至 {cool_until}（第 {account.risk_strikes} 次）"
                 store.update_account(account)
-                if plan_channel and not force_fallback and account.has_apikey_fallback():
+                if _jump_to_fallback():
                     logs.warn(
                         req_id,
                         f"账号 {account.name} 命中风控 HTTP {status_code}（出口={captcha_egress}），"
                         f"{penalty_note}，切 API Key 回退；上游body={snippet!r}",
                     )
                     needs_captcha = False
-                    force_fallback = True
                     continue
                 logs.warn(
                     req_id,
@@ -917,30 +1038,52 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if account.status in (Status.INVALID, Status.DISABLED):
                     store.update_account(account)
                 else:
-                    _mark(account, Status.EXHAUSTED, "额度已用完")
+                    reset_ts = _parse_exhaust_reset(text)
+                    if reset_ts:
+                        account.cooling_until = reset_ts
+                        account.last_error = (
+                            f"额度已用完（重置于 "
+                            f"{time.strftime('%m-%d %H:%M', time.localtime(reset_ts))}）"
+                        )
+                        account.status = Status.EXHAUSTED
+                        store.update_account(account)
+                    else:
+                        _mark(account, Status.EXHAUSTED, "额度已用完")
                     _spawn_bg(_safe_refresh(account))
                 logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
                 return _NEXT_ACCOUNT
 
             if status_code == 401:
+                # plan_std（标准 Anthropic）401：仅 OAuth token 失效，
+                # JWT 可能仍有效——下沉下一渠道，不判死账号
+                if channel in ("zai_plan", "bigmodel_plan"):
+                    account.record_result(False, "标准端点鉴权失败 HTTP 401")
+                    logs.warn(req_id, f"账号 {account.name} 标准端点 {channel} 鉴权失败 401，下沉下一渠道")
+                    if _jump_to_channel():
+                        continue
+                    return _NEXT_ACCOUNT
                 account.record_result(False, "鉴权失败 HTTP 401")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 401")
-                if plan_channel and not force_fallback and account.has_apikey_fallback():
+                if _jump_to_fallback():
                     logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切 API Key 回退")
                     needs_captcha = False
-                    force_fallback = True
                     continue
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 401，切换下一个")
                 return _NEXT_ACCOUNT
 
             if status_code == 403:
                 # 403 已排除挑战形态（上方 challenge 分支），此处为真实鉴权拒绝
+                if channel in ("zai_plan", "bigmodel_plan"):
+                    account.record_result(False, "标准端点鉴权失败 HTTP 403")
+                    logs.warn(req_id, f"账号 {account.name} 标准端点 {channel} 鉴权失败 403，下沉下一渠道")
+                    if _jump_to_channel():
+                        continue
+                    return _NEXT_ACCOUNT
                 account.record_result(False, "鉴权失败 HTTP 403")
                 _mark(account, Status.INVALID, "鉴权失败 HTTP 403")
-                if plan_channel and not force_fallback and account.has_apikey_fallback():
+                if _jump_to_fallback():
                     logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切 API Key 回退")
                     needs_captcha = False
-                    force_fallback = True
                     continue
                 logs.warn(req_id, f"账号 {account.name} 鉴权失败 403，切换下一个")
                 return _NEXT_ACCOUNT
@@ -952,14 +1095,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if "1113" in text or "insufficient balance" in text.lower():
                     account.record_result(False, "429 1113 无余额（Key 无资源包，永久态）")
                     logs.warn(req_id, f"账号 {account.name} 429 为 1113 无余额，跳过等待重试")
-                    if plan_channel and not force_fallback and account.has_apikey_fallback():
+                    if _jump_to_fallback():
                         needs_captcha = False
-                        force_fallback = True
                         retries_429 = 0
                         continue
                     return _NEXT_ACCOUNT
                 # 频控不是账号故障：不冷却，原地等一等再试，耗尽后换号且账号保持可用。
-                # Plan 通道耗尽 ≠ Key 回退也耗尽：同账号切回退并归还该通道的重试预算
+                # Plan 系渠道耗尽 ≠ apikey 也耗尽：同账号切回退并归还该渠道的重试预算
                 #（与上方 3012/401/403 切回退同一语义）
                 if retries_429 < settings.RETRY_429_TIMES:
                     retries_429 += 1
@@ -991,12 +1133,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         logs.warn(req_id, f"账号 {account.name} 429 等待后并发已满，切换下一个")
                         return _NEXT_ACCOUNT
                     continue
-                if plan_channel and not force_fallback and account.has_apikey_fallback():
+                if _jump_to_fallback():
                     account.record_result(False, "Plan 通道 429 耗尽，切 API Key 回退")
-                    logs.warn(req_id, f"账号 {account.name} Plan 通道 429 耗尽，切 API Key 回退")
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} Plan 通道 429 耗尽，切 API Key 回退",
+                    )
                     needs_captcha = False
-                    force_fallback = True
-                    retries_429 = 0
                     continue
                 account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
                 store.update_account(account)

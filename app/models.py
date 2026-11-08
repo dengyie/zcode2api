@@ -95,6 +95,10 @@ class Account:
     mode: str  # "jwt" | "apiKey"
     jwt_token: str | None = None
     api_key: str | None = None
+    # OAuth access_token（zcode.z.ai CLI OAuth 返回的 zai.access_token）：
+    # 可作 Bearer 打标准 Anthropic 端点（api.z.ai / open.bigmodel.cn），
+    # 绕过 zcode-plan WAF（Magpie 模式）。仅 JWT 账号持有。
+    oauth_token: str | None = None
     enabled: bool = True
     status: str = Status.ACTIVE
 
@@ -175,6 +179,20 @@ class Account:
         风控/失效后不得靠这把 Key 继续被选中。
         """
         return self.mode == "jwt" and bool((self.api_key or "").strip())
+
+    def supports_plan_std(self) -> bool:
+        """是否持有可打标准 Anthropic 端点的 OAuth access_token。
+
+        Magpie 模式通道（api.z.ai / open.bigmodel.cn 的 /api/anthropic/v1）：
+        用 OAuth access_token 作 Bearer 吃 Plan 额度，免验证码、免 zcode-plan
+        WAF。要求账号可走对话通道（uses_plan_channel）且确实持有 access_token。
+        """
+        return (
+            self.mode == "jwt"
+            and bool((self.oauth_token or "").strip())
+            and self.enabled
+            and self.status not in (Status.INVALID, Status.DISABLED)
+        )
 
     def uses_plan_channel(self) -> bool:
         """是否允许走 Coding Plan JWT 对话通道（messages）。
@@ -355,6 +373,8 @@ class Account:
             "fingerprint": self.fingerprint_view(),
             "install_id": self.install_id,
             "installed_at": self.installed_at,
+            # 是否持有标准端点 OAuth token（Magpie 模式通道可用性标记，不暴露 token 本体）
+            "has_oauth_token": bool((self.oauth_token or "").strip()),
         }
 
     def effective_status(self, now: float | None = None) -> str:

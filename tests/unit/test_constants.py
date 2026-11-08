@@ -15,6 +15,12 @@ def test_messages_urls():
         "https://api.z.ai/api/anthropic/v1/messages"
     assert constants.MESSAGES_URLS["bigmodel"] == \
         "https://open.bigmodel.cn/api/anthropic/v1/messages"
+    # plan_std 通道（Magpie 模式）：OAuth access_token 打标准 Anthropic 端点，
+    # 免验证码、免 zcode-plan WAF
+    assert constants.MESSAGES_URLS["zai_plan"] == \
+        "https://api.z.ai/api/anthropic/v1/messages"
+    assert constants.MESSAGES_URLS["bigmodel_plan"] == \
+        "https://open.bigmodel.cn/api/anthropic/v1/messages"
 
 
 def test_billing_base():
@@ -108,7 +114,9 @@ def test_retired_models_rewritten_to_live_model():
 def test_rejection_signals():
     assert constants.EXHAUST_HTTP_STATUSES == (402,)
     assert 1005 in constants.EXHAUST_BUSINESS_CODES  # Plan 通道 exceed quota limit
-    for word in ("余额不足", "额度不足", "exceed quota", "insufficient balance"):
+    assert 1113 in constants.EXHAUST_BUSINESS_CODES  # 无余额/无资源包
+    assert 1310 in constants.EXHAUST_BUSINESS_CODES  # 周/月使用上限（Magpie 实测）
+    for word in ("余额不足", "额度不足", "exceed quota", "insufficient balance", "使用上限"):
         assert any(word in k for k in constants.EXHAUST_KEYWORDS), word
     # 定量短语而非裸词：裸 "quota" 会把风控/验证码文案误判成额度用完
     assert "quota" not in constants.EXHAUST_KEYWORDS
@@ -135,7 +143,11 @@ def test_settings_upstream_defaults_from_constants():
     assert settings.UPSTREAM["zai"] == constants.MESSAGES_URLS["zai"]
     assert settings.UPSTREAM["zai_fallback"] == constants.MESSAGES_URLS["zai_fallback"]
     assert settings.UPSTREAM["bigmodel"] == constants.MESSAGES_URLS["bigmodel"]
+    assert settings.UPSTREAM["zai_plan"] == constants.MESSAGES_URLS["zai_plan"]
+    assert settings.UPSTREAM["bigmodel_plan"] == constants.MESSAGES_URLS["bigmodel_plan"]
     assert settings.ZCODE_BILLING_BASE == constants.BILLING_BASE
+    # 跨 provider 降级顺序默认 zai → bigmodel（Magpie 模式）
+    assert settings.PROVIDER_FALLBACK_ORDER == ("zai", "bigmodel")
 
 
 # 网关常量（底座原值，回归锁定）

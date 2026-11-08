@@ -136,6 +136,8 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
         "zai": f"{base}/api/v1/zcode-plan/anthropic/v1/messages",
         "zai_fallback": f"{base}/api/anthropic/v1/messages",
         "bigmodel": f"{base}/api/anthropic/v1/messages",
+        "zai_plan": f"{base}/api/anthropic/v1/messages",
+        "bigmodel_plan": f"{base}/api/anthropic/v1/messages",
     })
     # 后台额度刷新也指向 Mock（billing/current|balance|usage）
     monkeypatch.setattr(settings, "ZCODE_BILLING_BASE", f"{base}/api/v1/zcode-plan")
