@@ -88,6 +88,12 @@ async def cmd_login(args: list[str]) -> None:
             if zcode_jwt:
                 acc = store.add_account("zai", "oauth-login", zcode_jwt)
                 print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
+                # 与 Web 入池对齐（admin_api._schedule_login_followup）：
+                # OAuth access_token 落到 account.oauth_token，否则 plan_std
+                # 通道梯永远看不到凭证，CLI 入池的号只能走老 WAF 通道。
+                if access_token:
+                    acc.oauth_token = access_token
+                    store.update_account(acc)
                 await _cli_ingest_followup(acc)
             if access_token:
                 try:
