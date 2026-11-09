@@ -55,7 +55,7 @@ class TestSystemShape:
         body_transform.transform_body(body, model="GLM-5.3")
         blocks = body["system"]
         assert len(blocks) == 3
-        assert "powered by the model named GLM-5.3" in blocks[-1]["text"]
+        assert "powered by the model named zai-api/GLM-5.3" in blocks[-1]["text"]
 
     def test_transform_is_idempotent(self):
         body = _body(system="守则")

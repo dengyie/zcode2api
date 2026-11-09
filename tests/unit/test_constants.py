@@ -15,12 +15,6 @@ def test_messages_urls():
         "https://api.z.ai/api/anthropic/v1/messages"
     assert constants.MESSAGES_URLS["bigmodel"] == \
         "https://open.bigmodel.cn/api/anthropic/v1/messages"
-    # plan_std 通道（Magpie 模式）：OAuth access_token 打标准 Anthropic 端点，
-    # 免验证码、免 zcode-plan WAF
-    assert constants.MESSAGES_URLS["zai_plan"] == \
-        "https://api.z.ai/api/anthropic/v1/messages"
-    assert constants.MESSAGES_URLS["bigmodel_plan"] == \
-        "https://open.bigmodel.cn/api/anthropic/v1/messages"
 
 
 def test_billing_base():
@@ -57,22 +51,22 @@ def test_set_active_version():
 def test_client_configs():
     assert constants.CLIENT_CONFIGS_URL == "https://zcode.z.ai/api/v1/client/configs"
     # 实测带 platform 参数上游 3001，只允许 app_version
-    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.17.1"
+    assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.17.2"
 
 
 def test_client_version_single_source():
-    # 官方客户端 3.17.1（2026-11-03 本机 app.asar 核对 + 逆向；前值 3.16.3 / 3.14.4）
+    # 官方客户端 3.17.2（Magpie packages/zcode APP_VERSION 同源；前值 3.17.1 / 3.16.3）
     # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
-    assert constants.CLIENT_APP_VERSION == "3.17.1"
+    assert constants.CLIENT_APP_VERSION == "3.17.2"
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
     assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
     assert constants.CLIENT_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch
 
 
 def test_billing_version_and_activation():
-    # billing 族与 messages 指纹版本同源（官方现行版 3.17.1）；zcode-switch 的
+    # billing 族与 messages 指纹版本同源（官方现行版 3.17.2）；zcode-switch 的
     # 「读注册表真实版」在 Linux hub 上收敛为钉常量，升级时改此处即可
-    assert constants.BILLING_APP_VERSION == "3.17.1"
+    assert constants.BILLING_APP_VERSION == "3.17.2"
     assert constants.BILLING_TITLE == "Z Code@electron"
     assert constants.BILLING_RELEASE_CHANNEL == "production"
     assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"
@@ -143,8 +137,6 @@ def test_settings_upstream_defaults_from_constants():
     assert settings.UPSTREAM["zai"] == constants.MESSAGES_URLS["zai"]
     assert settings.UPSTREAM["zai_fallback"] == constants.MESSAGES_URLS["zai_fallback"]
     assert settings.UPSTREAM["bigmodel"] == constants.MESSAGES_URLS["bigmodel"]
-    assert settings.UPSTREAM["zai_plan"] == constants.MESSAGES_URLS["zai_plan"]
-    assert settings.UPSTREAM["bigmodel_plan"] == constants.MESSAGES_URLS["bigmodel_plan"]
     assert settings.ZCODE_BILLING_BASE == constants.BILLING_BASE
     # 跨 provider 降级顺序默认 zai → bigmodel（Magpie 模式）
     assert settings.PROVIDER_FALLBACK_ORDER == ("zai", "bigmodel")

@@ -27,7 +27,7 @@ def test_identity_headers_pinned_to_darwin():
     assert h["X-Platform"] == "darwin-arm64"
     assert h["X-Os-Category"] == "macos"
     assert h["X-Os-Version"] == constants.IDENTITY_OS_VERSION
-    assert h["User-Agent"] == constants.USER_AGENT
+    assert h["User-Agent"] == constants.USER_AGENT + " " + constants.ANTHROPIC_SDK_UA
     assert h["X-Device-Mid"]
 
 
@@ -111,7 +111,7 @@ class TestPassthroughFilter:
     def test_identity_headers_not_overridable(self):
         headers = self._build({"X-Device-Mid": "spoofed", "User-Agent": "evil"})
         assert headers["X-Device-Mid"] != "spoofed"
-        assert headers["User-Agent"] == constants.USER_AGENT
+        assert headers["User-Agent"] == constants.USER_AGENT + " " + constants.ANTHROPIC_SDK_UA
 
     def test_lowercase_client_hop_headers_dropped(self):
         """Starlette dict(request.headers) 键全小写。cookie/referer/origin 等

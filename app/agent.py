@@ -74,8 +74,7 @@ def build_request(
     账号 status 保持 ACTIVE，不能靠状态推导路由，须显式指定）。
 
     upstream_key：显式指定上游通道键（gateway 渠道优先梯驱动）；None 时按
-    账号能力自动选：JWT + oauth_token → `zai_plan`（标准 Anthropic，Magpie
-    模式，免 zcode-plan WAF）→ `zai`（zcode-plan 代理）→ `zai_fallback`
+    账号能力自动选：JWT → `zai`（zcode-plan 代理）→ `zai_fallback`
     （API Key）。
     """
     provider = account.provider
@@ -84,7 +83,7 @@ def build_request(
         if upstream_key:
             key = upstream_key
         elif account.uses_plan_channel() and not force_fallback:
-            key = "zai_plan" if account.supports_plan_std() else "zai"
+            key = "zai"
         elif account.api_key:
             key = "zai_fallback"
         else:
@@ -96,21 +95,13 @@ def build_request(
     else:
         raise RuntimeError(f"未知提供商: {provider}")
 
-    # 认证与目标 URL 选择；plan 系通道（zai / zai_plan / bigmodel_plan）共用
-    # 全量身份头 + 追踪头 + body transform 的「官方客户端形态」。
+    # 认证与目标 URL 选择；plan 系通道（zai）用全量身份头 + 追踪头 +
+    # body transform 的「官方客户端形态」。
     if key == "zai":
         if not account.jwt_token:
             raise RuntimeError("账号缺少 JWT")
         target_url = settings.UPSTREAM["zai"]
         auth = {"Authorization": f"Bearer {account.jwt_token}"}
-        bearer_token = account.jwt_token
-        plan_style = True
-    elif key in ("zai_plan", "bigmodel_plan"):
-        if not account.oauth_token:
-            raise RuntimeError("账号缺少 OAuth access_token")
-        target_url = settings.UPSTREAM[key]
-        auth = {"Authorization": f"Bearer {account.oauth_token}"}
-        bearer_token = account.oauth_token
         plan_style = True
     elif key == "zai_fallback":
         if not account.api_key:
@@ -142,20 +133,17 @@ def build_request(
             device_mid=profile.device_mid,
             session_id=session_id,
         )
+        # Start Plan 请求头部对齐 Magpie packages/zcode/index.mjs startHeaders：
+        # 不带 anthropic-beta（工具搜索 beta 仅 coding-plan 用）、不带 x-api-key
+        # （仅 Authorization: Bearer JWT）。旧「vlelyanin 实证」下发的这两项
+        # 已于 3.17.2 对齐时移除。
         headers = {
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
-            # start-plan 网关的 harness 要求：mid-conversation system 能力位，
-            # 官方客户端 LLM 调用恒带（vlelyanin / TriDefender 双源一致）。
-            "anthropic-beta": "mid-conversation-system-2026-04-07",
             **build_identity_headers(account),
             **build_trace_headers(session_id),
         }
-        # 官方 anthropic SDK 同时下发 x-api-key（与 Bearer 同值）；
-        # 缺失会被 start-plan 网关视为非客户端流量（vlelyanin 实证）。
-        if bearer_token:
-            headers["x-api-key"] = bearer_token
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集
         headers = {

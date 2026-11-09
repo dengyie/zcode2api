@@ -10,17 +10,17 @@ from app import constants
 @pytest.mark.asyncio
 async def test_check_zcode_version_now(gateway_client):
     client, mock = gateway_client
-    mock.state.mock_manifest_version = "3.17.2"
+    mock.state.mock_manifest_version = "3.18.0"
     orig = constants.CLIENT_APP_VERSION
     try:
         res = await client.post("/admin/api/version/zcode/check", headers={"Authorization": "Bearer zcode"})
         assert res.status_code == 200
         data = res.json()
         assert data["ok"] is True
-        assert data["latest_version"] == "3.17.2"
-        # 默认 auto_sync 为 true，自动对齐至 3.17.2
+        assert data["latest_version"] == "3.18.0"
+        # 默认 auto_sync 为 true，自动对齐至 3.18.0
         assert data["updated"] is True
-        assert constants.CLIENT_APP_VERSION == "3.17.2"
+        assert constants.CLIENT_APP_VERSION == "3.18.0"
     finally:
         constants.set_active_version(orig)
 

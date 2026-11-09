@@ -79,7 +79,9 @@ def build_identity_headers(account=None) -> dict[str, str]:
 
     headers: dict[str, str] = {
         "HTTP-Referer": constants.HTTP_REFERER,
-        "User-Agent": settings.USER_AGENT,
+        # Start Plan messages UA 带官方 anthropic SDK 后缀（billing 族不带）；
+        # build_identity_headers 仅 messages 通道调用，见 agent.build_request。
+        "User-Agent": settings.USER_AGENT + " " + constants.ANTHROPIC_SDK_UA,
     }
     if app_version:
         headers["X-ZCode-App-Version"] = app_version

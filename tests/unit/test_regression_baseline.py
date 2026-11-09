@@ -262,10 +262,9 @@ class TestBuildRequest:
         })
         # 客户端的鉴权/身份头被丢弃，authorization 保留的是账号自身凭证
         assert headers["Authorization"] == "Bearer a.b.c"
-        # x-api-key 恒为本账号 JWT 自身（官方 anthropic SDK 与 Bearer 同值双发，
-        # vlelyanin 实证：缺失会被 start-plan 网关判为非客户端流量），
-        # 绝不是客户端透传的 "leak"
-        assert headers["x-api-key"] == "a.b.c"
+        # Start Plan 请求不再下发 x-api-key（对齐 Magpie startHeaders：仅
+        # Authorization: Bearer JWT），客户端透传的 "leak" 同理被丢弃
+        assert "x-api-key" not in headers
         assert headers.get("x-zcode-foo") is None
         assert headers["User-Agent"] != "UA/1"
         assert headers.get("x-custom") == "keep"
