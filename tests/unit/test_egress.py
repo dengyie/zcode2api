@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import os
+
 import httpx
 import pytest
 
@@ -201,14 +203,20 @@ class TestCaptchaEgressSeparation:
         captured: dict[str, dict] = {}
 
         class _FakeProc:
+            pid = 4321  # 真实子进程有 pid；收尾会 killpg 整组，测试里 stub 掉
+
             async def communicate(self):
                 return b"VERIFY_PARAM=mock\n", b""
+
+            async def wait(self):
+                return 0
 
         async def _fake_exec(*args, **kwargs):
             captured["env"] = kwargs.get("env") or {}
             return _FakeProc()
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+        monkeypatch.setattr(os, "killpg", lambda *_a: None)
 
         await mgr._run_solver("s", "cn", "p", egress.DIRECT)
         assert "HTTP_PROXY" not in captured["env"]

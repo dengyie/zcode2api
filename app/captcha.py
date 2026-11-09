@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import time
 
 import httpx
@@ -41,6 +42,43 @@ class CaptchaSolveError(Exception):
 
     独立于 ClaimError 体系（验证码先于领域层使用），路由层按兜底回执处理。
     """
+
+
+def _kill_orphan_chromium() -> int:
+    """清扫孤儿 Chromium 进程（PPID==1），返回击杀数。
+
+    实测：Chromium 启动后会 setsid 脱离 node 的进程组（PGID=SESS=自身），
+    node 正常退出时由 solver 侧 exit 钩子清理；但 node 被 SIGKILL（求解超时）
+    或同步卡死时，killpg(node 组) 打不到逃逸的 Chromium，必须按孤儿特征兜底：
+    父进程已死的 Chromium 必为泄漏残留（并发求解中活跃 Chromium 的父进程是
+    活着的 node，PPID≠1，不会误杀）。
+
+    判据用 puppeteer 的临时 profile 目录（`--user-data-dir=<tmp>/puppeteer_dev_chrome_profile-*`），
+    而不是裸 `chromium` 子串——后者会把同机其它 Chromium/Chrome 服务一起 SIGKILL。
+    非 Linux（无 /proc）直接跳过。
+    """
+    killed = 0
+    try:
+        entries = [e for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as f:
+                raw = f.read().decode("utf-8", "ignore")
+            # stat 格式：pid (comm) state ppid ...（comm 可含空格/括号，从右起找最后的 ")"）
+            ppid = int(raw.rsplit(")", 1)[1].split()[1])
+            if ppid != 1:
+                continue
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", "ignore")
+            if "puppeteer_dev_chrome_profile" not in cmdline:
+                continue
+            os.kill(int(entry), signal.SIGKILL)
+            killed += 1
+        except (OSError, ValueError, IndexError):
+            continue
+    return killed
 
 
 class _Token:
@@ -325,7 +363,13 @@ class CaptchaManager:
         # 出口必须与取用该 token 的请求一致（见 app/egress.py）：
         #   direct → 剥掉代理变量，chrome 不带 --proxy-server
         #   proxy  → 注入代理变量，solver 用它作 --proxy-server
-        solver_env = {**os.environ, "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH)}
+        solver_env = {
+            **os.environ,
+            "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH),
+            # solver 侧硬超时：早于本侧 SIGKILL 20s 自我了断并清场，
+            # 避免"被 SIGKILL 打断 → 逃逸 Chromium 无人清理"
+            "ZCODE_SOLVE_DEADLINE_MS": str(max(30, settings.CAPTCHA_SOLVE_TIMEOUT - 20) * 1000),
+        }
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
                     "ALL_PROXY", "all_proxy"):
             solver_env.pop(key, None)
@@ -341,17 +385,39 @@ class CaptchaManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=solver_env,
+            start_new_session=True,  # 独立进程组：收尾时整组清场（见下方 finally）
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
         except TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
             return None
         except FileNotFoundError as err:
             raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
+        finally:
+            # 整组 SIGKILL 兜底：node 挂死（实测 NAS 上可挂 25 分钟以上）、launch 失败
+            # 残留、browser.close 异常被吞等路径都会留下 Chromium 孤儿（单个 ~360MB，
+            # 此前实测 10 分钟泄漏数 GB），必须由调用侧无条件清场。
+            # setsid 后 pgid == proc.pid；node 已正常退出且浏览器已关闭时组为空，
+            # 抛 ProcessLookupError 属正常情况，无副作用。
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (AttributeError, ProcessLookupError, PermissionError):
+                # Windows 无 killpg/SIGKILL（AttributeError）：退化为杀 node 本体，
+                # 否则超时路径会留下常驻 node 进程
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except Exception:  # noqa: BLE001 - 含等待超时；CancelledError 不在此列，正常传播
+                pass
+            # 二道防线：Chromium 逃逸了 node 进程组（setsid），killpg 打不到，按孤儿
+            # 特征（PPID==1）兜底清扫。必须放在 node 确认死亡之后：SIGKILL 投递是异步的，
+            # 早扫会因孤儿 PPID 尚未 reparent 到 1 而漏过（实测场景复现）
+            orphans = _kill_orphan_chromium()
+            if orphans:
+                logs.warn("captcha", f"清理孤儿 Chromium 进程 {orphans} 个")
 
         param = None
         for line in stdout.decode("utf-8", "ignore").splitlines():
