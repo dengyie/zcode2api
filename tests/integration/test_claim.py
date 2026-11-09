@@ -26,20 +26,21 @@ def claim_env(gateway_client, fresh_app, monkeypatch):
             self.solve_count = 0
             self.invalidated = 0
 
-        async def get_verify_param(self, port=None):
+        async def get_verify_param(self, egress_tag=None):
             self.solve_count += 1
             return "stub-verify-param", "sgp"
 
-        async def fetch_config(self):
+        async def fetch_config(self, egress_tag=None):
             return {"enabled": True, "prefix": "mockpre", "region": "sgp", "sceneId": "mock-scene"}
 
-        def invalidate(self):
+        def invalidate(self, tag=None):
             self.invalidated += 1
 
     stub = _StubCaptcha()
     monkeypatch.setattr(claim_module, "captcha_manager", stub)
     monkeypatch.setattr(captcha_module, "captcha_manager", stub)
     mock.state.claim_scenario = None  # session 级 mock，防止场景跨用例残留
+    mock.state.marketing_scenario = None
     acc = seed_account(fresh_app, GOOD_JWT, name="claim-a")
     return client, mock, stub, acc
 
@@ -59,6 +60,34 @@ class TestClaim:
         assert [g["name"] for g in plan["grants"]] == ["GLM-5.3"]
         assert plan["grants"][0]["units"] == 3_000_000
         assert plan["grants"][0]["period"] == "daily"
+
+    async def test_preview_merges_marketing_touch_plans(self, claim_env):
+        client, mock, _stub, _acc = claim_env
+        mock.state.marketing_scenario = "marketing_plan"
+        res = await client.get("/admin/api/claim/preview",
+                               headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        entry = res.json()["preview"][0]
+        assert entry["error"] is None
+        plan_ids = [p["plan_id"] for p in entry["plans"]]
+        # 优先级: mock-marketing-plan(120) > mock-claim-plan(100)
+        assert plan_ids == ["mock-marketing-plan", "mock-claim-plan"]
+        marketing_plan = entry["plans"][0]
+        assert marketing_plan["name"] == "Mock Marketing Plan"
+        assert marketing_plan["grants"][0]["name"] == "GLM-5.3-Flash"
+        assert marketing_plan["grants"][0]["units"] == 300_000_000
+
+    async def test_preview_discovers_marketing_plan_when_billing_preview_empty(self, claim_env):
+        client, mock, _stub, _acc = claim_env
+        mock.state.claim_scenario = "claim_none"
+        mock.state.marketing_scenario = "marketing_plan"
+        res = await client.get("/admin/api/claim/preview",
+                               headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        entry = res.json()["preview"][0]
+        assert entry["error"] is None
+        assert len(entry["plans"]) == 1
+        assert entry["plans"][0]["plan_id"] == "mock-marketing-plan"
 
     async def test_preview_business_failure_surfaced(self, claim_env):
         client, mock, _stub, _acc = claim_env
@@ -174,7 +203,7 @@ class TestClaim:
         assert h.get("user-agent") == f"ZCode/{constants.BILLING_APP_VERSION}"
         assert h.get("x-zcode-app-version") == constants.BILLING_APP_VERSION
         assert h.get("x-title") == "Z Code@electron"
-        assert h.get("x-release-channel") == "stable"
+        assert h.get("x-release-channel") == "production"
         # 平台/语言/设备按账号指纹档案出值（2026-09-07 随机指纹池）
         assert h.get("x-client-language") == profile.language
         assert h.get("x-client-timezone") == profile.timezone
@@ -218,7 +247,7 @@ class TestClaim:
 
         client, _mock, stub, acc = claim_env
 
-        async def _exhausted(port=None):
+        async def _exhausted(self, egress_tag=None):
             raise CaptchaSolveError("验证码求解失败: 多次重试无结果")
 
         monkeypatch.setattr(type(stub), "get_verify_param", _exhausted)

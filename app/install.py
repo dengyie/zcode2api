@@ -34,9 +34,15 @@ _CLIENT_TIMEOUT = 15
 
 
 async def _fetch_client_configs() -> dict:
-    """第 1 步：client/configs（免鉴权）。HTTP / 业务码任一失败抛异常。"""
+    """第 1 步：client/configs（免鉴权）。HTTP / 业务码任一失败抛异常。
+
+    trust_env=False 直连（2.7.16）：安装序与激活上报（telemetry 直连）/billing
+    （claim 直连）同属一条官方首启模拟链路，必须同出口——hub env 代理
+    （127.0.0.1:10822）2026-11-04 实测完全超时，走代理即「All connection
+    attempts failed」，且出口分裂本身是指纹矛盾信号。
+    """
     url = f"{constants.CLIENT_CONFIGS_URL}?app_version={constants.BILLING_APP_VERSION}"
-    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT, trust_env=False) as client:
         res = await client.get(url, headers={"User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}"})
     res.raise_for_status()
     body = res.json()  # 非 JSON 由调用方按 ValueError 容错

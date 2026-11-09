@@ -82,6 +82,9 @@ CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 # 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
 # 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 240)
+# 预热哪个出口的 token 池：空 = 跟随 messages 上游的实际出口（推荐）。
+# 可强制 "proxy" / "direct"；非预热出口按需现解（claim 一小时一轮，够用）。
+CAPTCHA_POOL_EGRESS = (os.getenv("ZCODE_CAPTCHA_POOL_EGRESS", "").strip().lower() or "")
 
 # ── 用量监控 ─────────────────────────────────────────────────────────────────
 # 后台自动刷新账号额度的间隔（秒）。0 表示关闭后台轮询，仅按需刷新。
@@ -97,6 +100,9 @@ BILLING_REFRESH_MIN_INTERVAL = _int("ZCODE_BILLING_REFRESH_MIN_INTERVAL", 60)
 RETRY_429_TIMES = _int("ZCODE_RETRY_429_TIMES", 5)       # 429 重试次数
 RETRY_429_WAIT = _int("ZCODE_RETRY_429_WAIT", 60)        # 429 重试等待秒数（上游 Retry-After 优先）
 RETRY_429_WAIT_MAX = _int("ZCODE_RETRY_429_WAIT_MAX", 120)  # Retry-After 采信上限（防吊死客户端）
+# 429/code 3009「model concurrency limit exceeded」是并发争用而非频控：上游没有
+# Retry-After，等 60s 纯属浪费（槽位早空了）。这类回短退避，配 jitter 打散重试。
+RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
@@ -113,14 +119,19 @@ RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 7 * 86400)
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
-# 单账号并发上限（0 = 不限）。默认 2；运行期可在后台设置改（meta 表即时生效）
-ACCOUNT_CONCURRENCY = _int("ZCODE_ACCOUNT_CONCURRENCY", 2)
+# 单账号并发上限。2026-11-04 线上实测写死为 2（每个账号同一时刻最多 2 个在飞
+# 请求，超限自动切下一账号）：不再读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台
+# meta 覆盖，历史 meta 值一律作废
+ACCOUNT_CONCURRENCY = 2
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
 # 时触发；10 分钟轮次 + 每轮 app_launch 上报是标记不消退的帮凶。0 = 关闭轮次，
 # 仅入池/手动触发。运行期可在后台设置改（meta 表即时生效）
 CLAIM_ROUND_INTERVAL = _int("ZCODE_CLAIM_ROUND_INTERVAL", 3600)
+# 领取窗口（北京时间小时，逗号分隔；空/"*" = 全天）。上游套餐按天投放，
+# 用户侧实证每天 19:00 放量——窗口外轮询只会空转 preview。
+CLAIM_ROUND_HOURS = os.getenv("ZCODE_CLAIM_ROUND_HOURS", "19")
 
 # ── 上游端点 ─────────────────────────────────────────────────────────────────
 # 上游端点：默认值统一收口在 constants.py，环境变量仅作覆盖
@@ -130,8 +141,28 @@ UPSTREAM = {
     "bigmodel": os.getenv("BIGMODEL_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel"]),
 }
 
+# 跨 provider 降级顺序（Magpie 模式）：当前 provider 池无可用号时按此顺序下沉。
+# 首个为默认路由 provider；裸模型名与 zai/ 前缀均落在 providers[0]。
+PROVIDER_FALLBACK_ORDER = tuple(
+    os.getenv("ZCODE_PROVIDER_FALLBACK_ORDER", "zai,bigmodel").replace(" ", "").split(",")
+) if os.getenv("ZCODE_PROVIDER_FALLBACK_ORDER") else ("zai", "bigmodel")
+
 # ZCode 计费 / 额度查询端点
 ZCODE_BILLING_BASE = constants.BILLING_BASE
+# 官方更新清单端点（测试时指向 Mock 上游）
+ZCODE_MANIFEST_URL = os.getenv("ZCODE_MANIFEST_URL", constants.ELECTRON_MANIFEST_URL)
+# 官方版本自动探测间隔（秒，默认 12 小时）
+VERSION_CHECK_INTERVAL = _int("ZCODE_VERSION_CHECK_INTERVAL", 43200)
+# 是否自动将客户端伪装对齐至官方最新版本
+AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
+# messages 通道强制直连（2026-11-04 线上实证：env 代理出口 GCP IP 被上游持续
+# 标记——messages 走代理 17h+ 零成功（3012 unusual activity），而同账号
+# billing/claim/telemetry 直连全部正常。切直连统一全链路出口，消除
+# 「CN billing + US messages」双 IP 异常信号；captcha 签发出口由 gateway
+# 的同一 egress tag 驱动自动对齐（app/egress.py「token 出口=请求出口」）。
+MESSAGES_FORCE_DIRECT = _bool("ZCODE_MESSAGES_FORCE_DIRECT", False)
+# 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
+ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）
 ZCODE_EVENT_REPORT_URL = os.getenv("ZCODE_EVENT_REPORT_URL", constants.EVENT_REPORT_URL)
 
@@ -140,7 +171,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.6.8"
+APP_VERSION = "2.7.22"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

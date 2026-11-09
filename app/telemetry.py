@@ -59,8 +59,14 @@ async def post_activation_event(profile, user_id: str, element: str,
 
     HTTP >= 400 或业务码非 0 抛 RuntimeError，文案含定位信息（"HTTP 500" /
     "业务码异常"）；httpx.HTTPError 原样上抛 —— 容错策略（中止/继续）由调用方定。
+
+    trust_env=False 直连（2.7.16，2026-11-04 线上实锤）：激活上报是领取链路的
+    资格信号，必须与 billing/claim 同出口——claim.py 实测「claim 直连 code:0、
+    走美国出口被拒 unusual activity」，且 hub 进程 env 代理（127.0.0.1:10822）
+    当晚完全超时（curl 15s HTTP 000），激活上报逐轮 ConnectTimeout/ReadTimeout
+    → 上游收不到当日活跃信号 → marketing/touch 恒空 → 自动领取全天空转。
     """
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
         res = await client.post(settings.ZCODE_EVENT_REPORT_URL,
                                 headers={"Content-Type": "application/json"},
                                 json=build_activation_event_body(element, profile, user_id))

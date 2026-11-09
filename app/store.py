@@ -16,11 +16,32 @@ import time
 import uuid
 from contextlib import closing
 
-from . import settings
+from . import logs, settings
 from .models import PROVIDERS, Account, Status
 
 _TBL = "accounts"
 _META = "meta"
+
+
+def _parse_hours(raw: str) -> list[int]:
+    """解析领取窗口（北京时间小时，逗号分隔；空/* = 全天 → []）。升序去重，脏值跳过。"""
+    raw = str(raw or "").strip()
+    if raw in ("", "*"):
+        return []
+    hours: list[int] = []
+    for part in raw.replace("，", ",").split(","):
+        part = part.strip()
+        try:
+            hour = int(part)
+        except ValueError:
+            continue  # 脏值跳过，不让一个坏配置挂掉领取轮
+        if 0 <= hour <= 23 and hour not in hours:
+            hours.append(hour)
+    return sorted(hours)
+
+
+# 已告警过的坏配置值（解析发生在每次循环唤醒/设置读取，去重避免刷屏）
+_HOURS_WARNED: set[str] = set()
 
 
 class Store:
@@ -78,10 +99,6 @@ class Store:
                 (str(settings.QUOTA_REFRESH_INTERVAL),),
             )
             conn.execute(
-                f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('account_concurrency', ?)",
-                (str(settings.ACCOUNT_CONCURRENCY),),
-            )
-            conn.execute(
                 f"INSERT OR IGNORE INTO {_META} (key, value) VALUES ('claim_round_interval', ?)",
                 (str(settings.CLAIM_ROUND_INTERVAL),),
             )
@@ -94,7 +111,6 @@ class Store:
             self._settings.setdefault("admin_key", settings.DEFAULT_ADMIN_KEY)
             self._settings.setdefault("gateway_key", "")
             self._settings.setdefault("quota_refresh_interval", str(settings.QUOTA_REFRESH_INTERVAL))
-            self._settings.setdefault("account_concurrency", str(settings.ACCOUNT_CONCURRENCY))
             self._settings.setdefault("claim_round_interval", str(settings.CLAIM_ROUND_INTERVAL))
 
             self._accounts = {p: [] for p in PROVIDERS}
@@ -166,11 +182,9 @@ class Store:
             return settings.QUOTA_REFRESH_INTERVAL
 
     def account_concurrency(self) -> int:
-        """单账号并发上限（0 = 不限）。运行时可改（meta 表），改后即生效。"""
-        try:
-            return max(0, int(self.get_setting("account_concurrency", settings.ACCOUNT_CONCURRENCY)))
-        except (TypeError, ValueError):
-            return settings.ACCOUNT_CONCURRENCY
+        """单账号并发上限。写死 2（2026-11-04 线上实测）：env 与后台 meta 覆盖
+        一律作废（历史 meta 值如 account_concurrency=4 自动失效）。"""
+        return settings.ACCOUNT_CONCURRENCY
 
     def claim_round_interval(self) -> int:
         """套餐自动领取轮间隔（0 = 关闭）。运行时可改（meta 表），改后即生效。"""
@@ -178,6 +192,25 @@ class Store:
             return max(0, int(self.get_setting("claim_round_interval", settings.CLAIM_ROUND_INTERVAL)))
         except (TypeError, ValueError):
             return settings.CLAIM_ROUND_INTERVAL
+
+    def claim_round_hours(self) -> list[int]:
+        """自动领取窗口：北京时间小时升序列表；空 = 全天（不限时）。运行时可改。
+
+        上游套餐按天投放（用户侧实证：每天 19:00 放量），窗口外轮询只会空转
+        preview。窗口锚定**北京时钟**而非 host 时区（host 换成 UTC 也不漂）；
+        中国无夏令时，固定 +8 即精确。
+        """
+        raw = str(self.get_setting("claim_round_hours", settings.CLAIM_ROUND_HOURS) or "").strip()
+        hours = _parse_hours(raw)
+        if not hours and raw not in ("", "*"):
+            # 配置写了但一个有效小时都没有（env 笔误 / 手改 DB——管理端 PUT 有校验
+            # 不会产生这种值）：**不允许坏配置静默升级成「全天轮询」**，回落默认并留痕。
+            fallback = _parse_hours(settings.CLAIM_ROUND_HOURS)
+            if raw not in _HOURS_WARNED:
+                _HOURS_WARNED.add(raw)
+                logs.warn("store", f"claim_round_hours={raw!r} 无有效小时，按默认处理 → {fallback or '全天'}")
+            return fallback
+        return hours
 
     # ── 账号读取 ─────────────────────────────────────────────────────────────
     def list_accounts(self, provider: str | None = None) -> list[Account]:
@@ -269,21 +302,62 @@ class Store:
             self._persist_account(account)
             return True
 
-    # ── 轮询选择 ─────────────────────────────────────────────────────────────
-    def select(self, provider: str, skip_ids: set[str] | None = None) -> Account | None:
-        """按 round-robin 选择下一个可用账号。用完 / 失效的自动跳过。"""
+    # ── 负载均衡与亲和选择 ───────────────────────────────────────────────────
+    def select(
+        self,
+        provider: str,
+        skip_ids: set[str] | None = None,
+        inflight: dict[str, int] | None = None,
+        pinned_id: str | None = None,
+        max_inflight: int = settings.ACCOUNT_CONCURRENCY,
+    ) -> Account | None:
+        """选择下一个可用账号。
+
+        策略：
+        1. 亲和账号优先：若指定 pinned_id 且未满（inflight < max_inflight）且可用，直接选用。
+        2. 负载均衡分配（新请求 或 亲和号满载/不可用时溢出）：
+           - 过滤掉 is_selectable 为 False、在 skip_ids 中、或已达并发上限（inflight >= max_inflight）的账号；
+           - 主排序：当前在飞数 inflight 升序（最小负载优先）；
+           - 次排序：距离当前轮询指针的偏移量（保证在负载相同时均匀轮流分配到不同账号）；
+           - 更新轮询指针为选中账号的下一位。
+        """
         skip_ids = skip_ids or set()
+        inflight_map = inflight or {}
         now = time.time()
         with self._lock:
+            accounts = self._accounts.get(provider, [])
+            # 1. 亲和号尝试
+            if pinned_id and pinned_id not in skip_ids:
+                for a in accounts:
+                    if a.id == pinned_id:
+                        if a.is_selectable(now) and inflight_map.get(a.id, 0) < max_inflight:
+                            return a
+                        break
+
+            # 2. 候选池过滤
             pool = [
-                a for a in self._accounts.get(provider, [])
-                if a.is_selectable(now) and a.id not in skip_ids
+                a for a in accounts
+                if a.is_selectable(now)
+                and a.id not in skip_ids
+                and inflight_map.get(a.id, 0) < max_inflight
             ]
             if not pool:
                 return None
-            idx = self._rotation.get(provider, 0) % len(pool)
-            account = pool[idx]
-            self._rotation[provider] = (idx + 1) % len(pool)
+
+            cur_rot = self._rotation.get(provider, 0)
+            n = len(pool)
+
+            # 负载优先（最小在飞请求数），相同负载下按轮询偏移平局
+            best_idx = 0
+            best_tuple = (inflight_map.get(pool[0].id, 0), (0 - cur_rot) % n)
+            for i in range(1, n):
+                cur_tuple = (inflight_map.get(pool[i].id, 0), (i - cur_rot) % n)
+                if cur_tuple < best_tuple:
+                    best_tuple = cur_tuple
+                    best_idx = i
+
+            account = pool[best_idx]
+            self._rotation[provider] = (best_idx + 1) % n
             return account
 
     # ── 导入 / 导出 ─────────────────────────────────────────────────────────

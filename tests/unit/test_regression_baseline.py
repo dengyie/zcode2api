@@ -15,6 +15,7 @@ from app.models import Account, Status
 from app.routes.gateway import (
     _detect_provider,
     _is_captcha_error,
+    _is_concurrency_hit,
     _is_exhausted,
     _normalize_body,
 )
@@ -23,12 +24,14 @@ from app.routes.gateway import (
 # ── 模型归一化 ────────────────────────────────────────────────────────────────
 class TestNormalizeBody:
     def test_lowercase_alias_mapped(self):
+        # glm-5.2 是**已退役**型号（上游 3006），别名表直接改写到 GLM-5.3
         body = {"model": "glm-5.2"}
-        assert _normalize_body(body)["model"] == "GLM-5.2"
+        assert _normalize_body(body)["model"] == "GLM-5.3"
 
     def test_provider_prefix_stripped(self):
+        # 前缀剥离后仍是退役型号 → 再改写到 GLM-5.3（两层改写都覆盖）
         body = {"model": "bigmodel/GLM-5.2"}
-        assert _normalize_body(body)["model"] == "bigmodel/GLM-5.2".split("/")[-1]
+        assert _normalize_body(body)["model"] == "GLM-5.3"
 
     def test_unknown_model_passed_through(self):
         body = {"model": "glm-unknown"}
@@ -124,23 +127,28 @@ class TestAccountStateMachine:
         assert not acc.allows_billing()
         assert acc.uses_plan_channel() is False
 
-    def test_risk_cooling_jwt_not_selectable(self):
-        """风控冷却期整号不可选（即使有 Key 回退；同请求回退由 force_fallback 保证）。"""
+    def test_risk_cooling_jwt_not_selectable_but_claimable(self):
+        """风控冷却期整号不可选（即使有 Key 回退；同请求回退由 force_fallback 保证），
+        但 billing/claim 照常（领取与使用两条链，2026-11-04 口径）。"""
         acc = self._acc()
         acc.api_key = "sk-fallback"
         acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
         assert acc.status == Status.COOLING
         assert acc.enabled is True
         assert not acc.is_selectable()
-        assert not acc.allows_billing()
+        # plan 通道名义可用（uses_plan_channel 只管 enabled/invalid/disabled），
+        # 冷却靠 is_selectable 挡选号——所以 messages 不会打到它。
+        assert acc.uses_plan_channel() is True
+        assert acc.allows_billing() is True
 
-    def test_manual_disable_never_selectable(self):
+    def test_manual_disable_never_selectable_but_claimable(self):
         acc = self._acc()
         acc.api_key = "sk-fallback"
         acc.enabled = False
         acc.status = Status.DISABLED
         assert not acc.is_selectable()
-        assert not acc.allows_billing()
+        assert acc.uses_plan_channel() is False
+        assert acc.allows_billing() is True
 
     def test_exhausted_jwt_not_selectable_but_plan_alive(self):
         acc = self._acc()
@@ -212,7 +220,7 @@ class TestBuildRequest:
         assert headers["anthropic-version"] == "2023-06-01"
         # JWT 通道带全量身份头 + 追踪头；桌面端账号走 electron/stable
         assert headers["X-Title"] == "Z Code@electron"
-        assert headers["X-Release-Channel"] == "stable"
+        assert headers["X-Release-Channel"] == "production"
         assert "X-Device-Mid" in headers
         assert "x-request-id" in headers and "x-zcode-trace-id" in headers
 
@@ -254,7 +262,9 @@ class TestBuildRequest:
         })
         # 客户端的鉴权/身份头被丢弃，authorization 保留的是账号自身凭证
         assert headers["Authorization"] == "Bearer a.b.c"
-        assert "x-api-key" not in {h.lower() for h in headers}
+        # Start Plan 请求不再下发 x-api-key（对齐 Magpie startHeaders：仅
+        # Authorization: Bearer JWT），客户端透传的 "leak" 同理被丢弃
+        assert "x-api-key" not in headers
         assert headers.get("x-zcode-foo") is None
         assert headers["User-Agent"] != "UA/1"
         assert headers.get("x-custom") == "keep"
@@ -267,14 +277,14 @@ class TestBuildRequest:
             build_request(acc, {}, None)
 
 
-# ── billing 阻断文案 ──────────────────────────────────────────────────────────
+# ── billing 阻断文案（只拦「JWT 不可用」；领取 ≠ 使用）────────────────────────
 class TestBillingBlockReason:
-    def test_cooling(self):
+    def test_cooling_not_blocked(self):
         from app.claim import billing_block_reason
         acc = Account.create("zai", "t", "a.b.c")
         acc.status = Status.COOLING
         acc.cooling_until = time.time() + 100
-        assert "冷却" in (billing_block_reason(acc) or "")
+        assert billing_block_reason(acc) is None
 
     def test_invalid_jwt(self):
         from app.claim import AUTH_EXPIRED_MESSAGE, billing_block_reason
@@ -282,30 +292,30 @@ class TestBillingBlockReason:
         acc.status = Status.INVALID
         assert billing_block_reason(acc) == AUTH_EXPIRED_MESSAGE
 
-    def test_manual_disable(self):
+    def test_manual_disable_not_blocked(self):
         from app.claim import billing_block_reason
         acc = Account.create("zai", "t", "a.b.c")
         acc.enabled = False
-        msg = billing_block_reason(acc, action="上游刷新") or ""
-        assert "停用" in msg
-        assert "重新授权" not in msg
+        acc.status = Status.DISABLED
+        assert billing_block_reason(acc, action="上游刷新") is None
 
-    def test_risk_cooling(self):
-        from app.claim import billing_block_reason
-        acc = Account.create("zai", "t", "a.b.c")
-        acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
-        msg = billing_block_reason(acc) or ""
-        assert "冷却" in msg
-        assert "重新授权" not in msg
-
-    def test_risk_disabled_after_strikes(self):
+    def test_risk_disabled_not_blocked(self):
         from app.claim import billing_block_reason
         acc = Account.create("zai", "t", "a.b.c")
         for _ in range(4):
             acc.risk_penalty(base=900.0, cap=86400.0, ban_strikes=4, decay_seconds=7 * 86400)
-        msg = billing_block_reason(acc) or ""
-        assert "风控封禁" in msg
-        assert "重新授权" not in msg
+        assert acc.status == Status.DISABLED
+        # 风控封禁只掐对话通道；billing/claim 照跑（2026-11-04 两条链）
+        assert billing_block_reason(acc) is None
+        assert acc.uses_plan_channel() is False
+
+    def test_no_jwt_blocked(self):
+        from app.claim import billing_block_reason
+        acc = Account.create("zai", "t", "not-a-jwt")  # 纯 apiKey
+        assert "非 Coding Plan" in (billing_block_reason(acc) or "")
+        acc2 = Account.create("zai", "t", "a.b.c")
+        acc2.jwt_token = None
+        assert "非 Coding Plan" in (billing_block_reason(acc2) or "")
 
 
 # ── 网关主流程（HTTP 层，走 Mock 上游；夹具见 conftest.py）────────────────────
@@ -316,7 +326,11 @@ class TestGatewayHTTP:
         res = await client.get("/v1/models")
         assert res.status_code == 200
         ids = [m["id"] for m in res.json()["data"]]
-        assert ids == ["GLM-5.3-Flash", "GLM-5.3"]
+        # Magpie 命名空间前缀：`zai/` 与 `bigmodel/` 前缀供外部 Agent 选 provider
+        assert ids == [
+            "zai/GLM-5.3-Flash", "zai/GLM-5.3",
+            "bigmodel/GLM-5.3-Flash", "bigmodel/GLM-5.3",
+        ]
 
     async def test_messages_ok(self, gateway_client):
         client, upstream = gateway_client
@@ -341,3 +355,22 @@ def fresh_account(secret: str) -> Account:
     """向当前 store 注入账号（gateway_client 用 fresh_app 的 store 单例）。"""
     from app.store import store
     return store.add_account("zai", "t", secret)
+
+
+# ── 3009 并发识别（2026-11-03 review：禁止裸子串，logid 会撞车）───────────────
+class TestConcurrencyHit:
+    def test_business_code_3009(self):
+        body = '{"code":3009,"msg":"model concurrency limit exceeded","logid":"202611030003009"}'
+        assert _is_concurrency_hit(body) is True
+
+    def test_logid_substring_alone_is_not_enough(self):
+        """20 位随机 logid 含 "3009" 子串（真实 429 形态）不得误判为并发。"""
+        body = '{"code":1302,"msg":"rate limited","logid":"202611030003009xxxx"}'
+        assert _is_concurrency_hit(body) is False
+
+    def test_text_fallback_for_non_json(self):
+        assert _is_concurrency_hit("model concurrency limit exceeded") is True
+
+    def test_other_codes_are_not_concurrency(self):
+        assert _is_concurrency_hit('{"code":1113,"msg":"insufficient balance"}') is False
+        assert _is_concurrency_hit("server busy") is False

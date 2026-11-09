@@ -20,7 +20,7 @@ import pytest_asyncio
 import uvicorn
 from httpx import ASGITransport, AsyncClient
 
-from app import settings
+from app import constants, settings
 from tests.mock_upstream import server as mock_server_module
 
 # 开发机常驻系统代理（如 Clash 监听 127.0.0.1:7897）时，httpx 默认 trust_env=True
@@ -38,6 +38,14 @@ _STORE_BINDING_MODULES = (
     "app.quota",
     "app.auth_admin",
 )
+
+
+@pytest.fixture(autouse=True)
+def reset_constants_version():
+    """每次测试前后将客户端伪装版本重置为基线版本，防止跨用例污染。"""
+    constants.set_active_version(constants.DEFAULT_CLIENT_APP_VERSION)
+    yield
+    constants.set_active_version(constants.DEFAULT_CLIENT_APP_VERSION)
 
 
 @pytest.fixture(scope="session")
@@ -92,11 +100,24 @@ class _StubCaptcha:
 
     def __init__(self) -> None:
         self.invalidated = 0
+        self.solve_count = 0
+        self.last_egress: str | None = None
+        # 线上配置默认「模型请求也要验证码」；测试可置 False 覆盖
+        self.needs_captcha = True
+        self.config = dict(constants.CAPTCHA_DEFAULTS)
 
-    async def get_verify_param(self, port: int | None = None) -> tuple[str, str | None]:
+    async def fetch_config(self, egress_tag: str | None = None) -> dict:
+        return dict(self.config)
+
+    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+        return self.needs_captcha
+
+    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+        self.solve_count += 1
+        self.last_egress = egress_tag
         return "mock-verify-param", None
 
-    def invalidate(self) -> None:
+    def invalidate(self, tag: str | None = None) -> None:
         self.invalidated += 1
 
 
@@ -118,6 +139,9 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     })
     # 后台额度刷新也指向 Mock（billing/current|balance|usage）
     monkeypatch.setattr(settings, "ZCODE_BILLING_BASE", f"{base}/api/v1/zcode-plan")
+    monkeypatch.setattr(settings, "ZCODE_MARKETING_TOUCH_URL", f"{base}/api/v1/marketing/touch")
+    # 官方更新清单也指向 Mock
+    monkeypatch.setattr(settings, "ZCODE_MANIFEST_URL", f"{base}/api/v1/releases/electron/manifest?platform=darwin-aarch64&channel=1")
     # 激活事件上报也指向 Mock
     monkeypatch.setattr(settings, "ZCODE_EVENT_REPORT_URL", f"{base}/api/v1/event/report")
     # OAuth（cli init/poll + api-key 兑换链）全部收敛到 Mock —— 测试永不打真网

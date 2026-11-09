@@ -51,7 +51,10 @@ class TestChatCompletions:
         )
         assert res.status_code == 200
         payload = json.loads(mock.state.calls[-1][3])
-        assert payload["system"][-1]["text"] == "守则"  # 用户 system 位于官方身份块之后
+        # 严格三块骨架（cli_prefix / 身份+Harness / 动态尾块）：
+        # 外来 system 文本只许并入末块内部，追加独立块会触发上游 3012
+        assert len(payload["system"]) == 3
+        assert "守则" in payload["system"][-1]["text"]
 
     async def test_max_tokens_clamped_to_upstream_limit(self, gateway_client, fresh_app):
         """上游 400 code 1210：max_tokens 上限 131072，网关钳制（GW-012）。"""
@@ -151,3 +154,105 @@ class TestChatCompletions:
             assert res.status_code == 503  # 鉴权通过，进入调度（无账号）
         finally:
             fresh_app.set_setting("gateway_key", "")
+
+
+@pytest.mark.integration
+class TestResponsesEndpoint:
+    """/v1/responses：入站 Responses → chat → anthropic，出站反向翻译。"""
+
+    async def test_nonstream_text(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="resp")
+        res = await client.post("/v1/responses", json={
+            "model": "glm-5.3-flash",
+            "instructions": "只答要点",
+            "input": "hi",
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert data["object"] == "response"
+        assert data["status"] == "completed"
+        assert data["output_text"] == "Hello from mock upstream"
+        assert data["output"][0]["content"][0]["type"] == "output_text"
+        # instructions 落到上游 system（并入末块，仍保持严格三块骨架）
+        payload = json.loads(mock.state.calls[-1][3])
+        assert len(payload["system"]) == 3
+        assert "只答要点" in payload["system"][-1]["text"]
+
+    async def test_stream_event_names(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        seed_account(fresh_app, _GOOD_JWT, name="resp-stream")
+        res = await client.post("/v1/responses", json={
+            "model": "glm-5.3-flash", "input": "hi", "stream": True,
+        })
+        assert res.status_code == 200
+        assert res.headers["content-type"].startswith("text/event-stream")
+        events = [ln[7:].strip() for ln in res.text.splitlines() if ln.startswith("event: ")]
+        assert events[0] == "response.created"
+        assert "response.output_text.delta" in events
+        assert events[-1] == "response.completed"
+        datas = [json.loads(ln[6:]) for ln in res.text.splitlines() if ln.startswith("data: ")]
+        seqs = [d["sequence_number"] for d in datas]
+        assert seqs == list(range(len(seqs)))  # 从 0 起严格连续（对齐 Responses SSE）
+        text = "".join(d["delta"] for d in datas if d["type"] == "response.output_text.delta")
+        assert "chunk-0" in text
+
+    async def test_previous_response_id_rejected(self, gateway_client, fresh_app):
+        client, _ = gateway_client
+        res = await client.post("/v1/responses", json={
+            "model": "glm-5.3", "input": "hi", "previous_response_id": "resp_x",
+        })
+        assert res.status_code == 400
+        assert "previous_response_id" in res.json()["error"]["message"]
+
+    async def test_no_account_returns_503(self, fresh_app):
+        from httpx import ASGITransport, AsyncClient
+
+        from app.main import create_app
+
+        app = create_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post("/v1/responses", json={"model": "glm-5.3", "input": "hi"})
+        assert res.status_code == 503
+        assert res.json()["error"]["type"] == "no_available_account"
+
+
+@pytest.mark.integration
+class TestCountTokensEndpoint:
+    """count_tokens：本地估算，不打上游、不需要可用账号。"""
+
+    async def test_estimate_without_account(self, fresh_app):
+        from httpx import ASGITransport, AsyncClient
+
+        from app.main import create_app
+
+        app = create_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post("/v1/messages/count_tokens", json={
+                "model": "glm-5.3",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            })
+        assert res.status_code == 200
+        assert res.json()["input_tokens"] >= 1
+
+    async def test_scales_with_content(self, gateway_client, fresh_app):
+        client, mock = gateway_client
+        before = len(mock.state.calls)
+        small = (await client.post("/v1/messages/count_tokens", json={
+            "model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}],
+        })).json()["input_tokens"]
+        big = (await client.post("/v1/messages/count_tokens", json={
+            "model": "glm-5.3", "messages": [{"role": "user", "content": "长" * 500}],
+        })).json()["input_tokens"]
+        assert big > small
+        assert len(mock.state.calls) == before  # 完全不打上游
+
+    async def test_missing_model_rejected(self, gateway_client, fresh_app):
+        client, _ = gateway_client
+        res = await client.post("/v1/messages/count_tokens",
+                                json={"messages": [{"role": "user", "content": "hi"}]})
+        assert res.status_code == 400

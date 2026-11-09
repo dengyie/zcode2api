@@ -54,7 +54,7 @@
 | `PUT /admin/api/accounts/{id}` | 改备注 / 换凭证（按形态自动判 jwt/apiKey） |
 | `POST /admin/api/accounts/{id}/enabled` | `{enabled}` 启用/禁用 |
 | `DELETE /admin/api/accounts` | body `[ids]` 批量移除 |
-| `POST /admin/api/accounts/refresh` | `{all?}` 或 `{ids}` 批量刷新额度（冷却/失效跳过 billing） |
+| `POST /admin/api/accounts/refresh` | `{all?}` 或 `{ids}` 批量刷新额度（仅无 JWT / JWT 失效跳过 billing；冷却/停用/风控禁用照刷） |
 | `POST /admin/api/accounts/{id}/refresh` | 立即刷新该账号额度 |
 | `POST /admin/api/accounts/{id}/fingerprint/rotate` | 换发客户端指纹（下一套成套桌面 SKU + 新 device_mid） |
 | `GET /admin/api/status` | provider 列表 + 网关 key 是否已配置 + 可选账号计数 |
@@ -101,7 +101,7 @@
 
 - 入池按 `{provider}:{credentialString}` 幂等（重复添加返回既有账号）。
 - 领取操作同一账号同时只有一个在途（调度器互斥）。
-- 请求调度单账号并发上限默认 2（`account_concurrency` 设置，0 = 不限）；满号不排队，直接跳下一个可选账号，全部满/无号返回 503。
+- 请求调度单账号并发上限写死为 2（2026-11-04 线上实测；`ZCODE_ACCOUNT_CONCURRENCY` env、meta 表、`PUT /admin/api/settings` 携带该键一律无效）；满号不排队，直接跳下一个可选账号，全部满/无号返回 503。
 - `POST /admin/api/accounts` 与 OAuth 回调并发入池：以 SQLite 写锁 + upsert 保证一致。
 - 网关转发无上游超时（与 ZCode 桌面行为一致）；客户端断开 → 取消上游流（`httpx` stream close）。
 

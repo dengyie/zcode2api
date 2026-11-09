@@ -23,7 +23,7 @@ from ..claim import (
 from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
-from ..quota import fetch_quota, refresh_accounts
+from ..quota import fetch_coding_limits, fetch_quota, refresh_accounts
 from ..store import store
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
@@ -177,15 +177,15 @@ async def refresh(payload: dict = Body(default=None)):
     else:
         ids = set(payload.get("ids") or [])
         pool = [a for a in store.list_accounts() if a.id in ids and a.mode == "jwt"]
-    # 失效 / 风控禁用 / 冷却 一律不打 billing（冷却期零上游流量 + 废 JWT 不再 401）
+    # 冷却 / 风控禁用 / 停用同样刷新（billing 链与对话链无关）；只有无 JWT / 废 JWT 不打
     targets = [a for a in pool if a.allows_billing()]
-    skipped_cooling = sum(1 for a in pool if a.is_cooling())
-    skipped_invalid = len(pool) - len(targets) - skipped_cooling
+    cooling = sum(1 for a in targets if a.is_cooling())
+    skipped_invalid = len(pool) - len(targets)
     summary = await refresh_accounts(targets)
     return {
         "summary": summary,
         "count": len(targets),
-        "skipped_cooling": skipped_cooling,
+        "cooling": cooling,
         "skipped_invalid": skipped_invalid,
     }
 
@@ -202,6 +202,20 @@ async def refresh_one(account_id: str):
         return {"ok": False, "message": blocked, "account": acc.public_view()}
     res = await fetch_quota(acc)
     return {"ok": "error" not in res, "result": res, "account": acc.public_view()}
+
+
+@router.get("/accounts/{account_id}/coding_limits")
+async def coding_limits(account_id: str):
+    """Coding 平面额度（api.z.ai monitor 端点，按 API Key 鉴权）。
+
+    与 billing 族是两套账本：Plan 通道额度看 `quota` 快照，API Key 直连
+    api.z.ai 的额度只能从这里看。体验套餐号常返回「当前用户不存在 coding plan」。
+    """
+    acc = store.find_any(account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    res = await fetch_coding_limits(acc)
+    return {"ok": "error" not in res, **res}
 
 
 # ── OAuth 登录（Z.AI）────────────────────────────────────────────────────────
@@ -329,13 +343,21 @@ _login_followup_tasks: set[asyncio.Task] = set()
 
 
 def _schedule_login_followup(account, flow, access_token: str | None) -> None:
-    """ready 后后台兑换 API Key 并刷新额度；失败只打日志，不影响已入池的 JWT。"""
+    """ready 后后台兑换 API Key 并刷新额度；失败只打日志，不影响已入池的 JWT。
+
+    同时把 OAuth access_token 落到 account.oauth_token（信息留存，供后台
+    `has_oauth_token` 标记展示；不是对话凭证）。API Key 兑换与之互不依赖——
+    兑换失败也保留 token 字符串，便于现场排查。
+    """
 
     async def _job():
         live = store.find("zai", account.id)
         if live is None:
             return
         if access_token:
+            # 先落 oauth_token（信息留存），再尝试兑换 API Key
+            live.oauth_token = access_token
+            store.update_account(live)
             try:
                 api_key = await asyncio.wait_for(
                     flow.exchange_api_key(access_token), timeout=LOGIN_EXCHANGE_TIMEOUT
@@ -455,7 +477,7 @@ async def claim(payload: dict = Body(default=None)):
     if not candidates:
         return {"outcomes": [], "summary": {"ok": 0, "fail": 0}}
 
-    # 冷却 / 失效 JWT 不领取（billing/claim 是上游写流量，废票只会 401）
+    # 废 JWT 不领取（billing/claim 打过去只会 401）；冷却 / 风控禁用 / 停用照领
     outcomes = [
         {"account_id": a.id, "account_name": a.name, "ok": False,
          "message": billing_block_reason(a) or AUTH_EXPIRED_MESSAGE}
@@ -499,8 +521,10 @@ async def claim(payload: dict = Body(default=None)):
 async def claim_captcha_config():
     """手动领取用：阿里验证码 SDK 初始化参数（前端浏览器内完成人机验证）。"""
     from ..captcha import captcha_manager
+    from ..egress import DIRECT
 
-    config = await captcha_manager.fetch_config()
+    # claim 全链路走直连（billing 请求 trust_env=False），验证码配置同源拉取
+    config = await captcha_manager.fetch_config(DIRECT)
     return {
         "enabled": bool(config.get("enabled", True)),
         "scene_id": config.get("sceneId") or "",
@@ -554,10 +578,22 @@ def _mask_secret(value: str) -> str:
 
 @router.get("/settings")
 async def get_settings():
+    from .. import constants
     from .. import settings as app_settings
+    from ..version_tracker import is_newer_version, version_tracker
 
     admin_key = store.admin_key()
     gateway_key = store.gateway_key()
+    auto_sync = (
+        store.get_setting(
+            "auto_sync_client_version", str(app_settings.AUTO_SYNC_CLIENT_VERSION).lower()
+        )
+        == "true"
+    )
+    latest = version_tracker.latest_info
+    latest_ver = latest.version if latest else constants.CLIENT_APP_VERSION
+    has_update = bool(latest and is_newer_version(latest.version, constants.CLIENT_APP_VERSION))
+
     return {
         "admin_key_set": bool(admin_key),
         "admin_key_masked": _mask_secret(admin_key),
@@ -567,6 +603,19 @@ async def get_settings():
         "quota_refresh_interval": store.quota_refresh_interval(),
         "account_concurrency": store.account_concurrency(),
         "claim_round_interval": store.claim_round_interval(),
+        "claim_round_hours": ",".join(map(str, store.claim_round_hours())),
+        "auto_sync_client_version": auto_sync,
+        "zcode_client_version": constants.CLIENT_APP_VERSION,
+        "zcode_latest_version": latest_ver,
+        "zcode_version_has_update": has_update,
+        "zcode_prompt_aligned_version": constants.PROMPT_ALIGNED_VERSION,
+        "zcode_prompt_port_required": bool(
+            latest and is_newer_version(latest.version, constants.PROMPT_ALIGNED_VERSION)
+        ),
+        "zcode_release_date": latest.release_date if latest else "",
+        "zcode_release_name": latest.release_name if latest else "",
+        "zcode_release_notes": latest.release_notes if latest else "",
+        "zcode_version_checked_at": latest.checked_at if latest else 0.0,
     }
 
 
@@ -592,19 +641,49 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "刷新间隔必须是非负整数") from None
         store.set_setting("quota_refresh_interval", str(interval))
-    if "account_concurrency" in payload:
-        try:
-            concurrency = max(0, int(payload["account_concurrency"]))
-        except (TypeError, ValueError):
-            raise HTTPException(400, "账号并发必须是非负整数（0 = 不限）") from None
-        store.set_setting("account_concurrency", str(concurrency))
+    # account_concurrency 已写死为 2（2026-11-04 线上实测），不再接受后台修改；
+    # PUT 中携带该键直接忽略（不报错，兼容旧前端 payload）
     if "claim_round_interval" in payload:
         try:
             interval = max(0, int(payload["claim_round_interval"]))
         except (TypeError, ValueError):
             raise HTTPException(400, "自动领取轮间隔必须是非负整数（0 = 关闭）") from None
         store.set_setting("claim_round_interval", str(interval))
+    if "claim_round_hours" in payload:
+        # 领取窗口（北京时间小时，逗号分隔；空 / * = 全天）。归一成升序去重后落库。
+        raw = str(payload["claim_round_hours"] or "").strip()
+        hours: list[int] = []
+        if raw not in ("", "*"):
+            for part in raw.replace("，", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    hour = int(part)
+                except ValueError:
+                    raise HTTPException(400, "领取窗口小时必须是 0-23 的整数，逗号分隔（空 = 全天）") from None
+                if not 0 <= hour <= 23:
+                    raise HTTPException(400, "领取窗口小时必须在 0-23 之间")
+                if hour not in hours:
+                    hours.append(hour)
+        store.set_setting("claim_round_hours", ",".join(map(str, sorted(hours))))
+    if "auto_sync_client_version" in payload:
+        enabled = bool(payload["auto_sync_client_version"])
+        store.set_setting("auto_sync_client_version", "true" if enabled else "false")
     return {"ok": True}
+
+
+# ── ZCode 官方版本与更新日志 ────────────────────────────────────────────────
+# 版本状态（当前/最新/更新日志）由 GET /settings 统一返回（前端 settings.html
+# 直接消费）；此处只保留手动核验动作接口。版本伪装值完全由 version_tracker
+# 自动对齐官方 manifest，不提供手工改写入口（避免脱离单一真相源）。
+@router.post("/version/zcode/check")
+async def check_zcode_version_now():
+    from ..version_tracker import version_tracker
+
+    # force=True：管理后台「立即核验」语义，跳过新鲜度缓存强制拉取
+    res = await version_tracker.check_and_sync(force=True)
+    return res
 
 
 # ── 导入 / 导出 ─────────────────────────────────────────────────────────────

@@ -1,7 +1,8 @@
 """ClaimRoundManager 单测：门控过滤、1005 退避、停服截止。
 
 不跑真实 loop（睡眠周期），直接驱动 _round() / stop() 验证：
-- 仅 allows_billing() 的 JWT 账号进入轮次（冷却/停用/风控禁用跳过）
+- 仅 allows_billing() 的 JWT 账号进入轮次（无 JWT / 废 JWT 之外一律进；
+  冷却/停用/风控禁用不再排除——领取与使用两条链，2026-11-04 口径）
 - 有新套餐入账才触发额度刷新
 - 1005+next_at 的套餐在等待期跳过领取（preview 照常、不耗 captcha），
   next_at 过后恢复重试，成功/其余失败清除退避
@@ -48,8 +49,8 @@ async def test_round_only_visits_billing_allowed_accounts(monkeypatch):
     refreshed: list[str] = []
     accounts = [
         _FakeAccount("ok-1", billing=True),
-        _FakeAccount("cooling", billing=False),
-        _FakeAccount("banned", billing=False),
+        _FakeAccount("no-jwt", billing=False),
+        _FakeAccount("invalid", billing=False),
         _FakeAccount("ok-2", billing=True),
     ]
 
@@ -70,7 +71,7 @@ async def test_round_only_visits_billing_allowed_accounts(monkeypatch):
     manager = ClaimRoundManager()
     await manager._round()
 
-    assert visited == ["ok-1", "ok-2"], "冷却/停用账号必须先被 allows_billing 过滤"
+    assert visited == ["ok-1", "ok-2"], "无 JWT / 废 JWT 账号必须先被 allows_billing 过滤"
     assert refreshed == ["ok-1"], "仅真正领到套餐的账号触发额度刷新"
 
 
@@ -377,3 +378,21 @@ async def test_auto_claim_skip_plan_ids_skips_claim_only(monkeypatch):
     assert claimed == ["p-new"], "退避中的套餐不得打 claim"
     assert [o["plan_id"] for o in outcomes] == ["p-new"]
     assert all(o["ok"] for o in outcomes)
+
+
+def test_activation_err_text_empty_message_uses_class_name():
+    """httpx 部分异常 str 为空 → 回退类名（2026-11-03 线上：日志只剩「上报失败: 」）。"""
+    import httpx
+
+    import app.claim as claim_module
+
+    err = claim_module._activation_err_text("app_daily_active", httpx.ReadError(""))
+    assert err == "激活事件 app_daily_active 上报失败: ReadError"
+
+
+def test_activation_err_text_keeps_nonempty_detail():
+    import app.claim as claim_module
+
+    err = claim_module._activation_err_text(
+        "app_launch", RuntimeError("event/report app_launch HTTP 500: boom"))
+    assert err == "激活事件 app_launch 上报失败: event/report app_launch HTTP 500: boom"

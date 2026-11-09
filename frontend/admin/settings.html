@@ -38,16 +38,49 @@
     </div>
     <div class="settings-row">
       <label>单账号并发上限</label>
-      <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。设为 0 不限制。修改后即时生效。</div>
-      <input class="input" id="account-concurrency" type="number" min="0" step="1" placeholder="2">
+      <div class="hint">每个账号同时处理的最大请求数；某账号并发满时自动切下一个账号。已按 2026-11-04 线上实测结果写死为 2，不可修改。</div>
+      <input class="input" id="account-concurrency" type="number" min="2" max="2" step="1" value="2" disabled>
     </div>
     <div class="settings-row">
       <label>套餐自动领取轮（秒）</label>
-      <div class="hint">周期对全部 JWT 账号执行活动套餐领取（激活上报 + 查询 + 领取）。设为 0 关闭轮次，仅入池/手动触发。默认 600（10 分钟）。修改后即时生效。</div>
-      <input class="input" id="claim-round-interval" type="number" min="0" step="30" placeholder="600">
+      <div class="hint">周期对全部 JWT 账号执行活动套餐领取（激活上报 + 查询 + 领取）。设为 0 关闭轮次，仅入池/手动触发。默认 3600（1 小时）。修改后即时生效。</div>
+      <input class="input" id="claim-round-interval" type="number" min="0" step="30" placeholder="3600">
+    </div>
+    <div class="settings-row">
+      <label>领取窗口（北京时间小时）</label>
+      <div class="hint">只在窗口内跑领取轮；窗口外自动休眠、到点准时醒来（上游套餐每天 19:00 放量，填 19 即每天 19 点开领）。逗号分隔可填多个小时（如 19,20,21）；留空或 * 表示全天。修改后即时生效。</div>
+      <input class="input" id="claim-round-hours" type="text" placeholder="19,20,21（留空 = 全天）">
     </div>
     <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:8px">
       <button onclick="saveSettings()" class="dialog-btn dialog-btn-primary">保存</button>
+    </div>
+  </div>
+
+  <div class="settings-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div class="section-title">ZCode 官方版本与伪装</div>
+      <button onclick="checkZcodeVersionNow()" id="check-version-btn" class="dialog-btn" style="padding:4px 10px;font-size:12px">立即核验官方最新版</button>
+    </div>
+    <div class="settings-row">
+      <div style="display:flex;gap:24px;align-items:center;margin-bottom:8px">
+        <div><span class="hint">当前伪装版本:</span> <strong id="cur-zcode-ver" style="font-family:monospace;color:var(--text-1)">-</strong></div>
+        <div><span class="hint">官方最新版本:</span> <strong id="latest-zcode-ver" style="font-family:monospace;color:var(--text-1)">-</strong> <span id="ver-status-badge" class="badge" style="display:none;margin-left:6px"></span></div>
+      </div>
+      <div style="margin-top:10px;display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="auto-sync-version" style="cursor:pointer">
+        <label for="auto-sync-version" style="cursor:pointer;font-weight:normal;margin:0">自动对齐官方最新版本（推荐，检测到新版本自动更新请求头与指纹，防止上游门槛拦截）</label>
+      </div>
+      <div class="hint" id="last-checked-hint" style="margin-top:6px;font-size:12px"></div>
+    </div>
+    <div id="release-notes-wrapper" style="margin-top:14px;display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="toggleReleaseNotes()">
+        <span style="font-size:13px;font-weight:500;color:var(--text-2)">官方最新更新日志</span>
+        <span id="notes-toggle-icon" style="font-size:12px;color:var(--text-3)">展开 ▼</span>
+      </div>
+      <div id="release-notes-content" style="display:none;margin-top:8px;padding:12px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;font-size:12px;line-height:1.6;white-space:pre-wrap;max-height:260px;overflow-y:auto;color:var(--text-2)"></div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+      <button onclick="saveVersionSettings()" class="dialog-btn dialog-btn-primary">保存版本设置</button>
     </div>
   </div>
 
@@ -79,12 +112,94 @@ async function load(){
     const d=await api('GET','/settings');
     document.getElementById('admin-key').value=d.admin_key_masked||'';
     document.getElementById('gateway-key').value=d.gateway_key_masked||'';
-    document.getElementById('quota-interval').value=d.quota_refresh_interval??60;
-    document.getElementById('account-concurrency').value=d.account_concurrency??2;
-    document.getElementById('claim-round-interval').value=d.claim_round_interval??600;
+    document.getElementById('quota-interval').value=d.quota_refresh_interval??1800;
+    document.getElementById('account-concurrency').value=2;
+    document.getElementById('claim-round-interval').value=d.claim_round_interval??3600;
+    document.getElementById('claim-round-hours').value=d.claim_round_hours??'';
     const hint=document.getElementById('admin-key-default-hint');
     if(hint) hint.style.display=d.admin_key_is_default?'block':'none';
+    renderVersionInfo(d);
   }catch(e){showToast('加载失败: '+e.message,'error');}
+}
+
+let _currentNotes = '';
+function toggleReleaseNotes(){
+  const content = document.getElementById('release-notes-content');
+  const icon = document.getElementById('notes-toggle-icon');
+  if(content.style.display === 'none'){
+    content.style.display = 'block';
+    icon.textContent = '折叠 ▲';
+  } else {
+    content.style.display = 'none';
+    icon.textContent = '展开 ▼';
+  }
+}
+
+function renderVersionInfo(d){
+  document.getElementById('cur-zcode-ver').textContent = 'v' + (d.zcode_client_version || '-');
+  document.getElementById('latest-zcode-ver').textContent = 'v' + (d.zcode_latest_version || d.zcode_client_version || '-');
+  document.getElementById('auto-sync-version').checked = d.auto_sync_client_version !== false;
+  const badge = document.getElementById('ver-status-badge');
+  if(d.zcode_prompt_port_required){
+    badge.style.display = 'inline-block';
+    badge.style.background = 'rgba(244,63,94,0.15)';
+    badge.style.color = 'var(--rose, #f43f5e)';
+    badge.style.border = '1px solid var(--rose, #f43f5e)';
+    badge.textContent = '需移植提示词 · 官方 v' + d.zcode_latest_version;
+  } else if(d.zcode_version_has_update){
+    badge.style.display = 'inline-block';
+    badge.style.background = 'rgba(245,158,11,0.15)';
+    badge.style.color = 'var(--amber)';
+    badge.style.border = '1px solid var(--amber)';
+    badge.textContent = '发现新版本';
+  } else if(d.zcode_latest_version){
+    badge.style.display = 'inline-block';
+    badge.style.background = 'rgba(16,185,129,0.15)';
+    badge.style.color = 'var(--emerald)';
+    badge.style.border = '1px solid var(--emerald)';
+    badge.textContent = '已是最新版';
+  }
+  if(d.zcode_version_checked_at){
+    const dt = new Date(d.zcode_version_checked_at * 1000).toLocaleString();
+    document.getElementById('last-checked-hint').textContent = '上次核验时间: ' + dt;
+  }
+  if(d.zcode_release_notes){
+    _currentNotes = d.zcode_release_notes;
+    document.getElementById('release-notes-wrapper').style.display = 'block';
+    document.getElementById('release-notes-content').textContent = _currentNotes;
+  }
+}
+
+async function checkZcodeVersionNow(){
+  const btn = document.getElementById('check-version-btn');
+  btn.disabled = true;
+  btn.textContent = '核验中...';
+  try{
+    const res = await api('POST', '/version/zcode/check');
+    if(res.ok){
+      // 正文未移植时上游新版会被拒绝自动对齐（头/正文错版 → 405/3012）
+      const note = res.prompt_port_required
+        ? '（正文未移植，暂不自动对齐）'
+        : (res.updated ? '（已自动对齐）' : '');
+      showToast('核验成功: 官方最新 v' + res.latest_version + note, 'success');
+      load();
+    } else {
+      showToast('核验未获取到清单，使用本地缓存', 'info');
+    }
+  }catch(e){
+    showToast('核验异常: ' + e.message, 'error');
+  }finally{
+    btn.disabled = false;
+    btn.textContent = '立即核验官方最新版';
+  }
+}
+
+async function saveVersionSettings(){
+  const auto_sync_client_version = document.getElementById('auto-sync-version').checked;
+  try{
+    await api('PUT', '/settings', {auto_sync_client_version});
+    showToast('版本设置已保存', 'success');
+  }catch(e){showToast('保存失败: ' + e.message, 'error');}
 }
 
 function _isSecretMask(v){
@@ -95,13 +210,16 @@ async function saveSettings(){
   const admin_key=document.getElementById('admin-key').value.trim();
   const gateway_key=document.getElementById('gateway-key').value.trim();
   const quota_refresh_interval=parseInt(document.getElementById('quota-interval').value,10);
-  const account_concurrency=parseInt(document.getElementById('account-concurrency').value,10);
   if(!admin_key)return showToast('后台密码不能为空','error');
   if(isNaN(quota_refresh_interval)||quota_refresh_interval<0)return showToast('刷新间隔必须是非负整数','error');
-  if(isNaN(account_concurrency)||account_concurrency<0)return showToast('账号并发必须是非负整数（0 = 不限）','error');
   const claim_round_interval=parseInt(document.getElementById('claim-round-interval').value,10);
   if(isNaN(claim_round_interval)||claim_round_interval<0)return showToast('自动领取轮间隔必须是非负整数（0 = 关闭）','error');
-  const payload={quota_refresh_interval,account_concurrency,claim_round_interval};
+  const claim_round_hours=document.getElementById('claim-round-hours').value.trim();
+  if(claim_round_hours && claim_round_hours!=='*' &&
+     !claim_round_hours.replace(/，/g,',').split(',').every(p=>{const n=parseInt(p,10);return !p.trim()||(!isNaN(n)&&n>=0&&n<=23);}))
+    return showToast('领取窗口必须是 0-23 的小时，逗号分隔（留空 = 全天）','error');
+  const payload={quota_refresh_interval,claim_round_interval,claim_round_hours,
+                 auto_sync_client_version:document.getElementById('auto-sync-version').checked};
   if(!_isSecretMask(admin_key)) payload.admin_key=admin_key;
   if(!_isSecretMask(gateway_key)) payload.gateway_key=gateway_key;
   try{

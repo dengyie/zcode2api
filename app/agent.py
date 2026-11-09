@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from . import body_transform, constants, settings
 from .identity import build_identity_headers, build_trace_headers
@@ -62,6 +63,7 @@ def build_request(
     incoming_headers: dict | None = None,
     verify_region: str | None = None,
     force_fallback: bool = False,
+    upstream_key: str | None = None,
 ) -> tuple[str, dict, bytes]:
     """返回 (目标 URL, 请求头, 序列化后的请求体)。
 
@@ -70,37 +72,77 @@ def build_request(
 
     force_fallback：强制走 API Key 回退通道（Plan 通道瞬态失败如 429 时，
     账号 status 保持 ACTIVE，不能靠状态推导路由，须显式指定）。
+
+    upstream_key：显式指定上游通道键（gateway 渠道优先梯驱动）；None 时按
+    账号能力自动选：JWT → `zai`（zcode-plan 代理）→ `zai_fallback`
+    （API Key）。
     """
     provider = account.provider
 
     if provider == "zai":
-        if account.uses_plan_channel() and not force_fallback:
-            target_url = settings.UPSTREAM["zai"]
-            auth = {"Authorization": f"Bearer {account.jwt_token}"}
+        if upstream_key:
+            key = upstream_key
+        elif account.uses_plan_channel() and not force_fallback:
+            key = "zai"
         elif account.api_key:
-            target_url = settings.UPSTREAM["zai_fallback"]
-            auth = {"x-api-key": account.api_key}
+            key = "zai_fallback"
         else:
             raise RuntimeError("账号缺少有效凭证")
     elif provider == "bigmodel":
-        target_url = settings.UPSTREAM["bigmodel"]
-        if not account.api_key:
+        key = upstream_key or "bigmodel"
+        if key != "bigmodel" or not account.api_key:
             raise RuntimeError("BigModel 账号缺少 API Key")
-        auth = {"x-api-key": account.api_key}
     else:
         raise RuntimeError(f"未知提供商: {provider}")
 
-    if provider == "zai" and account.uses_plan_channel() and not force_fallback:
-        # JWT 通道：全量身份头 + 追踪头（对齐官方客户端 pio + trace 头序）
+    # 认证与目标 URL 选择；plan 系通道（zai）用全量身份头 + 追踪头 +
+    # body transform 的「官方客户端形态」。
+    if key == "zai":
+        if not account.jwt_token:
+            raise RuntimeError("账号缺少 JWT")
+        target_url = settings.UPSTREAM["zai"]
+        auth = {"Authorization": f"Bearer {account.jwt_token}"}
+        plan_style = True
+    elif key == "zai_fallback":
+        if not account.api_key:
+            raise RuntimeError("账号缺少 API Key")
+        target_url = settings.UPSTREAM["zai_fallback"]
+        auth = {"x-api-key": account.api_key}
+        plan_style = False
+    elif key == "bigmodel":
+        if not account.api_key:
+            raise RuntimeError("BigModel 账号缺少 API Key")
+        target_url = settings.UPSTREAM["bigmodel"]
+        auth = {"x-api-key": account.api_key}
+        plan_style = False
+    else:
+        raise RuntimeError(f"未知上游通道: {key}")
+
+    if plan_style:
+        # Plan 系通道：全量身份头 + 追踪头（对齐官方客户端 pio + trace 头序）
+        from .fingerprint import profile_for
+
+        profile = profile_for(account)
+        # 会话粘性：同首轮文本 → 同 session_id（官方会话内稳定，cache 依赖它）。
+        # 必须在 transform_body 之前算——日期轮会被插到 messages[0]。
+        session_id = body_transform.conversation_session_id(body, account.id) or str(uuid.uuid4())
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None
-        body = body_transform.transform_body(body, user_id, model)
+        body = body_transform.transform_body(
+            body, user_id, model,
+            device_mid=profile.device_mid,
+            session_id=session_id,
+        )
+        # Start Plan 请求头部对齐 Magpie packages/zcode/index.mjs startHeaders：
+        # 不带 anthropic-beta（工具搜索 beta 仅 coding-plan 用）、不带 x-api-key
+        # （仅 Authorization: Bearer JWT）。旧「vlelyanin 实证」下发的这两项
+        # 已于 3.17.2 对齐时移除。
         headers = {
             "content-type": "application/json",
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
             **build_identity_headers(account),
-            **build_trace_headers(),
+            **build_trace_headers(session_id),
         }
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集
@@ -118,10 +160,10 @@ def build_request(
     if verify_region:
         headers[constants.CAPTCHA_REGION_HEADER] = verify_region
 
-    for key, value in (incoming_headers or {}).items():
-        lower = key.lower()
+    for hdr, value in (incoming_headers or {}).items():
+        lower = hdr.lower()
         if lower in _DROP_HEADERS or lower.startswith(_DROP_HEADER_PREFIXES):
             continue
-        headers[key] = value
+        headers[hdr] = value
 
     return target_url, headers, json.dumps(body, ensure_ascii=False).encode("utf-8")

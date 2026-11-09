@@ -43,7 +43,8 @@ class TestPureApiKeyRiskCooldown:
         # 冷却期整号不可选（若可选，网关会重打 Plan 通道，风控计数持续累加）；
         # 同请求内的 Key 回退由 force_fallback 保证，不依赖 is_selectable。
         assert acc.is_selectable() is False
-        assert acc.allows_billing() is False
+        # billing 链是另一条链：冷却期照常可领取/查额度（2026-11-04 口径）
+        assert acc.allows_billing() is True
 
     def test_risk_cooldown_escalates_to_disabled_at_4th_strike(self):
         acc = Account.create("zai", "t", "jwt.token")

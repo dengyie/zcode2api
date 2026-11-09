@@ -232,6 +232,21 @@ def build_app() -> FastAPI:
         if scenario == "risk_control_3012":
             # 2026-09-05 实测形态：HTTP 405 承载 {"code":3012,"msg":"...unusual activity..."}
             return 405, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+        if scenario == "quota_exhausted_200":
+            # 2026-10-30 实测形态：Plan 通道对额度拒绝回 **HTTP 200** +
+            # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
+            return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
+        if scenario == "quota_exhausted_1310":
+            # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 2026-11-15 23:59 重置"}
+            return 200, {
+                "code": 1310,
+                "msg": "您已达到每周使用上限，将于 2026-11-15 23:59 重置",
+            }, {}
+        if scenario == "risk_control_3012_200":
+            # 同形：风控拒绝也用 200 承载，最危险——当成功处理会洗掉 strikes
+            return 200, {"code": 3012, "msg": "request has been blocked due to unusual activity."}, {}
+        if scenario == "business_error_200_unknown":
+            return 200, {"code": 3006, "msg": "model not allowed"}, {}
         if scenario == "server_error":
             return 500, {"error": "internal"}, {}
         if scenario == "not_found":
@@ -256,6 +271,15 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        # billing_quota_200：Plan 通道真实形态——HTTP 200 + {"code":1005}
+        scenario = _scenario_for(headers, _bind_key(headers))
+        if scenario in ("billing_quota_200", "billing_all_quota_200"):
+            return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
+        if scenario == "billing_empty":
+            # 新号形态：200 成功但既没套餐也没窗口（体验额度不在 billing 里表达）
+            return Response(json.dumps({"code": 0, "data": {"plans": []}}),
+                            status_code=200, media_type="application/json")
         return Response(json.dumps({
             "data": {"plans": [{
                 "plan_id": "start", "show_name": "Start Plan",
@@ -270,19 +294,40 @@ def build_app() -> FastAPI:
             return Response("<html>waf</html>", status_code=403, media_type="text/html")
         if headers.get("authorization", "").endswith("bad-jwt"):
             return Response(json.dumps(_error_body("invalid token")), status_code=401)
+        # balance_expired：本地仍有余额、但窗口早已过期（2026-10-31 线上真实形态，
+        # 上游对这类请求一律 200+{"code":1005}）
+        scenario = _scenario_for(headers, _bind_key(headers))
+        if scenario == "billing_all_quota_200":
+            return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
+        if scenario == "billing_empty":
+            return Response(json.dumps({"code": 0, "data": {"balances": []}}),
+                            status_code=200, media_type="application/json")
+        if scenario == "balance_expired":
+            expires_at = "2026-01-01T00:00:00Z"
+        else:
+            expires_at = "2099-01-01T00:00:00Z"
         return Response(json.dumps({
             "data": {"balances": [
                 {"model": "GLM-5.3", "show_name": "GLM-5.3",
                  "total_units": 3000000, "used_units": 1000000, "remaining_units": 2000000,
-                 "expires_at": "2099-01-01T00:00:00Z"},
+                 "expires_at": expires_at},
                 {"model": "GLM-5-Turbo", "show_name": "GLM-5-Turbo",
                  "total_units": 2000000, "used_units": 2000000, "remaining_units": 0,
-                 "expires_at": "2099-01-01T00:00:00Z"},
+                 "expires_at": expires_at},
             ]},
         }), media_type="application/json")
 
     async def _usage(request: Request) -> Response:
-        _record("GET", request.url.path, {k.lower(): v for k, v in request.headers.items()}, b"")
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        scenario = _scenario_for(headers, _bind_key(headers))
+        if scenario == "billing_all_quota_200":
+            return Response(json.dumps({"code": 1005, "msg": "exceed quota limit"}),
+                            status_code=200, media_type="application/json")
+        if scenario == "billing_empty":
+            return Response(json.dumps({"code": 0, "data": {}}),
+                            status_code=200, media_type="application/json")
         return Response(json.dumps({"data": {"requests": 42}}), media_type="application/json")
 
     async def _client_configs(request: Request) -> Response:
@@ -335,6 +380,73 @@ def build_app() -> FastAPI:
             plans = [dict(_CLAIM_PLAN)]
         return Response(json.dumps({"code": 0, "data": {"plans": plans}}),
                         media_type="application/json")
+
+    async def _marketing_touch(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        scenario = getattr(app.state, "marketing_scenario", None) or headers.get("x-mock-marketing-scenario")
+        if scenario == "marketing_plan":
+            return Response(json.dumps({
+                "code": 0, "msg": "",
+                "data": {
+                    "server_time": 1787800000,
+                    "deliveries": [{
+                        "campaign_id": "mock-camp-1",
+                        "banner": {
+                            "buttons": [{
+                                "action": {
+                                    "type": "claim_zcode_plan",
+                                    "args": {"plan_id": "mock-marketing-plan"}
+                                }
+                            }],
+                            "args": {
+                                "zcode_plan": {
+                                    "plan_id": "mock-marketing-plan",
+                                    "name": "Mock Marketing Plan",
+                                    "priority": 120,
+                                    "entitlements": [{
+                                        "entitlement_id": "me1",
+                                        "show_name": "GLM-5.3-Flash",
+                                        "meter": "model_usage",
+                                        "unit_type": "token",
+                                        "grant_units": 300000000,
+                                        "period": "one_time"
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }), media_type="application/json")
+        return Response(json.dumps({"code": 0, "msg": "", "data": {"deliveries": []}}),
+                        media_type="application/json")
+
+    async def _releases_electron_manifest(request: Request) -> Response:
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        _record("GET", request.url.path, headers, b"")
+        scenario = getattr(app.state, "manifest_scenario", None) or headers.get("x-mock-manifest-scenario")
+        if scenario == "fail_500":
+            return Response("Internal Server Error", status_code=500)
+        ver = getattr(app.state, "mock_manifest_version", "3.17.2")
+        yaml_content = f"""version: {ver}
+releaseDate: "2026-11-02T06:43:49.471Z"
+releaseName: Release v{ver}
+releaseNotes: |-
+    ## 新功能
+    - 官方发布新版
+releaseNotesByLocale:
+    zh-CN:
+        title: ""
+        markdown: |-
+            ## 新功能
+            - 官方测试新功能
+    en-US:
+        title: ""
+        markdown: |-
+            ## New Features
+            - Official test features
+"""
+        return Response(yaml_content, media_type="application/x-yaml")
 
     async def _billing_claim(request: Request) -> Response:
         headers = {k.lower(): v for k, v in request.headers.items()}
@@ -477,6 +589,8 @@ def build_app() -> FastAPI:
     app.get("/api/v1/zcode-plan/billing/current")(_billing_current)
     app.get("/api/v1/zcode-plan/billing/balance")(_billing_balance)
     app.get("/api/v1/zcode-plan/billing/preview")(_billing_preview)
+    app.get("/api/v1/marketing/touch")(_marketing_touch)
+    app.get("/api/v1/releases/electron/manifest")(_releases_electron_manifest)
     app.post("/api/v1/zcode-plan/billing/claim")(_billing_claim)
     app.get("/api/v1/zcode-plan/usage")(_usage)
     app.get("/api/v1/client/configs")(_client_configs)
