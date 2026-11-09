@@ -88,6 +88,13 @@ async def cmd_login(args: list[str]) -> None:
             if zcode_jwt:
                 acc = store.add_account("zai", "oauth-login", zcode_jwt)
                 print(c(f"\n✔ 已保存 Coding Plan JWT 账号: {acc.name} ({acc.id})", "green"))
+                # 与 Web 入池（admin_api._schedule_login_followup）对齐：OAuth
+                # access_token 落到 account.oauth_token。该字段仅作信息留存，
+                # 供后台 has_oauth_token 标记展示；不参与路由（对话仍走
+                # JWT@zcode-plan 或 API Key@api.z.ai，见 app/models.py）。
+                if access_token:
+                    acc.oauth_token = access_token
+                    store.update_account(acc)
                 await _cli_ingest_followup(acc)
             if access_token:
                 try:
