@@ -12,6 +12,8 @@
 - 异步向上游拉取最新 electron manifest；
 - 若 upstream version > 当前本地 version，且开启 auto_sync：
   动态调用 constants.set_active_version 对齐指纹，落库并记录日志；
+  但绝不越过 constants.PROMPT_ALIGNED_VERSION（system 正文所属版本）——
+  头比正文新会触发上游 405/3012，新版本只记录并告警「需移植提示词」；
 - 定时轮询（默认每 12 小时），并在管理后台提供手动触发检查与日志展示。
 """
 
@@ -27,22 +29,7 @@ import httpx
 import yaml
 
 from . import constants, logs, settings
-
-
-def parse_semver(v: str) -> tuple[int, ...]:
-    """提取版本数字用于大小比较，如 '3.17.2' -> (3, 17, 2)。"""
-    nums = re.findall(r"\d+", str(v or ""))
-    return tuple(int(n) for n in nums) if nums else (0,)
-
-
-def is_newer_version(candidate: str, baseline: str) -> bool:
-    """candidate 是否比 baseline 更新（纯数字分量比较）。"""
-    c = parse_semver(candidate)
-    b = parse_semver(baseline)
-    max_len = max(len(c), len(b))
-    c_pad = c + (0,) * (max_len - len(c))
-    b_pad = b + (0,) * (max_len - len(b))
-    return c_pad > b_pad
+from .constants import is_newer_version
 
 
 @dataclass
@@ -149,10 +136,19 @@ class VersionTracker:
         auto_sync = store.get_setting(
             "auto_sync_client_version", str(settings.AUTO_SYNC_CLIENT_VERSION).lower()
         ) == "true"
+        aligned = constants.PROMPT_ALIGNED_VERSION
 
+        # 恢复缓存同样受正文锁约束：缓存里比提示词新的版本不能直接顶上去
         if auto_sync and stored_ver and is_newer_version(stored_ver, constants.CLIENT_APP_VERSION):
-            constants.set_active_version(stored_ver)
-            logs.info("version", f"恢复已同步的 ZCode 官方版本: v{stored_ver}")
+            if is_newer_version(stored_ver, aligned):
+                logs.warn(
+                    "version",
+                    f"缓存版本 v{stored_ver} 新于提示词对齐版本 v{aligned}，暂不恢复；"
+                    "需先移植 prompt.mjs 文本并抬高 PROMPT_ALIGNED_VERSION",
+                )
+            else:
+                constants.set_active_version(stored_ver)
+                logs.info("version", f"恢复已同步的 ZCode 官方版本: v{stored_ver}")
 
     async def fetch_remote_manifest(self) -> VersionInfo | None:
         """向上游请求最新 manifest。
@@ -222,6 +218,10 @@ class VersionTracker:
                 "latest_version": latest_ver,
                 "has_update": is_newer_version(latest_ver, current_ver),
                 "updated": False,
+                "prompt_aligned_version": constants.PROMPT_ALIGNED_VERSION,
+                "prompt_port_required": is_newer_version(
+                    latest_ver, constants.PROMPT_ALIGNED_VERSION
+                ),
                 "release_date": self.latest_info.release_date if self.latest_info else "",
                 "release_name": self.latest_info.release_name if self.latest_info else "",
                 "release_notes": self.latest_info.release_notes if self.latest_info else "",
@@ -233,14 +233,26 @@ class VersionTracker:
         store.set_setting("zcode_latest_info", json.dumps(info.to_dict(), ensure_ascii=False))
 
         current_ver = constants.CLIENT_APP_VERSION
+        aligned = constants.PROMPT_ALIGNED_VERSION
         auto_sync = store.get_setting(
             "auto_sync_client_version", str(settings.AUTO_SYNC_CLIENT_VERSION).lower()
         ) == "true"
         has_new = is_newer_version(info.version, current_ver)
+        # 正文锁：新版本头必须配新版本 system 文本，否则 405/3012。
+        # 文本尚未移植 → 只记录，不自动对齐（宁可滞后，不可错版）。
+        prompt_port_required = is_newer_version(info.version, aligned)
         updated = False
 
         if has_new:
-            if auto_sync:
+            if prompt_port_required:
+                logs.warn(
+                    "version",
+                    f"检测到 ZCode 官方发版 {info.version}（当前 {current_ver}），"
+                    f"但新于提示词对齐版本 v{aligned}：版本头与 system 正文错版会触发 "
+                    "405/3012，已拒绝自动对齐；升级前先移植 prompt.mjs 文本并抬高 "
+                    "PROMPT_ALIGNED_VERSION",
+                )
+            elif auto_sync:
                 constants.set_active_version(info.version)
                 updated = True
                 logs.ok("version", f"检测到 ZCode 官方发版 {info.version}（当前 {current_ver}），已自动对齐伪装指纹")
@@ -255,6 +267,8 @@ class VersionTracker:
             "latest_version": info.version,
             "has_update": has_new,
             "updated": updated,
+            "prompt_aligned_version": aligned,
+            "prompt_port_required": prompt_port_required,
             "release_date": info.release_date,
             "release_name": info.release_name,
             "release_notes": info.release_notes,

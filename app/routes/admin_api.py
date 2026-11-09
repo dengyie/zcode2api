@@ -608,6 +608,10 @@ async def get_settings():
         "zcode_client_version": constants.CLIENT_APP_VERSION,
         "zcode_latest_version": latest_ver,
         "zcode_version_has_update": has_update,
+        "zcode_prompt_aligned_version": constants.PROMPT_ALIGNED_VERSION,
+        "zcode_prompt_port_required": bool(
+            latest and is_newer_version(latest.version, constants.PROMPT_ALIGNED_VERSION)
+        ),
         "zcode_release_date": latest.release_date if latest else "",
         "zcode_release_name": latest.release_name if latest else "",
         "zcode_release_notes": latest.release_notes if latest else "",

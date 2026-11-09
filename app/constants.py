@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 # ── 上游 origin ──────────────────────────────────────────────────────────────
 # Plan 通道（JWT + 验证码）：zcode.z.ai 的 coding-plan 代理端点
@@ -59,7 +60,13 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # ⚠️ 11-03 起 zcode.z.ai start-plan 对 body 提示词锁版本：版本头与 body 文本
 # 必须同版（prompt.mjs 注释：新版本头 + 旧版本文本 → 405/3012 "unusual activity"）。
 # 发现 preview 为空、1004（领取不落条件）或 405/3012 时优先核对此常量是否落后官方。
-DEFAULT_CLIENT_APP_VERSION = "3.17.2"
+
+# 提示词对齐版本（正文锁）：zcode_system.json 的文本取自该版本客户端。
+# 活跃版本永远不得越过此值——头比正文新就是 405/3012，比"落后一点"更致命。
+# 自动同步 / 手动设置统一由 set_active_version 钳制；真正升级 ZCode 版本时，
+# 先移植 Magpie prompt.mjs 文本进 zcode_system.json，再同步抬高此常量。
+PROMPT_ALIGNED_VERSION = "3.17.2"
+DEFAULT_CLIENT_APP_VERSION = PROMPT_ALIGNED_VERSION
 CLIENT_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装
 # bundle 实证：安装/遥测序仍走 /api/v1/client/configs?app_version=…；
@@ -157,17 +164,40 @@ X_ZCODE_APP_VERSION = CLIENT_APP_VERSION
 X_ZCODE_AGENT = "glm"
 
 
-def set_active_version(new_version: str) -> None:
+def parse_semver(v: str) -> tuple[int, ...]:
+    """提取版本数字用于大小比较，如 '3.17.2' -> (3, 17, 2)。"""
+    nums = re.findall(r"\d+", str(v or ""))
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def is_newer_version(candidate: str, baseline: str) -> bool:
+    """candidate 是否比 baseline 更新（纯数字分量比较）。"""
+    c = parse_semver(candidate)
+    b = parse_semver(baseline)
+    max_len = max(len(c), len(b))
+    c_pad = c + (0,) * (max_len - len(c))
+    b_pad = b + (0,) * (max_len - len(b))
+    return c_pad > b_pad
+
+
+def set_active_version(new_version: str) -> str:
     """动态更新客户端与 billing 伪装版本号（当自动探测发现新版本时）。
 
     规范化：剥离首尾空白与前导 v/V——官方 CFBundleShortVersionString 与
     X-ZCode-App-Version 头均为纯数字形态，"v3.17.2" 会使 UA 变成
     "ZCode/v3.17.2" 产生指纹漂移。
+
+    正文锁：活跃版本永不越过 PROMPT_ALIGNED_VERSION（zcode_system.json 文本
+    所属版本）。上游按「版本头 + system 正文」同版校验，头新于正文即
+    405/3012，故越过时钳制到锁版本，返回实际生效版本。升级客户端必须先移植
+    prompt.mjs 文本并抬高 PROMPT_ALIGNED_VERSION，本函数不提供绕过。
     """
     global CLIENT_APP_VERSION, BILLING_APP_VERSION, USER_AGENT, X_ZCODE_APP_VERSION, CLIENT_CONFIGS_QUERY
     v = str(new_version or "").strip().lstrip("vV").strip()
     if not v:
-        return
+        return CLIENT_APP_VERSION
+    if is_newer_version(v, PROMPT_ALIGNED_VERSION):
+        v = PROMPT_ALIGNED_VERSION
     CLIENT_APP_VERSION = v
     BILLING_APP_VERSION = v
     USER_AGENT = f"ZCode/{v}"
@@ -180,6 +210,7 @@ def set_active_version(new_version: str) -> None:
             settings.USER_AGENT = USER_AGENT
     except (ImportError, AttributeError):
         pass
+    return CLIENT_APP_VERSION
 
 # 无尾斜杠：与 zcode-switch（billing 实证形态）及本服务 billing 头统一，
 # 消除 messages/billing 通道间 Referer 形状抖动

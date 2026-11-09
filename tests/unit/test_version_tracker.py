@@ -8,12 +8,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app import constants
+from app.constants import is_newer_version, parse_semver
 from app.version_tracker import (
     VersionInfo,
     VersionTracker,
-    is_newer_version,
     parse_manifest,
-    parse_semver,
 )
 
 
@@ -133,6 +132,8 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
     tracker = VersionTracker()
     orig = constants.CLIENT_APP_VERSION
     try:
+        # 模拟「提示词已移植到 3.18.5」：正文锁同步抬高后自动对齐才被允许
+        monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "3.18.5")
         mock_info = VersionInfo(
             version="3.18.5",
             release_date="2026-11-05",
@@ -147,8 +148,39 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
         assert res["ok"] is True
         assert res["has_update"] is True
         assert res["updated"] is True
+        assert res["prompt_port_required"] is False
         assert res["latest_version"] == "3.18.5"
         assert constants.CLIENT_APP_VERSION == "3.18.5"
+        assert fresh_app.get_setting("zcode_latest_version") == "3.18.5"
+    finally:
+        constants.set_active_version(orig)
+
+
+@pytest.mark.asyncio
+async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
+    """正文锁：官方新版高于提示词对齐版本时只记录、不顶版本头。
+
+    头新于 system 正文 = 405/3012，宁可滞后也不自动错版；后台用
+    prompt_port_required 标记「需移植 prompt.mjs」。
+    """
+    tracker = VersionTracker()
+    orig = constants.CLIENT_APP_VERSION
+    try:
+        mock_info = VersionInfo(
+            version="3.18.5", release_date="2026-11-05", release_name="v3.18.5"
+        )
+        monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
+        fresh_app.set_setting("auto_sync_client_version", "true")
+
+        res = await tracker.check_and_sync()
+        assert res["has_update"] is True
+        assert res["updated"] is False
+        assert res["prompt_port_required"] is True
+        assert res["prompt_aligned_version"] == constants.PROMPT_ALIGNED_VERSION
+        # 版本头与 billing 版本都没有被顶上去
+        assert constants.CLIENT_APP_VERSION == orig
+        assert constants.BILLING_APP_VERSION == orig
+        # 新版本仍落库（后台展示更新日志用）
         assert fresh_app.get_setting("zcode_latest_version") == "3.18.5"
     finally:
         constants.set_active_version(orig)
@@ -180,7 +212,8 @@ async def test_tracker_check_and_sync_manual_only(fresh_app, monkeypatch):
         constants.set_active_version(orig)
 
 
-def test_tracker_init_from_store(fresh_app):
+def test_tracker_init_from_store_respects_prompt_lock(fresh_app):
+    """缓存里比提示词新的版本不能直接顶上来（正文锁同样约束启动恢复）。"""
     tracker = VersionTracker()
     orig = constants.CLIENT_APP_VERSION
     try:
@@ -191,8 +224,23 @@ def test_tracker_init_from_store(fresh_app):
             json.dumps({"version": "3.19.0", "release_name": "v3.19.0"}),
         )
         tracker.init_from_store()
-        assert constants.CLIENT_APP_VERSION == "3.19.0"
+        assert constants.CLIENT_APP_VERSION == orig
+        # 最新版本信息仍恢复（后台展示更新日志）
         assert tracker.latest_info is not None
         assert tracker.latest_info.version == "3.19.0"
+    finally:
+        constants.set_active_version(orig)
+
+
+def test_tracker_init_from_store_applies_aligned_version(fresh_app):
+    """缓存版本在正文锁以内时正常恢复。"""
+    tracker = VersionTracker()
+    orig = constants.CLIENT_APP_VERSION
+    try:
+        constants.set_active_version("3.16.0")
+        fresh_app.set_setting("auto_sync_client_version", "true")
+        fresh_app.set_setting("zcode_latest_version", "3.17.1")
+        tracker.init_from_store()
+        assert constants.CLIENT_APP_VERSION == "3.17.1"
     finally:
         constants.set_active_version(orig)

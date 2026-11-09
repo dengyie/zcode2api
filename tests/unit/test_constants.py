@@ -26,25 +26,43 @@ def test_billing_base():
 def test_set_active_version():
     orig = constants.CLIENT_APP_VERSION
     try:
-        constants.set_active_version("3.18.0")
-        assert constants.CLIENT_APP_VERSION == "3.18.0"
-        assert constants.BILLING_APP_VERSION == "3.18.0"
-        assert constants.USER_AGENT == "ZCode/3.18.0"
-        assert constants.X_ZCODE_APP_VERSION == "3.18.0"
-        assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.18.0"
+        constants.set_active_version("3.17.0")
+        assert constants.CLIENT_APP_VERSION == "3.17.0"
+        assert constants.BILLING_APP_VERSION == "3.17.0"
+        assert constants.USER_AGENT == "ZCode/3.17.0"
+        assert constants.X_ZCODE_APP_VERSION == "3.17.0"
+        assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.17.0"
         # v/V 前缀必须剥离（官方 X-ZCode-App-Version 为纯数字形态，"ZCode/v3"
         # 是指纹漂移）；空串/裸 v 不改动现状
-        constants.set_active_version("v3.19.0")
-        assert constants.CLIENT_APP_VERSION == "3.19.0"
-        assert constants.USER_AGENT == "ZCode/3.19.0"
-        constants.set_active_version("V4.0.0")
-        assert constants.CLIENT_APP_VERSION == "4.0.0"
+        constants.set_active_version("v3.16.9")
+        assert constants.CLIENT_APP_VERSION == "3.16.9"
+        assert constants.USER_AGENT == "ZCode/3.16.9"
+        constants.set_active_version("V3.16.8")
+        assert constants.CLIENT_APP_VERSION == "3.16.8"
         cur = constants.CLIENT_APP_VERSION
         constants.set_active_version("")
         constants.set_active_version("v")
         assert constants.CLIENT_APP_VERSION == cur
     finally:
         constants.set_active_version(orig)
+
+
+def test_set_active_version_clamped_to_prompt_alignment():
+    orig = constants.CLIENT_APP_VERSION
+    try:
+        # 正文锁：活跃版本永不越过 prompt.mjs 文本所属版本，否则「版本头 +
+        # system 正文」错版 → 上游 405/3012。钳制并返回实际生效版本。
+        assert constants.set_active_version("3.18.0") == constants.PROMPT_ALIGNED_VERSION
+        assert constants.CLIENT_APP_VERSION == constants.PROMPT_ALIGNED_VERSION
+        assert constants.USER_AGENT == f"ZCode/{constants.PROMPT_ALIGNED_VERSION}"
+        assert constants.set_active_version("9.9.9") == constants.PROMPT_ALIGNED_VERSION
+    finally:
+        constants.set_active_version(orig)
+
+
+def test_prompt_aligned_version_is_single_source():
+    assert constants.PROMPT_ALIGNED_VERSION == "3.17.2"
+    assert constants.DEFAULT_CLIENT_APP_VERSION == constants.PROMPT_ALIGNED_VERSION
 
 
 
@@ -58,6 +76,8 @@ def test_client_version_single_source():
     # 官方客户端 3.17.2（Magpie packages/zcode APP_VERSION 同源；前值 3.17.1 / 3.16.3）
     # 全部版本出口必须引用同一常量，禁止再出现字面量版本号
     assert constants.CLIENT_APP_VERSION == "3.17.2"
+    # 版本头初始值必须等于提示词正文所属版本（否则一启动就错版）
+    assert constants.CLIENT_APP_VERSION == constants.PROMPT_ALIGNED_VERSION
     assert constants.X_ZCODE_APP_VERSION == constants.CLIENT_APP_VERSION
     assert constants.USER_AGENT == f"ZCode/{constants.CLIENT_APP_VERSION}"
     assert constants.CLIENT_PLATFORM == "darwin-arm64"  # asar TH() = platform-arch

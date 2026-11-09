@@ -140,7 +140,13 @@ function renderVersionInfo(d){
   document.getElementById('latest-zcode-ver').textContent = 'v' + (d.zcode_latest_version || d.zcode_client_version || '-');
   document.getElementById('auto-sync-version').checked = d.auto_sync_client_version !== false;
   const badge = document.getElementById('ver-status-badge');
-  if(d.zcode_version_has_update){
+  if(d.zcode_prompt_port_required){
+    badge.style.display = 'inline-block';
+    badge.style.background = 'rgba(244,63,94,0.15)';
+    badge.style.color = 'var(--rose, #f43f5e)';
+    badge.style.border = '1px solid var(--rose, #f43f5e)';
+    badge.textContent = '需移植提示词 · 官方 v' + d.zcode_latest_version;
+  } else if(d.zcode_version_has_update){
     badge.style.display = 'inline-block';
     badge.style.background = 'rgba(245,158,11,0.15)';
     badge.style.color = 'var(--amber)';
@@ -171,7 +177,11 @@ async function checkZcodeVersionNow(){
   try{
     const res = await api('POST', '/version/zcode/check');
     if(res.ok){
-      showToast('核验成功: 官方最新 v' + res.latest_version + (res.updated ? '（已自动对齐）' : ''), 'success');
+      // 正文未移植时上游新版会被拒绝自动对齐（头/正文错版 → 405/3012）
+      const note = res.prompt_port_required
+        ? '（正文未移植，暂不自动对齐）'
+        : (res.updated ? '（已自动对齐）' : '');
+      showToast('核验成功: 官方最新 v' + res.latest_version + note, 'success');
       load();
     } else {
       showToast('核验未获取到清单，使用本地缓存', 'info');

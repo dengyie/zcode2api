@@ -22,13 +22,14 @@ class TestSessionAffinityCache:
         assert aff.has("key1") is False
 
     def test_sliding_window_expiration(self):
-        aff = SessionAffinity(ttl=0.1)
+        # 时间余量按 ttl 的 ±40% 留：原 0.1s/±10ms 在 CI 抖动下会假红
+        aff = SessionAffinity(ttl=0.5)
         aff.bind("key1", "acc_1")
-        time.sleep(0.05)
+        time.sleep(0.3)
         # 命中后滑动续期
         assert aff.get("key1") == "acc_1"
-        time.sleep(0.06)
-        # 若没续期此时会过期，续期了依然有效
+        time.sleep(0.3)
+        # 未续期此时已过期（t=0.6 > 0.5）；续期后有效期到 t=0.8
         assert aff.get("key1") == "acc_1"
 
     def test_remove_and_clear(self):
