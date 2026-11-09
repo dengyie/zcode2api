@@ -1,7 +1,22 @@
-# zcode2api (zcode-hub)
+<div align="center">
 
-**ZCode 账号运营 + 双协议网关一体机**：把池内 ZCode Coding Plan / Start Plan / API Key 账号额度，统一转换为标准的
-**Anthropic Messages API**（`/v1/messages`）与 **OpenAI Chat Completions API**（`/v1/chat/completions`），向 Claude Code、Cline、Codex CLI、Chatbox、NextChat 等各类 Agent 与客户端提供高可用 API 服务。
+# ZCodeHub
+
+**High-Availability Dual-Protocol Gateway (Anthropic & OpenAI) & Fleet Operations Engine**
+
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg?style=flat-square)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Architecture](https://img.shields.io/badge/architecture-Dual--Protocol%20%7C%20Fingerprint%20Pool-orange.svg?style=flat-square)](#核心能力)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg?style=flat-square)]()
+
+[English](./README.md) • [Architecture](#核心能力) • [API Spec](#api-协议接口规范) • [Deployment](#快速上手)
+
+</div>
+
+---
+
+**ZCodeHub**（原 `zcode2api`）是面向团队与个人的高可用 **ZCode 账号运营调度中枢与双协议网关一体机**。它将池内 ZCode Coding Plan / Start Plan / API Key 账号额度，无缝转换为标准的 **Anthropic Messages API**（`/v1/messages`）与 **OpenAI Chat Completions API**（`/v1/chat/completions`），为 Claude Code、Cline、Codex CLI、Chatbox、NextChat 等各类 AI Coding Agent 与客户端提供工业级高可用 API 路由服务。
 
 自带一套完整的账号运营控制台：多账号池轮询、高可信成套桌面指纹仿真、官方首启安装序仿真、单账号并发控制、429/5xx/3012 阶梯容灾、请求全景监控、限时套餐自动与手动领取、OAuth 免密登录入池，以及免浏览器的阿里云无痕验证求解——开箱即用，自托管部署。
 
