@@ -1,218 +1,242 @@
+<!-- markdownlint-disable-file MD033 MD045 -->
 <div align="center">
 
 # ZCodeHub
 
 **High-Availability Dual-Protocol Gateway (Anthropic & OpenAI) & Fleet Operations Engine**
 
-[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
-[![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg?style=flat-square)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg?style=flat-square)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.11+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Architecture](https://img.shields.io/badge/architecture-Dual--Protocol%20%7C%20Fingerprint%20Pool-orange.svg?style=flat-square)](#核心能力)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg?style=flat-square)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Dual--Protocol_%7C_Fingerprint_Pool-orange.svg?style=flat-square)](#core-capabilities)
+[![Tests](https://img.shields.io/badge/tests-813%20passed-brightgreen.svg?style=flat-square)]()
 
-[English](./README.md) • [Architecture](#核心能力) • [API Spec](#api-协议接口规范) • [Deployment](#快速上手)
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [Core Capabilities](#core-capabilities) · [Architecture](#system-architecture) · [Quick Start](#quick-start) · [API Specs](#api-protocol-specifications) · [Account Lifecycle](#account-state-machine--failover)
+
+<br>
+
+<p align="center">
+  <b>Terminates credential rotation chaos, protocol fragmentation, and automated downtime caused by upstream anti-bot triggers.</b><br>
+  Engineered natively on Python 3.11+ and FastAPI async runtimes with emulated desktop SKU hardware fingerprints and headless captcha solving.<br>
+  Transforms ZCode Coding Plan and API Key quotas into standardized Anthropic Messages and OpenAI Chat Completions protocols with sticky session affinity, bounded 2-slot concurrency per account, laddered failover, and complete audit telemetry.
+</p>
 
 </div>
 
 ---
 
-**ZCodeHub**（原 `zcode2api`）是面向团队与个人的高可用 **ZCode 账号运营调度中枢与双协议网关一体机**。它将池内 ZCode Coding Plan / Start Plan / API Key 账号额度，无缝转换为标准的 **Anthropic Messages API**（`/v1/messages`）与 **OpenAI Chat Completions API**（`/v1/chat/completions`），为 Claude Code、Cline、Codex CLI、Chatbox、NextChat 等各类 AI Coding Agent 与客户端提供工业级高可用 API 路由服务。
+## Motivation & Architecture Comparison
 
-自带一套完整的账号运营控制台：多账号池轮询、高可信成套桌面指纹仿真、官方首启安装序仿真、单账号并发控制、429/5xx/3012 阶梯容灾、请求全景监控、限时套餐自动与手动领取、OAuth 免密登录入池，以及免浏览器的阿里云无痕验证求解——开箱即用，自托管部署。
+When integrating Claude Code, Cline, Codex CLI, or custom coding agents with upstream AI services, engineers frequently encounter manual token rotation overhead, non-standard protocol dialects, sliding verification obstacles, and cascading service outages when single accounts hit rate limits:
+
+| Evaluation Dimension | ZCodeHub Operations Engine | Ad-Hoc Reverse Proxy Scripts | Generic API Hubs |
+| :--- | :--- | :--- | :--- |
+| **Protocol Support** | Native dual-protocol gateway (Anthropic SSE streaming + bidirectional OpenAI translation) | Single protocol passthrough; cannot bridge Claude and OpenAI ecosystems | Rigid protocol mapping prone to dropping system prompts and streaming events |
+| **Hardware Fingerprints**| Independent per-account SKU profiles (Mac Sequoia/Win11) with launch telemetry | Exposes host Linux kernel and reverse-proxy headers, triggering cluster bans | Lacks client emulation, causing correlated account lockouts |
+| **Captcha Solving** | Headless Node.js + jsdom sandbox solving Aliyun slide verifications in seconds | Incapable of passing verification challenges; limited to low-quota keys | Relies on expensive, high-latency third-party solving APIs |
+| **Concurrency & Affinity**| Hard limit of 2 concurrent slots per account, session affinity for Prompt Cache reuse | No concurrency control; hung requests stall the entire queue | Basic round-robin across keys without context persistence |
+| **Failover & Automation**| 429 adaptive backoff, 3012 risk-control circuit breaking, and automated package claims | Fails immediately on 429; no intelligent backoff or channel rotation | No automated synchronization with upstream promotional benefits |
 
 ---
 
-## 核心能力
+## Core Capabilities
 
-- **双协议兼容网关**：原生支持 `POST /v1/messages`（Anthropic Messages 协议，支持流式 SSE）与 `POST /v1/chat/completions`（OpenAI 格式双向翻译，支持流式与非流式），并提供 `GET /v1/models` 模型列表。
-- **高可信桌面指纹池（一号一台）**：入池自动生成加权桌面成套 SKU（Mac Sequoia/Tahoe、Win11 主流分辨率等），每账号独立全新 UUIDv4 `device_mid`，杜绝宿主机云 Linux 内核共享导致的账号集群关联风险。
-- **官方首启安装序仿真**：入池与指纹轮换自动执行 `client/configs` 与激活事件上报（`app_launch` / `app_daily_active`），持久化 `install_id` 与 `installed_at`。
-- **反代与 CDN 基础设施头深度清洗**：自动剔除 `x-forwarded-*`、`forwarded`、`cf-*`、`cdn-loop`、`x-real-ip`、`via`、`cookie`、`referer`、`origin`、`accept-language` 等网络中间件头部，杜绝部署网络拓扑泄露与客户端伪装冲突。
-- **多账号负载均衡与会话亲和性**：
-  - **新请求负载均衡**：新来的请求自动进行动态负载均衡，优先分配给当前在飞负载最低的可用账号（Least-Inflight）；负载相同时通过轮询指针平局交替分流。
-  - **会话上下文亲和性 (Session Affinity)**：支持显式 Header（`x-session-id`, `session-id`, `x-conversation-id`, `conversation-id` 等）及多轮对话消息指纹；同一上下文的多轮请求粘性路由到同一账号，最大化复用上游 Prompt Cache。
-  - **单账号并发硬上限（恒为 2）与满载溢出**：单账号同时处理上限写死为 2（env/后台设置一律无效）。若会话绑定的账号已达并发上限（2/2）或进入冷却/禁用，请求无缝溢出至其他可用账号并更新绑定，绝不阻塞用户。
-- **阶梯式故障转移与容灾策略**：
-  - **429 智能退避重试**：优先根据上游 `Retry-After` 原地等待重试（等待期间释放并发槽位，防止阻塞）；重试耗尽无损换号且**不冷却账号**；Plan 通道 429 耗尽且同账号有 API Key 时自动切 `api.z.ai` 回退通道。
-  - **5xx 熔断冷却**：重试 3 次后进入 300s 冷却，自动切下一个可用账号。
-  - **3012/405 真风控隔离**：识别 "unusual activity" 立即标记 `DISABLED` 禁用账号保护资产，停止自动化空转，支持后台人工确认后一键启用恢复。
-  - **401/403 鉴权失效标记**：非验证码的凭证失效直接标 `INVALID`。
-- **全景请求监控与安全防护**：
-  - 请求监控面板（`/admin/monitoring`）：实时展示在飞请求、历史请求耗时、状态码、模型、账号及错误堆栈。
-  - 后台暴力破解防护：客户端 IP 连续登录失败达上限自动锁定 5 分钟。
-  - 设置密钥脱敏回显：GET 设置接口密钥自动打码，保障安全性。
-- **限时套餐领取（双轨机制）**：
-  - 自动领取：入池即自动领取全部可领套餐，并有可配置的周期自动领取轮（默认 600 秒，后台设置页可改，0 = 关闭），持续盯当期活动赠送。
-  - 领取与使用解耦：领取/查额度只看 JWT 是否失效（INVALID）；**停用、风控禁用、冷却中的账号照样参与领取**，不再因为「号停着 / 被 B 链风控」漏领投放。
-  - 领取语义对齐官方 3.11.2：成功回执携带上游 `server_time` 与套餐窗口；1005「名额用完」附带名额恢复时间 `next_at`，领取轮按其退避（等待期不重试领取、不耗验证码，`next_at` 过后自动恢复）。
-  - 浏览器过码：支持在前端调起阿里云滑块验证码进行手动领取，应对极严风控环境。
-- **OAuth CLI 免密登录**：
-  - 提供海外邮箱与 Google 登录直达引导卡片，解决上游 `chat.z.ai/auth` 隐藏第三方登录按钮问题。
-  - 严格遵循官方 CLI 的干净请求头规范，JWT 授权入池秒级完成，API Key 兑换异步后台回填。
-  - 跟进官方新协议：采用 init 响应服务端下发的 `poll_token` 轮询（未下发时回落自造，兼容旧协议）；poll 4xx 承载的 `code=3004` 明确映射为会话过期。
+| Module | Feature Highlight | Technical Implementation & Advantage |
+| :--- | :--- | :--- |
+| **Dual-Protocol Gateway** | Bidirectional translation | Native `POST /v1/messages` (Anthropic SSE streaming) and `POST /v1/chat/completions` (OpenAI format translation); includes `GET /v1/models`. |
+| **Trusted Fingerprint Pool**| Strict 1:1 hardware isolation| Generates weighted desktop SKU hardware profiles (Mac Sequoia/Tahoe, Win11) with distinct UUIDv4 `device_mid` per account to eliminate correlation. |
+| **Launch Sequence Telemetry**| Full lifecycle emulation | Emulates official client onboarding; executes `client/configs` and activation event logging (`app_launch` / `app_daily_active`) with persistent timestamps. |
+| **Header Sanitization** | Topology leakage guard | Strips `x-forwarded-*`, `cf-*`, `cdn-loop`, `x-real-ip`, `via`, and proxy metadata to avoid leaking backend deployment topology. |
+| **Session Affinity Routing**| Context cache maximization | Extracts session headers or message hashes for sticky routing to maximize Prompt Cache hits; hard-limits concurrency to 2, overflowing gracefully when full. |
+| **Laddered Failover Engine** | Adaptive backoff & breaker | Respects `Retry-After` on 429 while releasing active slots; falls back to API Key upon exhaustion; puts 5xx on 300s cooldown; disables accounts on 3012/405. |
+| **Headless Captcha Solver** | Zero-Chrome Node/jsdom sandbox | Executes official Aliyun SDK inside isolated Node processes; includes warm-up pools, 45s caching, and concurrency deduplication without heavy Chrome instances. |
+| **Automated Package Claims**| Promotional quota tracking | Automatically claims promotional benefit packages on onboarding and runs a 600s periodic inspection; safely pauses when hitting upstream `next_at` windows. |
 
-## 支持的账号类型
+---
 
-| Provider | 模式 | 说明 |
-|----------|------|------|
-| `zai` | `jwt` | Coding Plan 额度（Plan 通道，需无痕验证码），自动续领活动套餐 |
-| `zai` | `apiKey` | Z.AI API Key（回退通道，免验证码） |
-| `bigmodel` | `apiKey` | 智谱开放平台（Anthropic 兼容端点） |
+## System Architecture
 
-> 一个 Z.AI 账号可同时持有 JWT 与 API Key：OAuth 登录后会一并入池，JWT 额度告罄或 429 耗尽时自动无缝走 API Key 回退通道。
-
-## 快速开始
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp .env.example .env            # 按需修改密钥、端口等
-.venv/bin/python cli.py serve   # 启动网关 + 后台 UI（默认 http://0.0.0.0:3000）
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                        AI Clients & Coding Agents                      │
+│   Claude Code · Cline · Codex CLI · Chatbox · NextChat · Custom Tools  │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ HTTPS (Anthropic Messages / OpenAI Chat)
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   ZCodeHub Gateway & Operations Hub (:3000)            │
+│  ┌──────────────────────┐ ┌──────────────────────┐ ┌────────────────┐  │
+│  │ Protocol Translation │ │ Affinity & Concurrency │ │ Failover Engine│  │
+│  │ /v1/messages         │ │ Session Sticky Routing │ │ 429 Backoff/Key│  │
+│  │ /v1/chat/completions │ │ Concurrency Capped @ 2 │ │ 3012 Breaker   │  │
+│  └──────────┬───────────┘ └──────────┬───────────┘ └────────┬───────┘  │
+│             │                        │                      │          │
+│             ▼                        ▼                      ▼          │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │    Account Fleet Manager (SQLite WAL · Hardware Pool · Quota)    │  │
+│  └──────────────────────────────────┬───────────────────────────────┘  │
+└─────────────────────────────────────┼──────────────────────────────────┘
+                                      │ Upstream Requests with Emulated Headers
+        ┌─────────────────────────────┴─────────────────────────────┐
+        ▼                                                           ▼
+┌────────────────────────────────┐          ┌────────────────────────────────┐
+│   Node.js Captcha Sandbox      │          │   Upstream LLM Infrastructure  │
+│   (captcha_node / jsdom)       │          │   ├─ Z.AI Plan Channel (JWT)   │
+│   Headless Aliyun Captcha SDK  │          │   ├─ Z.AI API Key Fallback     │
+│   45s Cache · Zero Chrome Deps │          │   └─ BigModel Open Platform    │
+└────────────────────────────────┘          └────────────────────────────────┘
 ```
 
-- 后台管理：`http://127.0.0.1:3000/admin/login`（初始账号见 `.env` 的 `ZCODE_ADMIN_KEY`）
-- 对话端点：
-  - Anthropic 协议：`POST http://127.0.0.1:3000/v1/messages`（兼容 Claude Code、Cline）
-  - OpenAI 协议：`POST http://127.0.0.1:3000/v1/chat/completions`（兼容 OpenAI 客户端）
-  - 模型列表：`GET http://127.0.0.1:3000/v1/models`
-  - 探活端点：`GET http://127.0.0.1:3000/meta`
+---
 
-> 使用 Z.AI **JWT 模式**需要 Node.js 求解验证码，首次先执行：`cd captcha_node && npm install`。
+## Quick Start
 
-## 快速上手一个账号
+### 1. Prerequisites & Environment Setup
+
+Requirements: **Python 3.11+** and **Node.js 20+** (required for the captcha solver sandbox):
 
 ```bash
-# 方式一：OAuth 登录（免密，自动入池 + 自动兑换回退 Key）
+# Clone the repository
+git clone https://github.com/dengyie/zcode2api.git
+cd zcode2api
+
+# Create and activate Python virtual environment
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Install dependencies for the headless captcha sandbox
+cd captcha_node && npm install && cd ..
+```
+
+### 2. Configure & Run Service
+
+```bash
+# Copy configuration template
+cp .env.example .env
+
+# Adjust ZCODE_ADMIN_KEY and network settings in .env as needed
+# Start the gateway engine and web console (defaults to http://0.0.0.0:3000)
+.venv/bin/python cli.py serve
+```
+
+Once running:
+- **Management Console**: `http://127.0.0.1:3000/admin/login` (Admin key defined in `.env`)
+- **Anthropic Protocol Endpoint**: `POST http://127.0.0.1:3000/v1/messages`
+- **OpenAI Protocol Endpoint**: `POST http://127.0.0.1:3000/v1/chat/completions`
+- **Model Registry Endpoint**: `GET http://127.0.0.1:3000/v1/models`
+- **Health Check Probe**: `GET http://127.0.0.1:3000/meta`
+
+### 3. Account Ingestion
+
+```bash
+# Option 1: Headless OAuth Login (Automatic ingestion and fallback key exchange)
 .venv/bin/python cli.py login zai
 
-# 方式二：手动加入现成凭证（JWT 三段点分 或 API Key）
-.venv/bin/python cli.py add-account zai 名称 <jwt|key>
+# Option 2: Add credentials manually via CLI (JWT or API Key)
+.venv/bin/python cli.py add-account zai primary-account <JWT_OR_KEY>
 ```
 
-## 命令行
+---
+
+## API Protocol Specifications
+
+### Anthropic Messages Endpoint (`POST /v1/messages`)
+
+Fully compatible with Claude Code and Cline, supporting SSE streaming:
 
 ```bash
-python cli.py serve [--port 3000]    启动网关 + 后台 UI
-python cli.py login zai              通过 OAuth 登录 Z.AI 并自动入池
-python cli.py add-account <zai|bigmodel> <name> <jwt|key>   添加账号
-python cli.py accounts [zai|bigmodel]  查看账号列表
-python cli.py remove-account <provider> <id|name>  删除账号
-python cli.py quota                  查看各账号实时额度
-python cli.py status                 查看配置概览
-python cli.py set-admin-key <key>    设置后台密码
-python cli.py export [file]          导出全部账号
-python cli.py import <file>          导入账号
+curl -X POST http://127.0.0.1:3000/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-gateway-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-3-5-sonnet-20241022",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
 ```
 
-## 后台 UI
+### OpenAI Chat Endpoint (`POST /v1/chat/completions`)
 
-| 页面 | 说明 |
-|------|------|
-| `/admin/login` | 后台登录（Bearer 密钥鉴权，连续失败 IP 锁定防护，凭证加密存于浏览器 localStorage）|
-| `/admin/accounts` | 账号池：新增/导入/导出、启用禁用、指纹换发、**实时额度与状态监控**、套餐领取（自动/手动）|
-| `/admin/settings` | 后台密码、网关 API Key（GET 脱敏掩码）、额度刷新间隔、单账号并发上限（写死 2，只读展示）|
-| `/admin/monitoring` | 请求监控中心：实时请求耗时、状态码、上游模型、使用账号、失败原因 |
+Translates chat requests, streaming chunks, and tool invocations:
 
-账号池页实时展示每个账号的**状态（正常 / 额度用完 / 限流 / 异常 / 禁用）**、各模型剩余额度、
-调用与失败次数；并提供「手动刷新额度」与「批量领取套餐」入口。
-
-## 多账号轮询与故障转移
-
-- 在账号池粘贴 Coding Plan JWT（3 段点分）或 API Key，每行一个即可加入轮询。
-- 网关每次请求选择下一个「可用」账号，跳过用完 / 限流 / 异常 / 禁用的账号。
-- **单账号并发限制**：所选账号在飞并发达上限时智能跳过，不排队、不计入 `MAX_ACCOUNT_ATTEMPTS` 计数。
-- **额度用完**（余额为 0 / 上游 402 / 错误体含 quota、余额不足等关键词）→ 标记 `exhausted`，换下一个账号。
-- **上游 429** → **不冷却账号**，按 Retry-After（封顶）原地等待重试；等待期间释放该账号并发槽。耗尽后换号，账号保持可用。Plan 通道 429 耗尽且同账号有 API Key 时切回退通道。
-- **上游 5xx** → 重试 3 次后标记 `cooling` 冷却 300 秒，自动换下一个账号。
-- **真风控（3012 / 405 unusual activity）** → 标记 `disabled` 并熔断停用，防止账号进一步受损，需在后台手动恢复。
-- **鉴权失败 401/403（非验证码）** → 标记 `invalid`，需重新登录。
-- **验证码过期（403 / code 3007）** → 原地刷新验证码对同一账号重试（最多 3 次）。
-- 达到请求上限仍无可用账号 → 返回 `503 no_available_account`。
-
-账号状态机：
-
+```bash
+curl -X POST http://127.0.0.1:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-gateway-key" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
 ```
-            ┌─────────┐   额度用完(定期自动再探)    ┌──────────┐
-  登录 ────▶│ ACTIVE  │◀─────────────────────────│ EXHAUSTED│
-            │         │   5xx 重试耗尽(冷却 N 秒) └──────────┘
-            │         │◀───────┐      ┌─────────┐
+
+---
+
+## Account State Machine & Failover
+
+The gateway enforces atomic transitions across account states to ensure uninterrupted routing:
+
+```text
+            ┌─────────┐   Quota Refreshed           ┌──────────┐
+  Login ───>│ ACTIVE  │<────────────────────────────│ EXHAUSTED│
+            │         │   5xx Cooldown Settles      └──────────┘
+            │         │<───────┐      ┌─────────┐
             │         │        ├──────│ COOLING │
-            │         │        └─────▶└─────────┘
-            │         │ 401/403(非验证码)
-            │         │──────────────────────▶ INVALID（凭证失效，重新授权）
-            │         │ 3012/405(真风控)
-            │         │──────────────────────▶ DISABLED（风控保护，后台手动恢复）
+            │         │        └─────>└─────────┘
+            │         │ 401/403 (Non-Captcha Auth Fail)
+            │         │─────────────────────────────> INVALID (Re-authentication required)
+            │         │ 3012/405 (Anti-Bot Triggers)
+            │         │─────────────────────────────> DISABLED (Protected, manual recovery)
             └─────────┘
 ```
 
-> 成功响应可清除 `COOLING` / `EXHAUSTED`；额度恢复时后台监控也会自动回 `ACTIVE`。
+- **Concurrency Capped at 2**: When an account reaches its 2 active slots, incoming requests overflow immediately to the next available account without waiting or inflating retry counts.
+- **Adaptive 429 Handling**: Waits in-place based on upstream `Retry-After` headers while releasing its concurrency slot; switches to fallback API Key channels if 429 persists.
+- **Circuit Breaker on 3012/405**: Immediately marks flagged accounts as `DISABLED` to protect assets from further automated probing until verified via admin console.
 
-## 无痕验证（免浏览器）
+---
 
-JWT 账号调用上游时需携带阿里云无痕验证参数（请求头 `X-Aliyun-Captcha-Verify-Param`）。
-本项目**不启动真实浏览器**，而是用 **Node + jsdom** 在模拟浏览器环境中运行阿里云官方无痕 SDK 直接求解该参数。
+## Configuration Reference
 
-- 求解器位于 `captcha_node/solver.js`，首次使用前执行 `cd captcha_node && npm install`。
-- `app/captcha.py` 以子进程方式调用，内置预热池、结果缓存（默认 45s）、并发去重与失败重试。
-- 求解器在 jsdom 中补齐了 SDK 依赖的浏览器 API（`matchMedia`、canvas/WebGL、`Worker`、`OffscreenCanvas`）。
-- 配置与会话缓存兜底：`client/configs` 拉取失败时回落内置默认参数。
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `ZCODE_PORT` | `3000` | Port for the gateway server and management console |
+| `ZCODE_HOST` | `0.0.0.0` | Server bind host address |
+| `ZCODE_ADMIN_KEY` | `change-me` | Initial console password (persisted to SQLite on startup) |
+| `ZCODE_GATEWAY_KEY` | None | Gateway client authentication key (leave empty to disable check) |
+| `ZCODE_DATA_DIR` | `data` | Storage directory for SQLite database and state registries |
+| `ZCODE_QUOTA_REFRESH_INTERVAL` | `60` | Background quota refresh frequency in seconds (0 to disable) |
+| `ZCODE_COOLING_SECONDS` | `300` | Cooldown duration in seconds after 5xx upstream failures |
+| `ZCODE_CLAIM_ROUND_INTERVAL` | `600` | Interval in seconds between automated benefit package claim checks |
+| `ZCODE_NODE_PATH` | `node` | Executable path for Node.js runtime |
+| `ZCODE_CAPTCHA_RETRIES` | `4` | Maximum retries allowed for captcha verification solving |
+| `CAPTCHA_CACHE_TTL` | `45000` | Lifetime of cached captcha solutions in milliseconds |
 
-## 鉴权
+---
 
-- **后台鉴权**：所有 `/admin/api/*` 需 `Authorization: Bearer <后台密码>`（也支持 `?app_key=`），内置 IP 失败节流保护。
-- **网关鉴权（可选）**：在「设置」配置「网关 API Key」后，`/v1/messages` 与 `/v1/chat/completions` 须携带
-  `Authorization: Bearer <key>` 或 `x-api-key: <key>`；留空则不校验。
+## Testing & Quality Assurance
 
-## 环境变量
-
-`cp .env.example .env` 后按需修改（.env 永不入库）：
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `ZCODE_PORT` | 3000 | 服务端口 |
-| `ZCODE_HOST` | 0.0.0.0 | 监听地址 |
-| `ZCODE_ADMIN_KEY` | change-me | 后台密码初始值（之后写库，以库为准）|
-| `ZCODE_GATEWAY_KEY` | 空 | 网关 API Key；留空不校验（生产务必设置）|
-| `ZCODE_DATA_DIR` | data | 数据目录（SQLite 存放处）|
-| `ZCODE_QUOTA_REFRESH_INTERVAL` | 60 | 后台刷新额度间隔（秒），0 关闭 |
-| `ZCODE_COOLING_SECONDS` | 300 | 限流冷却时长（秒）|
-| `ZCODE_CLAIM_ROUND_INTERVAL` | 600 | 套餐自动领取轮间隔（秒），0 关闭（运行时可在后台设置改，以库为准）|
-| `ZCODE_NODE_PATH` | node | 验证码求解所用 Node 可执行文件 |
-| `ZCODE_CAPTCHA_RETRIES` | 4 | 单次求解失败重试次数 |
-| `ZCODE_CAPTCHA_TIMEOUT` | 40 | 单次求解超时（秒）|
-| `CAPTCHA_CACHE_TTL` | 45000 | 验证码结果缓存时长（ms）|
-| `ZAI_UPSTREAM_URL` / `ZAI_FALLBACK_URL` / `BIGMODEL_UPSTREAM_URL` | — | 上游端点覆盖 |
-
-## 开发与测试
+The repository includes offline regression suites with simulated upstream endpoints and fault injection:
 
 ```bash
-.venv/bin/python -m pytest            # 全量测试（Mock 上游，无真实网络）
+# Run complete test suite (813 tests passing offline)
+.venv/bin/python -m pytest tests/
+
+# Execute static linting and type boundary assertions
 .venv/bin/ruff check app tests
 .venv/bin/mypy app/constants.py
 ```
 
-测试全部走 **Mock 上游**：`tests/mock_upstream/` 模拟 Z.AI 被依赖的全部端点，
-支持 `x-mock-scenario` 故障注入（具体见 `docs/testing`），不依赖真实网络，可离线回归。
+---
 
-## 文档
+## Contributing & License
 
-完整文档见 [`docs/README.md`](docs/README.md)：
+Contributions are welcome. Please ensure all tests pass prior to submitting changes:
 
-- **开发**：架构 · 数据格式 · API 规范 · 上游协议 · 开发指南 · 路线图
-- **测试**：测试策略 · 单元用例 · 互通向量 · 集成 E2E · 验收标准
+```bash
+.venv/bin/python -m pytest tests/
+```
 
-## 技术栈
-
-- Python 3.11+ · FastAPI · Uvicorn · httpx
-- SQLite（账号 / 设置持久化，WAL 模式）
-- Node.js + jsdom（免浏览器求解阿里云无痕验证）
-
-## 许可证
-
-本项目采用 [AGPL-3.0](LICENSE) 许可证。
-
-## 免责声明
-
-本仓库仅供学习、研究、个人实验与内部验证使用，不提供任何形式的商业授权、适用性保证或结果保证。
-
-作者不因使用、修改、分发、部署或依赖本项目产生的任何直接或间接损失、账号封禁、数据丢失、
-法律风险或第三方索赔负责。请勿将本项目用于违反服务条款、协议、法律或平台规则的场景；商业前请自行确认许可证与相关协议。
+- Licensed under the [AGPL-3.0 License](LICENSE).
+- Disclaimer: This project is intended strictly for technical research, personal education, and internal testing. Please comply with all upstream terms of service and relevant local regulations.
