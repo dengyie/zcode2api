@@ -237,8 +237,7 @@ def build_app() -> FastAPI:
             # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
             return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
         if scenario == "quota_exhausted_1310":
-            # Magpie 模式实测形态：标准 Anthropic 端点对周/月使用上限回
-            # HTTP 200 + {"code":1310,"msg":"您已达到每周使用上限，将于 2026-11-15 23:59 重置"}
+            # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 2026-11-15 23:59 重置"}
             return 200, {
                 "code": 1310,
                 "msg": "您已达到每周使用上限，将于 2026-11-15 23:59 重置",

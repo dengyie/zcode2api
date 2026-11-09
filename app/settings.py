@@ -139,8 +139,6 @@ UPSTREAM = {
     "zai": os.getenv("ZAI_UPSTREAM_URL", constants.MESSAGES_URLS["zai"]),
     "zai_fallback": os.getenv("ZAI_FALLBACK_URL", constants.MESSAGES_URLS["zai_fallback"]),
     "bigmodel": os.getenv("BIGMODEL_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel"]),
-    "zai_plan": os.getenv("ZAI_PLAN_UPSTREAM_URL", constants.MESSAGES_URLS["zai_plan"]),
-    "bigmodel_plan": os.getenv("BIGMODEL_PLAN_UPSTREAM_URL", constants.MESSAGES_URLS["bigmodel_plan"]),
 }
 
 # 跨 provider 降级顺序（Magpie 模式）：当前 provider 池无可用号时按此顺序下沉。

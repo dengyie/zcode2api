@@ -345,9 +345,9 @@ _login_followup_tasks: set[asyncio.Task] = set()
 def _schedule_login_followup(account, flow, access_token: str | None) -> None:
     """ready 后后台兑换 API Key 并刷新额度；失败只打日志，不影响已入池的 JWT。
 
-    同时把 OAuth access_token 落到 account.oauth_token：这是标准 Anthropic
-    端点（plan_std，Magpie 模式）的推理凭证，与 API Key 兑换互不依赖——
-    兑换失败也保留 token 供 plan_std 通道使用（绕过 zcode-plan WAF）。
+    同时把 OAuth access_token 落到 account.oauth_token（信息留存，供后台
+    `has_oauth_token` 标记展示；不是对话凭证）。API Key 兑换与之互不依赖——
+    兑换失败也保留 token 字符串，便于现场排查。
     """
 
     async def _job():
@@ -355,7 +355,7 @@ def _schedule_login_followup(account, flow, access_token: str | None) -> None:
         if live is None:
             return
         if access_token:
-            # 先落 oauth_token（标准端点凭证），再尝试兑换 API Key
+            # 先落 oauth_token（信息留存），再尝试兑换 API Key
             live.oauth_token = access_token
             store.update_account(live)
             try:
