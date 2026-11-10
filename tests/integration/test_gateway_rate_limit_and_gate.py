@@ -329,16 +329,17 @@ class TestGateBusyHold:
         seed_account(fresh_app, _JWT_BUSY, name="a-busy")
         mock.state.sequences[_JWT_BUSY[:16]] = ["concurrency_3008"]
 
-        # 每个请求贡献一次「因并发耗尽放弃 Plan」；第 5 次（阈值）触发全进程 hold
-        for _ in range(5):
+        # 每个请求贡献一次「因并发耗尽放弃 Plan」；第 5 次（阈值）触发全进程 hold。
+        # 触发请求本身由兜底按限流语义回 429（busy_hold），前 4 个为无号 503
+        for i in range(5):
             res = await client.post("/v1/messages", json=_MSG_BODY)
-            assert res.status_code == 503
+            assert res.status_code == (429 if i == 4 else 503)
         assert gate.busy_remaining() > 0
 
-        # hold 期间新请求本地拦截，不打上游
+        # hold 期间新请求本地拦截（限流语义 429，客户端按 Retry-After 退避），不打上游
         before = len(mock.state.calls)
         res = await client.post("/v1/messages", json=_MSG_BODY)
-        assert res.status_code == 503
+        assert res.status_code == 429
         assert res.json()["error"]["type"] == "gate_busy_hold"
         assert "Retry-After" in res.headers
         assert not _paths(mock, before)
@@ -507,6 +508,94 @@ class TestNoBalance1113:
         assert after.status == Status.COOLING  # 走了真限流分支
         assert after.status != Status.EXHAUSTED
         assert "1302" in (after.last_error or "")
+
+
+@pytest.mark.integration
+class TestKeyNoBalanceScope:
+    """review 修复：冷却记忆不连坐 ACTIVE 双通道账号；凭证变更/删除即清。"""
+
+    async def test_dual_channel_account_not_benched_by_key_1113(
+        self, gateway_client, fresh_app, monkeypatch, no_retry_sleep
+    ):
+        """ACTIVE 双通道账号 Plan 失败 → Key 1113：冷却只记忆，**不跳过整号**，
+        下一个请求仍走健康的 Plan 通道（review P2）。"""
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RETRY_429_TIMES", 0)  # Plan 一次 429 即下沉
+        key = "sk-dual-no-balance"
+        acc = seed_account(fresh_app, _JWT_MIX_KEY, name="a-dual")
+        acc.api_key = key
+        fresh_app.update_account(acc)
+        mock.state.sequences[_JWT_MIX_KEY[:16]] = ["rate_limited"]      # Plan 通道
+        mock.state.sequences[key[:16]] = ["no_balance_1113"]            # Key 通道
+
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res1.status_code == 503  # Plan 429 → Key 1113 → 换号（无其它账号）
+        assert gw._key_no_balance.get(acc.id) is not None  # 记忆已记录
+
+        # 第二个请求：不得被冷却跳过——Plan 通道仍被重试（有界浪费，非连坐）
+        before = len(mock.state.calls)
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 503
+        paths = _paths(mock, before)
+        assert _PLAN_PATH in paths  # Plan 通道再次被打到 = 未被连坐
+
+    async def test_exhausted_branch_1113_on_key_does_not_mark_account(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """402/200 承载的 1113 在 Key 通道同样不标 EXHAUSTED（通道感知全覆盖）。"""
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        acc = seed_account(fresh_app, _JWT_1113_KEY, name="a-1113-key-402")
+        acc.api_key = "sk-key-no-balance-1113"
+        acc.status = Status.DISABLED
+        fresh_app.update_account(acc)
+        mock.state.sequences["sk-key-no-balance"[:16]] = ["no_balance_1113_402"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.DISABLED  # 不被标 EXHAUSTED（Plan 可能仍在）
+        assert gw._key_no_balance.get(acc.id) is not None
+
+    async def test_credential_update_clears_cooldown(
+        self, gateway_client, fresh_app
+    ):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+        import time as _time
+
+        acc = seed_account(fresh_app, _JWT_MIX_KEY, name="a-edit-clear")
+        gw._key_no_balance[acc.id] = _time.time() + 600
+
+        res = await client.put(
+            f"/admin/api/accounts/{acc.id}",
+            json={"token": "hNew.eyJzdWIiOiJuIn0.sig"}, headers=ADMIN_AUTH,
+        )
+        assert res.status_code == 200
+        assert gw._key_no_balance.get(acc.id) is None  # 凭证变更 = 立即重探
+
+    async def test_delete_account_clears_cooldown(
+        self, gateway_client, fresh_app
+    ):
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+        import time as _time
+
+        acc = seed_account(fresh_app, _JWT_MIX_KEY, name="a-del-clear")
+        gw._key_no_balance[acc.id] = _time.time() + 600
+
+        res = await client.request(
+            "DELETE", "/admin/api/accounts", json=[acc.id], headers=ADMIN_AUTH,
+        )
+        assert res.status_code == 200
+        assert gw._key_no_balance.get(acc.id) is None  # 删除即无残留
 
 
 @pytest.mark.integration

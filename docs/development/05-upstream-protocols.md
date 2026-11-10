@@ -95,7 +95,7 @@ API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证
 | 402 / body 含 quota|insufficient|balance|exhaust|额度|余额不足 | 额度耗尽 | exhausted，30min 重试窗 |
 | 429 + `code` 3008/3009/3010 | 并发已满（用户/模型/轮次，瞬态争用） | **不冷却账号**，短退避 `RETRY_429_CONCURRENCY_WAIT`+jitter 重试；耗尽下沉 Key 渠道。同一请求**连续两次**被拒 = 真饱和信号，`GATE_BUSY_THRESHOLD`（5）次/60s → 全进程 busy-hold `GATE_BUSY_HOLD_SECONDS`（180s，`app/gate.py`）——封禁前先降速 |
 | 429 + `code` 1302/1303 | 真限流（Z.ai 频控） | 账号休息 `RATE_LIMIT_COOLDOWN`（默认 60s），请求下沉 Key 渠道/换号；不原地重试 |
-| 429 + `1113` / insufficient balance | 无余额（永久态） | **通道感知**：Plan = 套餐额度耗尽 → 标 EXHAUSTED（选号停止重探）；Key = 该 Key 无资源包 → 选号冷却 `KEY_NO_BALANCE_COOLDOWN`（默认 1h，进程内记忆，后台启用即清）。判定走业务码精确解析，裸子串会撞 logid |
+| 429 + `1113` / insufficient balance | 无余额（永久态） | **通道感知**：Plan = 套餐额度耗尽 → 标 EXHAUSTED（选号停止重探）；Key = 该 Key 无资源包 → 选号冷却 `KEY_NO_BALANCE_COOLDOWN`（默认 1h，进程内记忆，后台启用即清）。判定走业务码精确解析，裸子串会撞 logid。冷却在凭证更新/后台启用/删除账号时即清；**ACTIVE 双通道账号不被连坐**（跳过仅限无可用 Plan 通道的账号） |
 | 429（其它/无业务码） | 频控 | 不冷却，按 Retry-After（封顶 120s）原地重试 ×5 |
 | 405 文案含 `address was blocked` / `network's address` | **边缘封 IP**（出口 IP 级，无 code 3012） | 全进程暂停 plan 渠道 `GATE_EDGE_HOLD_SECONDS`（默认 180s，`app/gate.py`），账号不改状态；本请求下沉 Key 渠道。宽口径对齐 Magpie `EDGE_PAGE`：405 承载的**任何 HTML 页**（含 errors.aliyun.com 跳转）都按边缘页处置 |
 | 401 / 403(非验证码) | 凭证失效 | invalid，直到重登 |

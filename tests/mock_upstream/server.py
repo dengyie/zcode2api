@@ -232,6 +232,10 @@ def build_app() -> FastAPI:
             # logid 故意含 "1113" 子串：钉死裸子串判定不得撞车（3009 同款教训）
             return 429, {"code": 1302, "msg": "too many requests",
                          "logid": "2026111100011139999"}, {}
+        if scenario == "no_balance_1113_402":
+            # 同语义 402 承载（业务码映射 → exhausted 分支）：通道感知守卫的覆盖形态
+            return 402, {"code": 1113, "msg": "insufficient balance",
+                         "logid": "2026111100011139999"}, {}
         if scenario == "no_balance_1113":
             # 1113 无余额（永久态）。logid 同样含 "1113"：分类必须走业务码
             # 精确解析而非裸子串

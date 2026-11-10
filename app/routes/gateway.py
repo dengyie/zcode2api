@@ -582,8 +582,11 @@ async def _dispatch(req_id, body, incoming_headers, provider):
             pinned_id = None
 
             # Key 无资源包（1113）冷却中的账号跳过：再选它只会重演一次必然
-            # 失败的上游调用（同满载跳过，不计 attempts）
-            if _key_no_balance_cooling(account.id):
+            # 失败的上游调用（同满载跳过，不计 attempts）。**仅限无可用 Plan
+            # 通道的账号**——ACTIVE 双通道账号的 Plan 是健康的，跳过整号等于
+            # 让 Key-1113 把 Plan 连坐 1 小时（冷却记忆仍保留：路由到 Key 时
+            # 依旧有界重探）。
+            if _key_no_balance_cooling(account.id) and not account.uses_plan_channel():
                 logs.warn(req_id, f"账号 {account.name} Key 无资源包冷却中，跳过")
                 continue
 
@@ -643,11 +646,12 @@ async def _dispatch(req_id, body, incoming_headers, provider):
 
     # 进程级闸门拒绝（边缘封禁/忙碌断路器/分钟预算）期间的兜底：所有 plan 账号
     # 都被本地拒绝到这里，必须带真实原因与 Retry-After，而不是误导性的
-    # 「无可用账号」。rate_limit 是限流语义回 429，其余回 503。
+    # 「无可用账号」。rate_limit/busy_hold 是限流语义回 429（客户端按限流退避
+    # 重试，magpie 同款），edge_hold（IP 被封）回 503。
     reason = gate.refusal_reason()
     if reason:
         wait = gate.retry_after()
-        status = 429 if reason == "rate_limit" else 503
+        status = 429 if reason in ("rate_limit", "busy_hold") else 503
         logs.req_err(req_id, f"闸门 {reason}，拒绝本请求（Retry-After {wait}s）")
         reqlog.finish_error(req_id, f"gate_{reason}", status=status)
         return JSONResponse(
@@ -1212,7 +1216,19 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     )
                     return _NEXT_ACCOUNT
 
-                if _is_exhausted(status_code, text):
+                exhausted = _is_exhausted(status_code, text)
+                if exhausted and channel != "zai" and                         business_error.business_code(_safe_json(text)) == constants.NO_BALANCE_BUSINESS_CODE:
+                    # 1113 在 Key 通道 = 该 Key 无资源包（账号不标态，Plan 可能仍在）；
+                    # 只有 Plan 通道的 1113 才是套餐额度信号（与 429 分支同口径）
+                    account.record_result(False, "1113 无余额（Key 无资源包），跳过")
+                    _key_no_balance[account.id] = time.time() + settings.KEY_NO_BALANCE_COOLDOWN
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} 1113 无余额（Key），"
+                        f"冷却 {settings.KEY_NO_BALANCE_COOLDOWN}s 并换号",
+                    )
+                    return _NEXT_ACCOUNT
+                if exhausted:
                     account.record_result(False, f"额度用完 HTTP {status_code}")
                     if account.status in (Status.INVALID, Status.DISABLED):
                         store.update_account(account)

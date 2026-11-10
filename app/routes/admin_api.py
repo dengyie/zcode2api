@@ -100,10 +100,13 @@ async def add_accounts(payload: dict = Body(...)):
 # ── 删除账号 ─────────────────────────────────────────────────────────────────
 @router.delete("/accounts")
 async def delete_accounts(ids: list[str] = Body(...)):
+    from .gateway import clear_key_no_balance
+
     deleted = 0
     for aid in ids:
         acc = store.find_any(aid)
         if acc and store.remove_account(acc.provider, aid):
+            clear_key_no_balance(aid)  # 删除即无残留（Key-1113 冷却记忆）
             deleted += 1
     return {"deleted": deleted}
 
@@ -130,6 +133,10 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
             acc.jwt_token = None
         acc.status = Status.ACTIVE
         acc.last_error = None
+        # 凭证变更 = 明确重试意图：清掉 Key 无资源包（1113）的选号冷却
+        from .gateway import clear_key_no_balance
+
+        clear_key_no_balance(account_id)
     store.update_account(acc)
     return {"ok": True}
 
