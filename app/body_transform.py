@@ -178,33 +178,50 @@ def apply_current_date_turn(body: dict) -> bool:
 
 
 def apply_cache_control(body: dict) -> bool:
-    """最后一条非 system 消息的最后一个 block 加 ephemeral 缓存标记。幂等。"""
+    """官方缓存标记形态（Magpie packages/zcode dress 同构，2026-11-11 对齐）：
+
+    1. 清除客户端自带的全部 cache_control——非 system 消息的每个 block、每个
+       tool（官方客户端不发这些；客户端自设断点会改变上游 prompt-cache 的
+       前缀边界，是额外的形状信号）；
+    2. 只给最后一条非 system 消息打 ephemeral：字符串 content 包装成单 block
+       （空串跳过，避免上游拒空 text block），list content 取最后一个 block。
+
+    system 三块的 ephemeral 由 apply_start_plan_system 负责。幂等：二次调用零改动。
+    """
+    changed = False
     messages = body.get("messages")
-    if not isinstance(messages, list) or not messages:
-        return False
-
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") == "system":
-            continue
-
-        content = msg.get("content")
+    last = None
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") == "system":
+                continue
+            last = msg
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.pop("cache_control", None) is not None:
+                        changed = True
+    if last is not None:
+        content = last.get("content")
         if isinstance(content, str):
-            msg["content"] = [{
-                "type": "text",
-                "text": content,
-                "cache_control": {"type": "ephemeral"},
-            }]
-            return True
-        if isinstance(content, list) and content:
+            if content:
+                last["content"] = [{
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+                changed = True
+        elif isinstance(content, list) and content:
             last_block = content[-1]
             if isinstance(last_block, dict) and not last_block.get("cache_control"):
                 last_block["cache_control"] = {"type": "ephemeral"}
-                return True
-        return False
-    return False
+                changed = True
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and tool.pop("cache_control", None) is not None:
+                changed = True
+    return changed
 
 
 def apply_user_id(body: dict, user_id: str) -> bool:

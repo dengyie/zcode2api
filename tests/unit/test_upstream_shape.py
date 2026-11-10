@@ -70,6 +70,50 @@ class TestSystemShape:
         body_transform.transform_body(body)
         assert all(b.get("cache_control") == {"type": "ephemeral"} for b in body["system"])
 
+    def test_client_cache_control_stripped_last_block_marked(self):
+        """官方形态（Magpie dress 同构）：清光 turns+tools 的客户端缓存标记，
+        只给最后一条非 system 消息的最后一个 block 打 ephemeral。"""
+        body = _body()
+        body["messages"] = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "第一问",
+                 "cache_control": {"type": "ephemeral"}},  # 客户端断点：应被清除
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "答"}]},
+            {"role": "user", "content": [
+                {"type": "text", "text": "第二问"},
+                {"type": "text", "text": "附注",
+                 "cache_control": {"type": "ephemeral"}},  # 非末块：也应清除后重打
+            ]},
+        ]
+        body["tools"] = [{"name": "Bash", "cache_control": {"type": "ephemeral"}}]
+        body_transform.transform_body(body)
+        for msg in body["messages"][1:-1]:  # 日期轮之后到倒数第二条
+            for b in msg["content"]:
+                assert "cache_control" not in b
+        for t in body["tools"]:
+            assert "cache_control" not in t
+        last_blocks = body["messages"][-1]["content"]
+        assert last_blocks[-1].get("cache_control") == {"type": "ephemeral"}
+
+    def test_string_last_message_wrapped(self):
+        body = _body()
+        body["messages"].append({"role": "user", "content": "字符串尾轮"})
+        body_transform.transform_body(body)
+        last = body["messages"][-1]["content"]
+        assert isinstance(last, list) and len(last) == 1
+        assert last[0]["cache_control"] == {"type": "ephemeral"}
+
+    def test_cache_normalization_idempotent(self):
+        body = _body()
+        body["messages"][0]["content"] = [
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]
+        body_transform.transform_body(body)
+        import json
+        once = json.dumps(body["messages"], ensure_ascii=False)
+        body_transform.transform_body(body)
+        assert json.dumps(body["messages"], ensure_ascii=False) == once
+
     def test_date_turn_prepended_once(self):
         body = _body()
         body_transform.transform_body(body)
