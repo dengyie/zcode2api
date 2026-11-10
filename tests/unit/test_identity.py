@@ -42,20 +42,30 @@ def test_identity_env_override_still_works(monkeypatch):
 
 
 def test_trace_headers_attribution_full_set():
-    """JWT 通道追踪头对齐官方 3.16.3 attribution 构造器：六件全发、无分级
-    （旧「start-plan 只发三件」系 3.10.2 时代 zapi 静态分析，其 3012 依据
-    已被 2026-09-05 真因修正推翻）。每请求全新 UUID。"""
+    """JWT 通道追踪头对齐官方 3.16.3 attribution 构造器（六件语义、无分级）。
+
+    x-query-id 按官方口径只在有可归因提问时发（build_trace_headers(query_id=)，
+    Magpie queryOf 同构），且同轮稳定——不再是每请求全新；request/trace 仍
+    每请求全新。旧「start-plan 只发三件」系 3.10.2 时代 zapi 静态分析，其
+    3012 依据已被 2026-09-05 真因修正推翻。"""
     a, b = build_trace_headers(), build_trace_headers()
     expected = {
         "x-request-id", "x-zcode-session-type", "x-zcode-trace-id",
-        "x-query-id", "x-zcode-query-source", "x-session-id",
+        "x-zcode-query-source", "x-session-id",
     }
-    assert set(a) == expected
+    assert set(a) == expected  # 无 query_id 不发 x-query-id（官方同款）
+    assert "x-query-id" not in a
     assert a["x-zcode-session-type"] == "main"
     assert a["x-zcode-query-source"] == "main_turn"
-    # 逐请求全新
-    for key in ("x-request-id", "x-zcode-trace-id", "x-query-id", "x-session-id"):
+    # request/trace/session 未传时逐请求全新
+    for key in ("x-request-id", "x-zcode-trace-id", "x-session-id"):
         assert a[key] != b[key], key
+
+    # 传入 query_id：六件全发，query_id 原样透传（同轮稳定由派生函数保证）
+    c = build_trace_headers(session_id="sid-1", query_id="q-turn-1")
+    assert set(c) == expected | {"x-query-id"}
+    assert c["x-query-id"] == "q-turn-1"
+    assert c["x-session-id"] == "sid-1"
 
 
 def test_plan_channel_request_carries_full_attribution():

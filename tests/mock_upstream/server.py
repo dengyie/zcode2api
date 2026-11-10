@@ -219,6 +219,24 @@ def build_app() -> FastAPI:
             return 400, {"code": 1002, "message": "额度已用完"}, {}
         if scenario == "rate_limited":
             return 429, _error_body("rate limited"), {"retry-after": "30"}
+        if scenario == "concurrency_3008":
+            # magpie 插件实证（ZCode 3.17.2）：并发上限族 429——3008 账号并发，
+            # 与 3009 模型并发/3010 轮次并发同族同处置（瞬态争用，可原样重试）。
+            # 带 20 位 logid：确认精确码解析不撞裸子串。
+            return 429, {"code": 3008, "msg": "concurrency limit exceeded",
+                         "logid": "2026110300030081234"}, {}
+        if scenario == "concurrency_3010":
+            return 429, {"code": 3010, "msg": "round concurrency limit exceeded"}, {}
+        if scenario == "rate_limit_1302":
+            # Z.ai 真限流：账号级，原地重试只会加重，应休息并下沉/换号
+            return 429, {"code": 1302, "msg": "too many requests"}, {}
+        if scenario == "rate_limit_1302_200":
+            # 同形 200 承载：业务码映射走 _status_for_business_code → 429 分支
+            return 200, {"code": 1302, "msg": "too many requests"}, {}
+        if scenario == "edge_block_405":
+            # 2026-11 magpie 实证形态：同 IP 挂 3 个账号被边缘 405 封地址，
+            # 页面不带 code 3012，文案指向 network address blocked（IP 级）
+            return 405, {"msg": "Your network's address was blocked by the edge."}, {}
         if scenario == "rate_limited_quota_body":
             # 线上 2026-09-13 实测形态：api.z.ai 频控 429 但 body 带额度文案，
             # 不得被 _is_exhausted 关键词分支误判成「额度用完」。
@@ -253,6 +271,16 @@ def build_app() -> FastAPI:
             return 404, _error_body("no such route", type="invalid_request_error"), {}
         if scenario == "garbage_body":
             return 200, "<html>not json</html>", {}
+        if scenario == "tool_search_ok":
+            # ToolSearch 别名回显：请求侧被改名后，上游响应里模型调用名也是
+            # 别名——网关透传必须还原回客户端原名（Magpie searchNamed 同款）
+            body = dict(ok_body)
+            body["stop_reason"] = "tool_use"
+            body["content"] = [
+                {"type": "tool_use", "id": "tu_1", "name": "ToolSearchTool",
+                 "input": {"query": "bash"}},
+            ]
+            return 200, body, {}
         return 200, ok_body, {}
 
     def _sse_stream(chunks: int) -> str:

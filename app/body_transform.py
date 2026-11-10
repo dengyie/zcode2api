@@ -233,6 +233,50 @@ def attribution_user_id(device_mid: str | None, session_id: str | None) -> str:
     return json.dumps(blob, separators=(",", ":"))
 
 
+def _message_reads_as_query(msg: dict) -> bool:
+    """这条 user 消息是否算一次「用户提问」（Magpie queryOf 的计数口径）。
+
+    官方口径：content 为非空字符串，或块列表里存在任何非 tool_result 块——
+    只带工具结果的 user 轮是模型的工具回传，不是新提问。日期注入轮不算。
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip()) and not _is_date_turn_text(content)
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") == "tool_result":
+            continue
+        if block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip() and not _is_date_turn_text(text):
+                return True
+            continue
+        return True  # image 等其它块同算一次提问
+    return False
+
+
+def conversation_query_id(body: dict, session_id: str | None) -> str | None:
+    """轮次 attribution 的 x-query-id（Magpie queryOf 同构，轮内稳定）。
+
+    官方 3.17.2 createModelRequestAttributionHeaders：一次用户提问带出的全部
+    请求（含其工具循环）共用同一个 query-id，下一次提问换新 id。Anthropic
+    协议每次带全量历史，「第几轮」= 数一遍带提问语义的 user 消息即可，天然
+    确定性；日期注入轮跳过，重试/换号重复调用结果一致（幂等）。
+    无提问轮返回 None——官方对无可归因的请求**不发** x-query-id。
+    """
+    turns = 0
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user" and _message_reads_as_query(msg):
+                turns += 1
+    if not turns:
+        return None
+    seed = f"zcode-query\0{session_id or ''}\0{turns}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
+
+
 def extract_first_user_text(body: dict) -> str:
     """提取会话首条非日期注入的用户文本。无有效文本返回空字符串。"""
     messages = body.get("messages")
@@ -320,3 +364,65 @@ def transform_body(
     except Exception:  # noqa: BLE001 - 变换永不放大请求失败
         pass
     return body
+
+
+# ── ToolSearch 别名（对齐 Magpie packages/zcode/index.mjs searchless）─────────
+# 唯一应用点：agent.build_request（全通道、序列化前）；响应侧反向还原在
+# gateway._Upstream.to_streaming。
+# Claude Code 提供 ToolSearch 工具搜索（defer_loading 延迟加载工具）；官方
+# ZCode 不发这两个概念。上游 Anthropic 端点见到**原名** ToolSearch 时会把
+# 其它工具全部藏起（Bash/Read/Write 在列，仅 tool_reference 加载过的可见），
+# 模型只能先「搜索」才能用基础工具。处置：改名成别名上架、剥离 defer_loading、
+# 丢弃占位工具；响应侧把模型对别名的调用还原回原名（网关流式透传里做，
+# 见 gateway._alias_reverse_iter）。api.z.ai / zcode.z.ai 同症，全通道生效。
+TOOL_SEARCH = "ToolSearch"
+TOOL_SEARCH_ALIAS = "ToolSearchTool"
+TOOL_PLACEHOLDER = "DeferredToolPlaceholder"
+
+
+def apply_tool_search_alias(body: dict) -> bool:
+    """改名 ToolSearch→别名、剥离 defer_loading、丢弃占位工具。幂等。
+
+    覆盖 tools 数组与 messages 历史里的 tool_use 调用名，保证上游看到的
+    工具史自洽（历史里半新半旧是额外的形状信号）。客户端已自带别名的
+    时候不改名（别名已被占用，改了会撞名）——Magpie searchless 同款守卫。
+    """
+    changed = False
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        # 别名已被占用则不改名（防撞名），其余清理照做
+        alias_taken = any(
+            isinstance(t, dict) and t.get("name") == TOOL_SEARCH_ALIAS for t in tools
+        )
+        kept: list = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                kept.append(tool)
+                continue
+            if tool.get("name") == TOOL_PLACEHOLDER:
+                changed = True
+                continue  # 占位工具整个丢弃（官方不发）
+            if "defer_loading" in tool:
+                tool = {k: v for k, v in tool.items() if k != "defer_loading"}
+                changed = True
+            if not alias_taken and tool.get("name") == TOOL_SEARCH:
+                tool = {**tool, "name": TOOL_SEARCH_ALIAS}
+                changed = True
+            kept.append(tool)
+        if changed:
+            body["tools"] = kept
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" \
+                        and block.get("name") == TOOL_SEARCH:
+                    block["name"] = TOOL_SEARCH_ALIAS
+                    changed = True
+    return changed

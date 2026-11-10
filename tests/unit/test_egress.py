@@ -205,6 +205,9 @@ class TestCaptchaEgressSeparation:
         class _FakeProc:
             pid = 4321  # 真实子进程有 pid；收尾会 killpg 整组，测试里 stub 掉
 
+            def kill(self) -> None:
+                pass  # Windows 退化路径（无 killpg）：杀 node 本体
+
             async def communicate(self):
                 return b"VERIFY_PARAM=mock\n", b""
 
@@ -216,7 +219,8 @@ class TestCaptchaEgressSeparation:
             return _FakeProc()
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
-        monkeypatch.setattr(os, "killpg", lambda *_a: None)
+        if hasattr(os, "killpg"):  # POSIX 专属；Windows 走 proc.kill() 退化路径
+            monkeypatch.setattr(os, "killpg", lambda *_a: None)
 
         await mgr._run_solver("s", "cn", "p", egress.DIRECT)
         assert "HTTP_PROXY" not in captured["env"]

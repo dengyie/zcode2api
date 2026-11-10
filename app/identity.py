@@ -12,8 +12,9 @@
 
 另含追踪头（attribution 六件，2026-10-29 对齐官方 3.16.3 构造器）：
 x-request-id / x-zcode-session-type / x-zcode-trace-id / x-query-id /
-x-zcode-query-source / x-session-id，每请求重新生成；分级语义已随
-官方客户端升级废除（详见 build_trace_headers docstring）。
+x-zcode-query-source / x-session-id。生命周期分两档：request/trace 每请求
+全新；session/query 会话与轮内稳定（官方 attribution 语义，由 agent 在
+transform 前确定性派生，见 build_trace_headers docstring）。
 
 平台/语言/时区/设备 ID 取自账号指纹（fingerprint.profile_for）：每账号独立
 设备档案，消灭「多账号同一设备」的关联信号。account 为 None（CLI 自检等）
@@ -105,12 +106,18 @@ def build_identity_headers(account=None) -> dict[str, str]:
     return headers
 
 
-def build_trace_headers(session_id: str | None = None) -> dict[str, str]:
-    """追踪头：每请求全新 UUID（对齐官方 3.16.3 attribution 构造器）。
+def build_trace_headers(session_id: str | None = None,
+                        query_id: str | None = None) -> dict[str, str]:
+    """追踪头：request/trace 每请求全新，session/query 会话与轮内稳定。
 
     session_id 传入时复用为 x-session-id —— 官方同一会话内 x-session-id 与
     metadata.user_id blob 的 session_id 是同值，二者必须一致（不一致会构成
     指纹矛盾）。未传入则新生成。
+
+    query_id 传入时作为 x-query-id（body_transform.conversation_query_id 的
+    确定性派生，一次用户提问带出的全部请求同值——官方 3.17.2
+    createModelRequestAttributionHeaders 语义，Magpie queryOf 同构）；官方对
+    无可归因的请求**不发**该头，None 即不发。
 
     历史注记：旧实现按 zapi（3.10.2 时代）静态分析做 start-plan/coding-plan
     分级——start-plan 只发 request-id/session-type/trace-id 三件，理由是
@@ -119,19 +126,16 @@ def build_trace_headers(session_id: str | None = None) -> dict[str, str]:
 
     2026-10-29 对 3.16.3 bundle 静态核对（createModelRequestAttributionHeaders）：
     六件头**无任何按套餐/通道的分级**，数据存在即发；同日 mitm 实抓真实
-    请求头六件俱全（x-zcode-query-source=main_turn）。故全量对齐：
-      x-request-id / x-zcode-session-type / x-zcode-trace-id /
-      x-query-id / x-zcode-query-source / x-session-id
+    请求头六件俱全（x-zcode-query-source=main_turn）。
     （x-opencode-session 仅对 opencode.ai 域名生效，与本服务无关。）
-
-    与官方的已知残留差异：官方 session-id/query-id 在会话/查询内稳定，
-    hub 无会话态、每请求全新——形状一致、生命周期更短，属可接受漂移。
     """
-    return {
+    headers = {
         "x-request-id": str(uuid.uuid4()),
         "x-zcode-session-type": "main",
         "x-zcode-trace-id": str(uuid.uuid4()),
-        "x-query-id": str(uuid.uuid4()),
         "x-zcode-query-source": "main_turn",
         "x-session-id": session_id or str(uuid.uuid4()),
     }
+    if query_id:
+        headers["x-query-id"] = query_id
+    return headers

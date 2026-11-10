@@ -103,6 +103,9 @@ RETRY_429_WAIT_MAX = _int("ZCODE_RETRY_429_WAIT_MAX", 120)  # Retry-After 采信
 # 429/code 3009「model concurrency limit exceeded」是并发争用而非频控：上游没有
 # Retry-After，等 60s 纯属浪费（槽位早空了）。这类回短退避，配 jitter 打散重试。
 RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
+# 429/code 1302/1303「真限流」（Z.ai 频控，magpie 同源实证）：与并发争用相反，
+# 原地重试只会加重——账号休息该时长（秒），请求下沉下一渠道/换号
+RATE_LIMIT_COOLDOWN = _int("ZCODE_RATE_LIMIT_COOLDOWN", 60)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
@@ -117,6 +120,24 @@ RISK_BAN_STRIKES = _int("ZCODE_RISK_BAN_STRIKES", 4)          # 窗口内累计�
 RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 7 * 86400)
 # 距上次风控命中超过该窗口则 strikes 重新起算：跨月偶发命中不累积成禁用
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
+
+# ── 进程级上游闸门（只作用于 zcode-plan 渠道，见 app/gate.py）────────────────
+# 默认关闭速率/在飞两项：多出口/多实例部署下全局速率应由外层网关决定；单出口
+# 小池部署可按 magpie 实证打开（Start Plan 约 18 请求/分钟、在飞 ≤ 3~8 更稳）。
+GATE_RATE_PER_MIN = _int("ZCODE_GATE_RATE_PER_MIN", 0)     # 每分钟请求预算，0=关闭
+GATE_MAX_INFLIGHT = _int("ZCODE_GATE_MAX_INFLIGHT", 0)     # 全池在飞上限，0=关闭
+# 边缘 405（IP 封禁）后全进程暂停 plan 渠道的秒数（magpie 实测封禁 1–2 小时，
+# 3 分钟只是「先别再撞」；窗口过后请求会重新探测，封禁仍在则再次触发）
+GATE_EDGE_HOLD_SECONDS = _int("ZCODE_GATE_EDGE_HOLD_SECONDS", 180)
+# 忙碌断路器（busy-hold，Magpie BUSY_N/BUSY_WINDOW/BUSY_HOLD 同款，默认开）：
+# 3008 在短退避重试后**仍然** 3008（真饱和；一次重试就过去的瞬态争用不计）
+# 在 GATE_BUSY_WINDOW_SECONDS 窗口内累计 GATE_BUSY_THRESHOLD 次，全进程暂停
+# plan 渠道 GATE_BUSY_HOLD_SECONDS 秒——封禁前先降速（magpie 实证：重试吸收
+# ~90% 的 3008，上层无感不降速，3–7 分钟后地址被封 1–2 小时）
+GATE_BUSY_THRESHOLD = _int("ZCODE_GATE_BUSY_THRESHOLD", 5)
+GATE_BUSY_WINDOW_SECONDS = _int("ZCODE_GATE_BUSY_WINDOW_SECONDS", 60)
+GATE_BUSY_HOLD_SECONDS = _int("ZCODE_GATE_BUSY_HOLD_SECONDS", 180)
+
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
 # 单账号并发上限。2026-11-04 线上实测写死为 2（每个账号同一时刻最多 2 个在飞
@@ -171,7 +192,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.22"
+APP_VERSION = "2.7.23"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

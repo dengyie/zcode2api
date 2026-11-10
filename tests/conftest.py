@@ -89,6 +89,10 @@ def fresh_app(tmp_path, monkeypatch):
         if hasattr(mod, "store"):
             monkeypatch.setattr(mod, "store", fresh)
     assert store_module.store is fresh
+    # 进程级闸门是模块级单例（分钟窗口 + 边缘断路器），跨用例会互相污染
+    from app.gate import gate as upstream_gate
+
+    upstream_gate.reset()
     from app import auth_admin as auth_admin_module
     if hasattr(auth_admin_module, "reset_failures"):
         auth_admin_module.reset_failures()

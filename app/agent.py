@@ -126,6 +126,9 @@ def build_request(
         # 会话粘性：同首轮文本 → 同 session_id（官方会话内稳定，cache 依赖它）。
         # 必须在 transform_body 之前算——日期轮会被插到 messages[0]。
         session_id = body_transform.conversation_session_id(body, account.id) or str(uuid.uuid4())
+        # 轮次粘性：同一次提问（含其工具循环）→ 同 query-id（官方 3.17.2
+        # attribution 语义，Magpie queryOf 同构）。同样必须在日期轮注入前算。
+        query_id = body_transform.conversation_query_id(body, session_id)
         user_id = body_transform.jwt_user_id(account.jwt_token)
         model = body.get("model") if isinstance(body.get("model"), str) else None
         body = body_transform.transform_body(
@@ -142,7 +145,7 @@ def build_request(
             **auth,
             "anthropic-version": constants.ANTHROPIC_VERSION,
             **build_identity_headers(account),
-            **build_trace_headers(session_id),
+            **build_trace_headers(session_id, query_id),
         }
     else:
         # API Key 通道（回退 / bigmodel）：保持原有最小头集
@@ -159,6 +162,10 @@ def build_request(
         headers[constants.CAPTCHA_HEADER] = verify_param
     if verify_region:
         headers[constants.CAPTCHA_REGION_HEADER] = verify_region
+
+    # ToolSearch 别名全通道生效（api.z.ai 同症，Magpie searchless 同款）；
+    # Plan 通道 transform_body 已做过，此处幂等
+    body_transform.apply_tool_search_alias(body)
 
     for hdr, value in (incoming_headers or {}).items():
         lower = hdr.lower()

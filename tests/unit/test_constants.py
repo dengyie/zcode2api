@@ -180,6 +180,36 @@ def test_risk_control_signals():
     assert "unusual activity" in constants.RISK_CONTROL_MARKERS
 
 
+def test_429_code_split_and_edge_markers():
+    """429 业务码分流全集 + 边缘封禁文案（2026-11 magpie 插件 / ZCode 3.17.2 实证）。
+
+    并发族（3008/3009/3010）是瞬态争用，短退避重试；真限流（1302/1303）是频控，
+    账号休息下沉。两组码集合不得混用——混用会把「没排到」的并发拒绝当成账号
+    被限速而白歇，或把真限流当并发连打加重。边缘封 IP 页面文案与账号级 3012
+    文案必须互斥（3012 页面不得触发全进程暂停）。
+    """
+    assert constants.CONCURRENCY_BUSINESS_CODES == frozenset({3008, 3009, 3010})
+    assert constants.RATE_LIMIT_429_CODES == frozenset({1302, 1303})
+    assert not constants.CONCURRENCY_BUSINESS_CODES & constants.RATE_LIMIT_429_CODES
+    assert constants.RISK_BUSINESS_CODE not in constants.CONCURRENCY_BUSINESS_CODES
+    assert "network's address" in constants.EDGE_BLOCK_MARKERS
+    assert "address was blocked" in constants.EDGE_BLOCK_MARKERS
+    assert not set(constants.EDGE_BLOCK_MARKERS) & set(constants.RISK_CONTROL_MARKERS)
+
+
+def test_gate_settings_defaults():
+    from app import settings
+    # 速率/在飞默认关闭（多出口/多实例部署由外层限速）；边缘断路器默认开启
+    assert settings.GATE_RATE_PER_MIN == 0
+    assert settings.GATE_MAX_INFLIGHT == 0
+    assert settings.GATE_EDGE_HOLD_SECONDS == 180
+    # busy-hold（magpie BUSY_N/BUSY_WINDOW/BUSY_HOLD 同款）：默认开启
+    assert settings.GATE_BUSY_THRESHOLD == 5
+    assert settings.GATE_BUSY_WINDOW_SECONDS == 60
+    assert settings.GATE_BUSY_HOLD_SECONDS == 180
+    assert settings.RATE_LIMIT_COOLDOWN == 60
+
+
 def test_retry_settings_defaults():
     from app import settings
     assert settings.RETRY_429_TIMES == 5

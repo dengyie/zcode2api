@@ -80,6 +80,10 @@ X-Aliyun-Captcha-Region: {region}
 
 Body：标准 Anthropic Messages（`model/max_tokens/stream/system/messages`）。上游模型名**大小写敏感**（`GLM-5.2`、`GLM-5-Turbo`）。
 
+**Body 形状（网关统一变换，`app/body_transform.py`）**：system 严格三块（cliPrefix / stableSections / dynamic，3.17.2 逐字节，见 `zcode_system.json`）；首条 user 轮前插 `<system-reminder>Today's date is …</system-reminder>`；末条消息最后一块打 `cache_control: ephemeral`；`metadata.user_id` = `{"device_id": mid, "account_uuid": "", "session_id": sid}`。**ToolSearch 别名**：客户端的 Claude Code 会带 ToolSearch 工具（defer_loading 延迟加载），上游见到**原名**会把其余工具全部藏起——网关改名 `ToolSearchTool`、剥 `defer_loading`、丢 `DeferredToolPlaceholder`，响应侧在流式透传中还原回原名（Magpie searchless/searchNamed 同款，api.z.ai 同症全通道生效）。
+
+**attribution 生命周期（会话/轮内稳定，非每请求全新）**：`x-session-id` 与 metadata blob 的 `session_id` 同值，会话内稳定（hub 用「会话首轮文本」派生）；`x-query-id` 由「会话 + 用户轮计数」确定性派生（`conversation_query_id`），一次提问带出的全部请求（含工具循环）同值——工具循环里 N 个请求 N 个 query-id 是可被上游统计的行为指纹。
+
 API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证码头。
 
 **验证码 verifyParam**：Node+jsdom 运行阿里云官方无痕 SDK（`AliyunCaptcha.js`，o.alicdn.com），`startTracelessVerification()` 成功回调给出 `verifyParam = base64(JSON{certifyId, sceneId, isSign, securityToken})`；sceneId/region/prefix 从 `client/configs` 动态取（默认 `11xygtvd/sgp/no8xfe`）。挑战形态：403 + captcha 头；或 400 + body `{"code":3007}`。
@@ -89,9 +93,20 @@ API Key 通道差异：`x-api-key: {apiKey}.{secret?}` 替代 Bearer，无验证
 | 上游响应 | 判定 | 动作 |
 |----------|------|------|
 | 402 / body 含 quota|insufficient|balance|exhaust|额度|余额不足 | 额度耗尽 | exhausted，30min 重试窗 |
-| 429 | 限流 | cooling 300s |
+| 429 + `code` 3008/3009/3010 | 并发已满（用户/模型/轮次，瞬态争用） | **不冷却账号**，短退避 `RETRY_429_CONCURRENCY_WAIT`+jitter 重试；耗尽下沉 Key 渠道。同一请求**连续两次**被拒 = 真饱和信号，`GATE_BUSY_THRESHOLD`（5）次/60s → 全进程 busy-hold `GATE_BUSY_HOLD_SECONDS`（180s，`app/gate.py`）——封禁前先降速 |
+| 429 + `code` 1302/1303 | 真限流（Z.ai 频控） | 账号休息 `RATE_LIMIT_COOLDOWN`（默认 60s），请求下沉 Key 渠道/换号；不原地重试 |
+| 429 + `1113` / insufficient balance | Key 无资源包（永久态） | 不等待，下沉/换号 |
+| 429（其它/无业务码） | 频控 | 不冷却，按 Retry-After（封顶 120s）原地重试 ×5 |
+| 405 文案含 `address was blocked` / `network's address` | **边缘封 IP**（出口 IP 级，无 code 3012） | 全进程暂停 plan 渠道 `GATE_EDGE_HOLD_SECONDS`（默认 180s，`app/gate.py`），账号不改状态；本请求下沉 Key 渠道。宽口径对齐 Magpie `EDGE_PAGE`：405 承载的**任何 HTML 页**（含 errors.aliyun.com 跳转）都按边缘页处置 |
 | 401 / 403(非验证码) | 凭证失效 | invalid，直到重登 |
 | 403 + captcha 挑战 / 400+`code:3007` | 验证码问题 | 刷新 verifyParam 原账号重试 |
+
+429 业务码分流出处：2.7.6/2.7.9 实测 3009（`{"code":3009,"msg":"model concurrency
+limit exceeded"}`，判定必须解析业务码——logid 20 位随机数字，裸子串必撞车）；
+3008/3010 与 1302/1303 为 2026-11 magpie 插件（`@magpie-community/opencode-zcode-auth`）
+同源实证补齐。边缘 405 同出处：同一出口 IP 同时使用 3 个账号即被封地址（2 个不封），
+Start Plan 约 18 请求/分钟、10 在飞 → 3008 连发 3–7 分钟后 405 封 IP 1–2 小时；
+进程级闸门（速率预算/在飞上限默认关、断路器默认开）见 `app/gate.py` 与 `settings.GATE_*`。
 
 ## 4. 免费额度（Start Plan）
 

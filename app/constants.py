@@ -257,12 +257,29 @@ CAPTCHA_BODY_MARKERS = ('"code":3007', '"code": 3007')
 # 处置：账号指数退避冷却 + 暂停验证码池预热（池预热本身即上游流量，会加剧风控）。
 RISK_CONTROL_HTTP_STATUSES = (405,)
 RISK_BUSINESS_CODE = 3012
-# 429 承载的「模型并发已满」（2026-11-02 实测 {"code":3009,"msg":"model
-# concurrency limit exceeded"}）：并发争用是瞬态，短退避重试，不等 Retry-After。
+# 429 承载的「并发已满」业务码全集（2026-11 magpie 插件 / ZCode 3.17.2 实证）：
+# 3009 模型并发（2026-11-02 实测 {"code":3009,"msg":"model concurrency limit
+# exceeded"}）；3008 账号并发、3010 轮次并发同族。三者同为「这一轮没排到」的
+# 瞬态争用：短退避重试，不等 Retry-After，也不算账号故障。
 # ⚠️ 判定必须解析业务码，不能用裸子串——响应体里的 logid 是 20 位随机数字，
 # 裸子串 "3009" 会撞车（与 EXHAUST 裸子串教训同款，见上方 EXHAUST_KEYWORDS 注）。
-CONCURRENCY_BUSINESS_CODE = 3009
+CONCURRENCY_BUSINESS_CODES = frozenset({3008, 3009, 3010})
+# 429 承载的「真限流」业务码（Z.ai 频控，magpie 同源实证）：与并发争用相反，
+# 继续原地重试只会加重——账号休息 RATE_LIMIT_COOLDOWN，请求下沉下一渠道/换号。
+RATE_LIMIT_429_CODES = frozenset({1302, 1303})
 RISK_CONTROL_MARKERS = (
     '"code":3012', '"code": 3012',
     "unusual activity",
+)
+
+# ── 边缘封禁（IP 级，与账号级 3012 区分）──────────────────────────────────────
+# 2026-11 magpie zcode 插件实证：同一出口 IP 同时使用 3 个 ZCode 账号即被
+# 405 封地址（2 个不封）；Start Plan ~18 请求/分钟、最多 10 在飞 → 3008 连发
+# → 3–7 分钟后 405 封 IP 1–2 小时。该页面不带 code 3012，文案指向「地址被封」
+# 而非账号风控。处置：全进程暂停 zcode-plan 写入一段窗口（app/gate.py），
+# 而不是只冷却单账号——换账号解决不了 IP 被封，只会把全池送进同一封禁窗口。
+EDGE_BLOCK_MARKERS = (
+    "address was blocked",
+    "network's address",
+    "blocked by the edge",
 )
