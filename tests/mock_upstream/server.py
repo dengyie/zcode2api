@@ -228,8 +228,15 @@ def build_app() -> FastAPI:
         if scenario == "concurrency_3010":
             return 429, {"code": 3010, "msg": "round concurrency limit exceeded"}, {}
         if scenario == "rate_limit_1302":
-            # Z.ai 真限流：账号级，原地重试只会加重，应休息并下沉/换号
-            return 429, {"code": 1302, "msg": "too many requests"}, {}
+            # Z.ai 真限流：账号级，原地重试只会加重，应休息并下沉/换号。
+            # logid 故意含 "1113" 子串：钉死裸子串判定不得撞车（3009 同款教训）
+            return 429, {"code": 1302, "msg": "too many requests",
+                         "logid": "2026111100011139999"}, {}
+        if scenario == "no_balance_1113":
+            # 1113 无余额（永久态）。logid 同样含 "1113"：分类必须走业务码
+            # 精确解析而非裸子串
+            return 429, {"code": 1113, "msg": "insufficient balance",
+                         "logid": "2026111100011139999"}, {}
         if scenario == "rate_limit_1302_200":
             # 同形 200 承载：业务码映射走 _status_for_business_code → 429 分支
             return 200, {"code": 1302, "msg": "too many requests"}, {}

@@ -234,6 +234,10 @@ IDENTITY_OS_VERSION = "25.6.0"
 
 # ── 上游被拒信号 → 账号动作（gateway / quota 判定共用）────────────────────────
 EXHAUST_HTTP_STATUSES = (402,)
+# 「无余额/无资源包」业务码：Plan 通道 = 套餐额度耗尽（EXHAUSTED）；Key 通道 =
+# 该 Key 无资源包（Key 冷却记忆，账号不标态——Plan 可能仍在）。判定必须用
+# 业务码精确解析，裸子串 "1113" 会撞 20 位 logid（3009 同款教训）。
+NO_BALANCE_BUSINESS_CODE = 1113
 # 额度耗尽信号。2026-10-31 复盘：原实现是**裸子串**匹配 "quota"，任何含该词的
 # 文案（含风控/验证码页）都会被判成「额度用完」而把号踢成 EXHAUSTED——比漏判更糟。
 # 改为 ① 业务码（Plan 通道 {"code":1005,"msg":"exceed quota limit"} 实测形态）

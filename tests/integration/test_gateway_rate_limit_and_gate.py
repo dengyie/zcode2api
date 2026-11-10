@@ -36,10 +36,13 @@ _JWT_BUSY = "hU5b.eyJzdWIiOiJ4In0.sig"
 _JWT_TR = "hV6t.eyJzdWIiOiJ4In0.sig"
 _JWT_MIX_PLAN = "hW7m.eyJzdWIiOiJ4In0.sig"
 _JWT_MIX_KEY = "hX8k.eyJzdWIiOiJ4In0.sig"
+_JWT_1113_PLAN = "hY9p.eyJzdWIiOiJ4In0.sig"
+_JWT_1113_KEY = "hZ0q.eyJzdWIiOiJ4In0.sig"
 
 _MSG_BODY = {"model": "GLM-5.3", "messages": [{"role": "user", "content": "hi"}]}
 _PLAN_PATH = "/api/v1/zcode-plan/anthropic/v1/messages"
 _KEY_PATH = "/api/anthropic/v1/messages"
+ADMIN_AUTH = {"Authorization": "Bearer zcode"}  # 默认后台密钥
 
 
 def _count(mock, cred: str) -> int:
@@ -394,6 +397,116 @@ class TestGateBusyHold:
             await task
         await asyncio.sleep(0)  # 让 finally 跑完
         assert gate._inflight == 0  # finally 归还，无泄漏
+
+
+@pytest.mark.integration
+class TestNoBalance1113:
+    """1113「无余额」通道感知（2026-11-11 线上实证：死号每请求重探 151 次）。
+
+    Plan 通道 = 套餐额度耗尽 → 标 EXHAUSTED；Key 通道 = 该 Key 无资源包 →
+    选号冷却记忆（账号不标态）。判定走业务码精确解析，logid 含 "1113" 不撞。
+    """
+
+    async def _no_refresh(self, monkeypatch):
+        from app.routes import gateway as gw
+
+        async def _stub(account):
+            return None
+
+        monkeypatch.setattr(gw, "_safe_refresh", _stub)
+
+    async def test_plan_1113_marks_exhausted_and_stops_reprobing(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)  # 屏蔽后台 billing，计数只看 messages
+        acc = seed_account(fresh_app, _JWT_1113_PLAN, name="a-1113-plan")
+        mock.state.sequences[_JWT_1113_PLAN[:16]] = ["no_balance_1113"]
+
+        before = len(mock.state.calls)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503  # 唯一账号耗尽
+        assert len([x for x in _paths(mock, before)]) == 1  # 不原地重试
+
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.EXHAUSTED  # 标态：选号不再重选重探
+        assert "1113" in (after.last_error or "")
+
+        # 第二个请求不再打上游（EXHAUSTED 不可选）
+        before2 = len(mock.state.calls)
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 503
+        assert not _paths(mock, before2)  # 零重探（线上 151 次循环的根治点）
+
+    async def test_key_1113_cools_selection_without_touching_status(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """Key 通道 1113：账号状态不改（Plan 可能仍在），但选号冷却停止重探；
+        后台手动启用清除冷却、允许立即重探。"""
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        monkeypatch.setattr(settings, "KEY_NO_BALANCE_COOLDOWN", 600)
+        acc = seed_account(fresh_app, _JWT_1113_KEY, name="a-1113-key")
+        acc.api_key = "sk-key-no-balance-1113"
+        acc.status = Status.DISABLED  # plan 死、仅 Key 可用（线上 briarlow17 形态）
+        acc.risk_strikes = 5  # 3012 风控 5/5 禁用
+        acc.last_error = "风控封禁 (3012/unusual activity) HTTP 405，确认恢复后请在后台手动启用（第 5 次）"
+        fresh_app.update_account(acc)
+        mock.state.sequences["sk-key-no-balance"[:16]] = ["no_balance_1113"]
+
+        before = len(mock.state.calls)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        assert _paths(mock, before) == [_KEY_PATH]  # 只探了 Key 通道一次
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.DISABLED  # 账号状态不被 Key-1113 污染
+        assert after.risk_strikes >= 5  # 风控记录原样保留
+
+        # 冷却记忆生效：第二个请求不再撞上游（151 次重探循环的根治点）
+        before2 = len(mock.state.calls)
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 503
+        assert not _paths(mock, before2)
+
+        # 后台手动启用 = 明确重试意图：清冷却（走 admin 端点，store 直调不清）
+        res_en = await client.post(
+            f"/admin/api/accounts/{acc.id}/enabled",
+            json={"enabled": True}, headers=ADMIN_AUTH,
+        )
+        assert res_en.status_code == 200
+        assert gw._key_no_balance.get(acc.id) is None
+        # 启用后账号 ACTIVE：plan 通道恢复入梯，重探一次（仍 1113 → 标 EXHAUSTED）
+        mock.state.sequences[_JWT_1113_KEY[:16]] = ["no_balance_1113"]
+        before3 = len(mock.state.calls)
+        res3 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res3.status_code == 503
+        assert _paths(mock, before3) == [_PLAN_PATH]
+        after3 = fresh_app.find("zai", acc.id)
+        assert after3.status == Status.EXHAUSTED
+
+    async def test_rate_limit_1302_with_1113_logid_is_not_no_balance(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """裸子串回归钉：1302 body 的 logid 含 "1113" 不得误入无余额分支
+        （mock 场景 rate_limit_1302 的 logid 故意带 1113 子串）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RATE_LIMIT_COOLDOWN", 30)
+        acc = seed_account(fresh_app, _JWT_1302, name="a-1302")
+        mock.state.sequences[_JWT_1302[:16]] = ["rate_limit_1302"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503  # 真限流：账号休息（非无余额路径）
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.COOLING  # 走了真限流分支
+        assert after.status != Status.EXHAUSTED
+        assert "1302" in (after.last_error or "")
 
 
 @pytest.mark.integration

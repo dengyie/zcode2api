@@ -142,6 +142,11 @@ async def set_enabled(account_id: str, payload: dict = Body(...)):
         raise HTTPException(404, "账号不存在")
     enabled = bool(payload.get("enabled", True))
     store.set_enabled(acc.provider, account_id, enabled)
+    if enabled:
+        # 人工启用 = 明确要求立即重试：清掉 Key 无资源包（1113）的选号冷却
+        from .gateway import clear_key_no_balance
+
+        clear_key_no_balance(account_id)
     return {"ok": True}
 
 

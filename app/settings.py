@@ -106,6 +106,10 @@ RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
 # 429/code 1302/1303「真限流」（Z.ai 频控，magpie 同源实证）：与并发争用相反，
 # 原地重试只会加重——账号休息该时长（秒），请求下沉下一渠道/换号
 RATE_LIMIT_COOLDOWN = _int("ZCODE_RATE_LIMIT_COOLDOWN", 60)
+# Key 通道 1113「无资源包」（永久态）后的选号冷却（秒）：不冷却的话每个请求
+# 都会重选该号去撞一次必然失败的 1113（2026-11-11 线上实证：151 个请求 =
+# 151 次白烧上游调用）。进程内记忆，重启后自动重探一次
+KEY_NO_BALANCE_COOLDOWN = _int("ZCODE_KEY_NO_BALANCE_COOLDOWN", 3600)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
@@ -192,7 +196,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.23"
+APP_VERSION = "2.7.24"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

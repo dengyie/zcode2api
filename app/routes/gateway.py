@@ -581,6 +581,12 @@ async def _dispatch(req_id, body, incoming_headers, provider):
             tried.add(account.id)
             pinned_id = None
 
+            # Key 无资源包（1113）冷却中的账号跳过：再选它只会重演一次必然
+            # 失败的上游调用（同满载跳过，不计 attempts）
+            if _key_no_balance_cooling(account.id):
+                logs.warn(req_id, f"账号 {account.name} Key 无资源包冷却中，跳过")
+                continue
+
             slot_box: list[str | None] = [None]
             if limit > 0:
                 if _inflight.get(account.id, 0) >= limit:
@@ -745,6 +751,27 @@ def _spawn_bg(coro) -> None:
 # 账号并发限制：account_id → 在飞请求数。asyncio 单线程事件循环下
 # check+inc 原子；释放走 _Upstream.close / 失败路径，泄漏面在测试钉住。
 _inflight: dict[str, int] = {}
+
+# Key 通道 1113「无资源包」（永久态）的选号冷却记忆：account_id → 解禁 epoch。
+# 不记的话每个请求都会重选该号去撞一次必然失败的 1113（2026-11-11 线上实证：
+# 151 个请求 = 151 次白烧上游调用）。进程内记忆：重启即忘，重探一次代价可接受；
+# 后台手动启用账号时清除（用户明确意图 = 立即重试）。
+_key_no_balance: dict[str, float] = {}
+
+
+def clear_key_no_balance(account_id: str) -> None:
+    """后台启用/凭证变更时清除该号的 Key 无余额冷却，允许立即重探。"""
+    _key_no_balance.pop(account_id, None)
+
+
+def _key_no_balance_cooling(account_id: str, now: float | None = None) -> bool:
+    until = _key_no_balance.get(account_id, 0)
+    if not until:
+        return False
+    if (now or time.time()) >= until:
+        _key_no_balance.pop(account_id, None)  # 到期自然重探
+        return False
+    return True
 
 
 def _limit() -> int:
@@ -1227,16 +1254,30 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     return _NEXT_ACCOUNT
 
                 if status_code == 429:
-                    # 1113「无余额/无资源包」是 Key 的永久状态（api.z.ai 实测秒回），
-                    # 原地等待重试毫无意义，只会把客户端吊死在 RETRY_429_TIMES×WAIT 里
-                    # ——快速换号/失败。
-                    if "1113" in text or "insufficient balance" in text.lower():
-                        account.record_result(False, "429 1113 无余额（Key 无资源包，永久态）")
-                        logs.warn(req_id, f"账号 {account.name} 429 为 1113 无余额，跳过等待重试")
-                        if _jump_to_fallback():
-                            needs_captcha = False
-                            retries_429 = 0
-                            continue
+                    # 1113「无余额/无资源包」是永久态，判定用业务码精确解析 +
+                    # 官方文案（裸子串 "1113" 会撞 20 位 logid，3009 同款教训）。
+                    # 通道感知：Plan 通道 = 套餐额度耗尽 → 标 EXHAUSTED（不标的话
+                    # 选号每个请求都重选重探，2026-11-11 线上实证 151 次白烧）；
+                    # Key 通道 = 该 Key 无资源包（Key 冷却记忆，账号不标态——
+                    # Plan 可能仍在）。原地等待毫无意义，只会吊死客户端。
+                    body_code = business_error.business_code(_safe_json(text))
+                    if body_code == constants.NO_BALANCE_BUSINESS_CODE or \
+                            "insufficient balance" in text.lower():
+                        account.record_result(False, "429 1113 无余额，跳过等待重试")
+                        if channel == "zai":
+                            _mark(account, Status.EXHAUSTED, "429 1113 无余额（套餐额度耗尽）")
+                            _spawn_bg(_safe_refresh(account))
+                            logs.warn(
+                                req_id,
+                                f"账号 {account.name} 429 为 1113 无余额（Plan），标记额度耗尽并换号",
+                            )
+                        else:
+                            _key_no_balance[account.id] = time.time() + settings.KEY_NO_BALANCE_COOLDOWN
+                            logs.warn(
+                                req_id,
+                                f"账号 {account.name} 429 为 1113 无余额（Key），"
+                                f"冷却 {settings.KEY_NO_BALANCE_COOLDOWN}s 并换号",
+                            )
                         return _NEXT_ACCOUNT
                     # 1302/1303「真限流」（Z.ai 频控，magpie 同源实证）：与并发争用
                     # 相反，继续原地重试只会加重——账号休息 RATE_LIMIT_COOLDOWN 秒
