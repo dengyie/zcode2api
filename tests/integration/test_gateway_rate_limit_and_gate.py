@@ -873,3 +873,107 @@ class TestPoolWindowGate:
         ]}]
         v = acc.next_window_start()
         assert v is not None and abs(v - (now + 9000)) < 1, v  # 跳过死窗口取健康的
+
+
+@pytest.mark.integration
+class TestPlanModelExhaust:
+    """模型级额度耗尽冷却（plan_guard，2.7.29）：（账号，模型）粒度跳号。
+
+    线上实证：GLM-5.3 旗舰上游 1005 exceed quota limit 时同号 Flash 窗口仍有
+    2.9 亿——点名单一模型的请求不该把全池每号都撞一遍必然失败的 1005。
+    """
+
+    # mock 的 sequences 按凭证前 16 位累计，每个用例独立凭证
+    _JWT_ME1 = "hMe1.eyJzdWIiOiJ4In0.sig"
+    _JWT_ME2 = "hMe2.eyJzdWIiOiJ4In0.sig"
+    _JWT_ME3 = "hMe3.eyJzdWIiOiJ4In0.sig"
+
+    async def _no_refresh(self, monkeypatch):
+        from app.routes import gateway as gw
+
+        async def _stub(account):
+            return None
+
+        monkeypatch.setattr(gw, "_safe_refresh", _stub)
+
+    async def test_flagship_1005_marks_cooling_next_request_skips(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """A 号旗舰 1005 → plan_guard 记（A, GLM-5.3）；账号被 billing 刷新救活
+        （ACTIVE）但旗舰仍冷却时，第二个同模型请求跳过 A 不再撞 1005。"""
+        client, mock = gateway_client
+        from app import plan_guard
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_ME1, name="a-me1")
+        mock.state.sequences[self._JWT_ME1[:16]] = ["quota_exhausted_200"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503  # 单号池，耗尽后无号
+        assert plan_guard.cooling(acc.id, "GLM-5.3")  # 模型级记忆已打点
+
+        # billing 刷新把号救回 ACTIVE（窗口恢复的号），但旗舰 1005 冷却仍在 TTL 内
+        acc.status = Status.ACTIVE
+        acc.quota = {"GLM-5.3-Flash": {"remaining": 100, "expires_at": time.time() + 3600}}
+        acc.quota_verified_at = time.time()
+        fresh_app.update_account(acc)
+
+        # 同模型再请求：A 被模型级冷却跳过（日志可见「额度耗尽冷却中，跳过」）→ 503
+        before = len(mock.state.calls)
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res1.status_code == 503
+        assert len(_paths(mock, before)) == 0  # A 零上游流量——没撞第二次 1005
+
+        # Flash（异模型）请求：不连坐，A 被正常选中并成功
+        mock.state.sequences[self._JWT_ME1[:16]] = ["ok"]
+        before2 = len(mock.state.calls)
+        res2 = await client.post("/v1/messages",
+                                 json={**_MSG_BODY, "model": "GLM-5.3-Flash"})
+        assert res2.status_code == 200
+        assert len(_paths(mock, before2)) == 1  # Flash 走到了 A 的 Plan 通道
+
+    async def test_other_model_not_contaminated(self, gateway_client, fresh_app, monkeypatch):
+        """A 号旗舰 1005 冷却中（账号已被救活 ACTIVE），点名 Flash（异模型）不连坐。"""
+        client, mock = gateway_client
+        from app import plan_guard
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_ME3, name="a-me3")
+        mock.state.sequences[self._JWT_ME3[:16]] = ["quota_exhausted_200", "ok"]
+
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)  # 旗舰撞 1005
+        assert res1.status_code == 503
+        assert plan_guard.cooling(acc.id, "GLM-5.3")
+
+        # billing 刷新救回 ACTIVE（Flash 窗口在账），旗舰冷却仍在
+        acc.status = Status.ACTIVE
+        acc.quota = {"GLM-5.3-Flash": {"remaining": 100, "expires_at": time.time() + 3600}}
+        acc.quota_verified_at = time.time()
+        fresh_app.update_account(acc)
+
+        res2 = await client.post("/v1/messages",
+                                 json={**_MSG_BODY, "model": "GLM-5.3-Flash"})
+        assert res2.status_code == 200  # Flash 不受旗舰冷却影响，A 被选中
+        assert not plan_guard.cooling(acc.id, "GLM-5.3-Flash")
+
+    async def test_billing_recovery_clears_cooling(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """quota.fetch_quota 实查到可用窗口 → 整号清除模型冷却。"""
+        client, mock = gateway_client
+        from app import plan_guard
+
+        acc_id = "acct-x"
+        plan_guard.note(acc_id, "GLM-5.3", time.time() + 3600)
+        assert plan_guard.cooling(acc_id, "GLM-5.3")
+        plan_guard.clear_account(acc_id)
+        assert not plan_guard.cooling(acc_id, "GLM-5.3")
+
+    async def test_ttl_expiry_reprobes(self, monkeypatch):
+        """TTL 到期自动摘除（自然重探），不等 billing。"""
+        from app import plan_guard
+
+        plan_guard.note("acct-y", "GLM-5.3", time.time() - 1)  # 已过期
+        assert not plan_guard.cooling("acct-y", "GLM-5.3")

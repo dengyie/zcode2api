@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from .. import body_transform, business_error, constants, egress, logs, reqlog, settings
+from .. import body_transform, business_error, constants, egress, logs, plan_guard, reqlog, settings
 from ..affinity import affinity_manager, extract_context_key
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
@@ -614,6 +614,14 @@ async def _dispatch(req_id, body, incoming_headers, provider):
             # 依旧有界重探）。
             if _key_no_balance_cooling(account.id) and not account.uses_plan_channel():
                 logs.warn(req_id, f"账号 {account.name} Key 无资源包冷却中，跳过")
+                continue
+
+            # 模型级额度耗尽冷却跳号（2.7.29）：该号在本模型上已确认 1005/1113，
+            # 再选它只会重演一次必然失败的 1005（同满载跳过，不计 attempts）。
+            # 粒度是（账号，模型）——同号其它模型额度独立，不连坐；TTL 到期或
+            # billing 刷新确认有可用窗口即恢复重探。
+            if plan_guard.cooling(account.id, str(body.get("model") or "")):
+                logs.warn(req_id, f"账号 {account.name} 模型 {body.get('model')} 额度耗尽冷却中，跳过")
                 continue
 
             slot_box: list[str | None] = [None]
@@ -1321,6 +1329,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             _mark(account, Status.EXHAUSTED, "额度已用完")
                         _spawn_bg(_safe_refresh(account))
                         _note_pool_exhausted(account)
+                        # 模型级冷却：Plan 通道确认耗尽的（账号，模型）组合记一笔，
+                        # 后续点名同模型的请求直接跳号（不撞必然的 1005）；同号
+                        # 其它模型不受影响（额度独立账本，2.7.29）。
+                        if channel == "zai" and model_name and model_name != "-":
+                            plan_guard.note(
+                                account.id, model_name,
+                                reset_ts or (time.time() + settings.PLAN_MODEL_EXHAUST_COOLDOWN),
+                            )
                     logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
                     return _NEXT_ACCOUNT
 
@@ -1360,6 +1376,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                             _mark(account, Status.EXHAUSTED, "429 1113 无余额（套餐额度耗尽）")
                             _spawn_bg(_safe_refresh(account))
                             _note_pool_exhausted(account)
+                            # 模型级冷却同步打点（同 1005 分支口径）
+                            if model_name and model_name != "-":
+                                plan_guard.note(
+                                    account.id, model_name,
+                                    time.time() + settings.PLAN_MODEL_EXHAUST_COOLDOWN,
+                                )
                             logs.warn(
                                 req_id,
                                 f"账号 {account.name} 429 为 1113 无余额（Plan），标记额度耗尽并换号",

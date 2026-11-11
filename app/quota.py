@@ -259,6 +259,11 @@ async def fetch_quota(account: Account) -> dict:
         # 放在状态机之外——闸门是进程级状态，不与单账号状态耦合（2026-11-12）。
         if has_daily or has_bonus:
             gate.clear_pool_hold()
+            # 模型级额度耗尽冷却整号清除（2.7.29）：billing 实查拿到该号账本，
+            # 「（账号，模型）已确认 1005」的前提被推翻——避免冷却记忆比事实
+            # 活得久（TTL 是兜底，这里是主动解除）。
+            from .plan_guard import clear_account as _pg_clear
+            _pg_clear(account.id)
     elif errors:
         # billing 回了业务错误、但没拿到任何窗口：**不据此判死**。
         # 上游对「体验套餐/新号」的 billing 支持并不一致（老实证：billing 全空
