@@ -179,11 +179,10 @@ async function solveOnce(executablePath, proxy, scene, region, prefix) {
   chromePid = browser.process() ? browser.process().pid : null;
   const stopWatchdog = oomWatchdog(browser.process() ? browser.process().pid : process.pid);
   try {
-    const page = await browser.newPage();
-    await page.setUserAgent(UA, {
-      architecture: "x86", bitness: "64", mobile: false, model: "",
-      platform: "Windows", platformVersion: "10.0.0", wow64: false,
-    });
+    // 复用 launch 自带的 about:blank 目标：Target.createTarget 在小内存 LXC
+    // + CDP 下实测 ~50% 概率 Target closed，复用缺省页规避该操作（2026-11-11 排查）
+    const page = (await browser.pages())[0];
+    await page.setUserAgent(UA);
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
       Object.defineProperty(navigator, "languages", { get: () => ["zh-CN", "zh", "en"] });
@@ -195,7 +194,12 @@ async function solveOnce(executablePath, proxy, scene, region, prefix) {
     dbg("SDK ready");
 
     return await page.evaluate(async (scene, region, prefix) => {
-      window.AliyunCaptchaConfig = { region, prefix };
+      // region=cn/空 不设 AliyunCaptchaConfig：SDK 缺省即 CN 端点；且实测显式
+      // 配置会走完整 UI 验证流，被风控拒（F001）后 SDK 弹 popup 兜底，触发
+      // --single-process 下 Chrome 的 FATAL:check.cc NOTREACHED 崩溃（整个
+      // 浏览器死，2026-11-11 dumpio 实证）。不设配置走降级无痕路径稳定出参。
+      // sgp（代理出口）需显式配置切新加坡端点。
+      if (region && region !== "cn") window.AliyunCaptchaConfig = { region, prefix };
       return await new Promise((resolve) => {
         let done = false;
         const finish = (v) => { if (!done) { done = true; resolve(v || null); } };
