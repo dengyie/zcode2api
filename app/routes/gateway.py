@@ -567,15 +567,18 @@ async def _dispatch(req_id, body, incoming_headers, provider):
     attempts = 0
     providers = _provider_chain(provider)
 
-    # 套餐窗口闸门（pool_hold）入口快速失败：全池确认枯竭且**没有任何 Key 回退
-    # 可用**时直接 429，不再白走 5 轮账号×验证码检查（2026-11-12 线上实证：真空
-    # 期每请求白撞 5 轮、247 次全失败）。有 Key 的号不在此拦——Key 花自己的
-    # 余额，与套餐窗口无关，交给正常循环走 _try_account 的「gate 拒→切 Key」。
+    # 套餐窗口闸门（pool_hold）入口快速失败：全池确认枯竭且**没有任何可用的
+    # Key 回退归宿**时直接 429，不再白走 5 轮账号×验证码检查（2026-11-12 线上
+    # 实证：真空期每请求白撞 5 轮、247 次全失败）。「可用归宿」= JWT 号持有
+    # Key **且** 该 Key 不在 1113 无资源包冷却中——只看「持有」会把 Key 也死透
+    # 的混合池放行进循环，最终仍落到裸 503（无 Retry-After，review P2 #1）。
+    # 有真归宿的号不在此拦：Key 花自己的余额，与套餐窗口无关，交给正常循环走
+    # _try_account 的「gate 拒→切 Key」。
     if (
         "zai" in providers
         and gate.refusal_reason() == "pool_hold"
         and not any(
-            a.has_apikey_fallback()
+            a.has_apikey_fallback() and not _key_no_balance_cooling(a.id)
             for a in store.list_accounts("zai")
             if a.mode == "jwt"
         )

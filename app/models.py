@@ -296,15 +296,23 @@ class Account:
         return self._future_effective_at(now)
 
     def _future_effective_at(self, now: float) -> float:
-        """plans[] entitlements 里未来的 effective_at 最小值；无则 -1。"""
+        """plans[] entitlements 里未来的 effective_at 最小值；无则 -1。
+
+        跳过「起点在未来但已注定死亡」的脏 entitlement（ends_at 早于起点）：
+        hold 等到这种窗口点是白等，到期自然重探反而更诚实。
+        """
         starts = []
         for plan in [self.plan, *(self.plans or [])]:
             if not isinstance(plan, dict):
                 continue
             for e in plan.get("entitlements") or []:
                 eff = expires_epoch(e.get("effective_at"))
-                if eff and eff > now:
-                    starts.append(eff)
+                if not eff or eff <= now:
+                    continue
+                ends = expires_epoch(e.get("ends_at") or e.get("expires_at"))
+                if ends is not None and ends <= eff:
+                    continue
+                starts.append(eff)
         return min(starts) if starts else -1.0
 
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:

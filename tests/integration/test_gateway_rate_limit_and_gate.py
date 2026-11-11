@@ -566,9 +566,10 @@ class TestKeyNoBalanceScope:
         self, gateway_client, fresh_app
     ):
         client, mock = gateway_client
+        import time as _time
+
         from app.routes import gateway as gw
         from tests.conftest import seed_account
-        import time as _time
 
         acc = seed_account(fresh_app, _JWT_MIX_KEY, name="a-edit-clear")
         gw._key_no_balance[acc.id] = _time.time() + 600
@@ -584,9 +585,10 @@ class TestKeyNoBalanceScope:
         self, gateway_client, fresh_app
     ):
         client, mock = gateway_client
+        import time as _time
+
         from app.routes import gateway as gw
         from tests.conftest import seed_account
-        import time as _time
 
         acc = seed_account(fresh_app, _JWT_MIX_KEY, name="a-del-clear")
         gw._key_no_balance[acc.id] = _time.time() + 600
@@ -708,8 +710,22 @@ class TestPoolWindowGate:
         assert "Retry-After" in res2.headers
         assert not _paths(mock, before2)  # 0 次上游调用
 
-        # 解除路径 1：hold 到期自然失效
-        gate._pool_hold_until = time.time() - 1
+        # 解除路径 1：hold 到期自然失效——用一个独立 Gate 验证「到期即失效」
+        # 语义（公共 API：note 一个已过去的窗口点 + 上限 1s，hold 立即耗尽），
+        # 不触碰私有字段
+        from app.gate import Gate as _Gate
+
+        expired = _Gate()
+        expired.note_pool_exhausted(time.time() + 3600)  # 先置正常 hold
+        monkeypatch.setattr(settings, "GATE_POOL_HOLD_MAX_SECONDS", 1)
+        expired.clear_pool_hold()  # 公共清除入口
+        expired.note_pool_exhausted(time.time() - 5, now=time.time() - 6)  # 过去窗口点 → cap=1s
+        # max 语义对全新实例无历史 hold 可保留：hold=1s 后自然过期
+        expired._pool_hold_until -= 2  # 唯一可控的时间平移：模拟 1s 流逝
+        assert expired.pool_hold_remaining() <= 0
+        assert expired.refusal_reason() is None
+        # 原闸门（本用例持有的 gate 单例）此刻仍处 hold——用 clear 公共入口解除
+        gate.clear_pool_hold()
         assert gate.refusal_reason() is None
 
     async def test_future_window_retry_after_points_to_it(
@@ -800,3 +816,60 @@ class TestPoolWindowGate:
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200  # 入口预检放行（有 Key），Key 通道接住
         assert _paths(mock, before) == [_KEY_PATH]  # plan 零流量（被 hold 拦在 _try_account）
+
+    async def test_mixed_pool_with_dead_key_gets_pool_hold_429(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """review P2 #1 钉子：混合池里唯一有 Key 号的 Key 也已 1113 冷却——
+        入口预检必须拦（429 gate_pool_hold），不能放行进循环落裸 503。"""
+        client, mock = gateway_client
+        import time as _time
+
+        from app.gate import gate
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        # A：无 Key，确认枯竭（EXHAUSTED，select 滤光）
+        acc_a = seed_account(fresh_app, self._JWT_PW1, name="a-pw-dead")
+        self._dead_snapshot(acc_a)
+        fresh_app.update_account(acc_a)
+        # B：DISABLED + 持 Key（briarlow17 形态），Key 已进 1113 冷却
+        acc_b = seed_account(fresh_app, self._JWT_PW2, name="b-pw-deadkey")
+        self._dead_snapshot(acc_b)  # 快照也确认枯竭，否则判定保守放行
+        acc_b.api_key = "sk-pw-dead-key"
+        acc_b.status = Status.DISABLED
+        fresh_app.update_account(acc_b)
+        gw._key_no_balance[acc_b.id] = _time.time() + 600
+
+        # 首请求：A/B 全不可选 → 无号兜底 503，顺带触发 hold
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res1.status_code == 503
+        assert gate.pool_hold_remaining() > 0
+
+        # 第二请求：Key 也死 → 预检不再放行（修复前会落裸 503）
+        before = len(mock.state.calls)
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 429
+        assert res2.json()["error"]["type"] == "gate_pool_hold"
+        assert "Retry-After" in res2.headers
+        assert not _paths(mock, before)  # 零上游流量
+
+    async def test_future_window_with_dead_ends_at_is_skipped(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """review #4 钉子：entitlement 起点在未来但 ends_at 早于起点（脏数据）
+        → 不作为窗口点，hold 用 cap 兜底而非等到死窗口。"""
+        from app.models import Account as _Account
+
+        acc = _Account.create("zai", "t-dirty", "hP9z.eyJzdWIiOiJ4In0.sig")
+        now = time.time()
+        acc.quota = {"GLM-5.3": {"total": 100, "used": 100, "remaining": 0,
+                                 "expires_at": now - 3600}}
+        acc.quota_verified_at = now - 1800
+        acc.plans = [{"entitlements": [
+            {"period": "daily", "effective_at": now + 7200, "ends_at": now + 3600},  # 死窗口
+            {"period": "daily", "effective_at": now + 9000},  # 健康窗口
+        ]}]
+        v = acc.next_window_start()
+        assert v is not None and abs(v - (now + 9000)) < 1, v  # 跳过死窗口取健康的

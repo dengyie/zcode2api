@@ -111,6 +111,7 @@ class TestToolSearchAlias:
     def test_build_request_is_sole_apply_site(self):
         """别名唯一应用点 = agent.build_request（全通道）；transform_body 不再重复。"""
         import inspect
+
         from app.agent import build_request
 
         assert "apply_tool_search_alias" in inspect.getsource(build_request)

@@ -14,7 +14,12 @@ import httpx
 
 from . import business_error, constants, logs, settings
 from .gate import gate
+
+# 一次性赠送授权判定收敛到 models（2026-11-12 review #2）：同一上游结构的
+# 同一判定不允许两份实现漂移——models 版经 expires_epoch 归一（兼容 ISO8601/
+# 字符串 epoch），原本地实现只做裸数字比较，遇到非 epoch 形态会静默失效。
 from .models import Account, Status, expires_epoch, window_expired, window_usable
+from .models import _plan_bonus_active as _bonus_active
 from .store import store
 
 _DEVICE_MID: str | None = None
@@ -76,21 +81,6 @@ def _auth_headers(account: Account) -> dict:
     elif account.api_key:
         headers["x-api-key"] = account.api_key
     return headers
-
-
-def _bonus_active(plan: dict, now: float) -> bool:
-    """plan 是否带有已生效的一次性赠送授权（balance 不含这类额度）。
-
-    用于额度耗尽判定：日窗口用完但赠送池有效时，账号仍有真实可用额度。
-    """
-    for e in (plan or {}).get("entitlements") or []:
-        if e.get("period") != "one_time":
-            continue
-        eff = e.get("effective_at") or 0
-        ends = e.get("ends_at") or e.get("expires_at") or 0
-        if eff and eff <= now and (not ends or now <= ends):
-            return True
-    return False
 
 
 async def fetch_quota(account: Account) -> dict:
