@@ -79,6 +79,22 @@ def window_expired(window: dict, now: float) -> bool:
     return expires_at is not None and expires_at <= now
 
 
+def _plan_bonus_active(plan: dict, now: float) -> bool:
+    """plan 是否带已生效的一次性赠送授权（与 quota._bonus_active 同判定）。
+
+    models 不 import quota（quota 反向依赖 models 会循环），故此处留一份
+    同语义实现；两侧判定字段来自同一上游结构（entitlements one_time）。
+    """
+    for e in (plan or {}).get("entitlements") or []:
+        if e.get("period") != "one_time":
+            continue
+        eff = expires_epoch(e.get("effective_at"))
+        ends = expires_epoch(e.get("ends_at") or e.get("expires_at"))
+        if eff and eff <= now and (ends is None or now <= ends):
+            return True
+    return False
+
+
 def _account_id(name: str) -> str:
     safe = "".join(c if c.isalnum() else "-" for c in (name or "account").lower())
     safe = safe.strip("-")[:32] or "account"
@@ -241,6 +257,55 @@ class Account:
             return True
         verified = self.quota_verified_at
         return bool(verified and verified > max(ends))
+
+    def next_window_start(self, now: float | None = None) -> float | None:
+        """套餐窗口闸门（pool_hold）的单账号判定，返回下一个窗口开始的 epoch。
+
+        口径（2026-11-12，保守优先——绝不误拦）：
+
+        - 返回 ``0.0`` = 账号**当前可用**（有 remaining>0 且未过期的窗口，或
+          已生效的一次性赠送授权）——这个号不参与闸门，有它在就放行；
+        - 返回 ``>0`` = 账号**确认枯竭**：所有窗口都过期/为零，且快照取自最新
+          到期时间之后（``quota_verified_at > max(expires)``，与 quota_expired
+          同一段过期后实查证据），下一个窗口取 plans[] entitlements 里未来的
+          effective_at 最小值；无未来计划返回 -1（有枯竭证据但不知何时恢复）；
+        - 返回 ``None`` = **不可判定**（快照空/陈旧/没有过期后实查）：按未知
+          处理，有这种号在池里就不拦——让它去撞一次上游定生死，宁可白撞
+          一次也不错拦能用请求（quota_expired 同款哲学）。
+        """
+        now = now or time.time()
+        if any(window_usable(w, now) for w in self.quota.values()):
+            return 0.0
+        # 一次性赠送池在 balance 里不出现，但其额度真实可用：有它就不拦
+        plan_now = self.plan or {}
+        if _plan_bonus_active(plan_now, now) or any(
+            _plan_bonus_active(p, now) for p in (self.plans or [])
+        ):
+            return 0.0
+        if not self.quota:
+            return None  # 新号/未刷新 = 未知
+        if not any((w.get("remaining") or 0) > 0 for w in self.quota.values()):
+            # 余额本身归零 = 确定耗尽，与快照新旧无关（quota_expired 同口径）
+            return self._future_effective_at(now)
+        ends = [e for e in (expires_epoch(w.get("expires_at")) for w in self.quota.values()) if e]
+        if not ends:
+            return None
+        verified = self.quota_verified_at
+        if not (verified and verified > max(ends)):
+            return None  # 快照停在上一轮日窗，无资格判死
+        return self._future_effective_at(now)
+
+    def _future_effective_at(self, now: float) -> float:
+        """plans[] entitlements 里未来的 effective_at 最小值；无则 -1。"""
+        starts = []
+        for plan in [self.plan, *(self.plans or [])]:
+            if not isinstance(plan, dict):
+                continue
+            for e in plan.get("entitlements") or []:
+                eff = expires_epoch(e.get("effective_at"))
+                if eff and eff > now:
+                    starts.append(eff)
+        return min(starts) if starts else -1.0
 
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
         """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。

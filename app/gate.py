@@ -9,14 +9,19 @@
 - 单账号并发由 store 的并发槽处理，但进程级没有「总速率 / 总在飞 / 边缘封禁」
   这层保护，风控会把整个出口 IP 上的所有账号一起带走。
 
-本模块只做四件低风险的事，不参与账号选择、不改账号状态机：
+本模块只做五件低风险的事，不参与账号选择、不改账号状态机：
 
 1. 滑动分钟窗口内的 plan 渠道请求预算（0 = 关闭）；
 2. plan 渠道全池在飞上限（0 = 关闭）；
 3. 边缘封禁断路器：观察到 405 封 IP 页面后，全进程暂停 plan 渠道 N 秒；
 4. 忙碌断路器（busy-hold，Magpie BUSY_N/BUSY_HOLD 同款）：3008 在短退避重试
    后**仍然** 3008（真饱和；一次重试就过去的瞬态争用不计）达到阈值，全进程
-   暂停 plan 渠道一段窗口——封禁前先降速，而不是封了再认。
+   暂停 plan 渠道一段窗口——封禁前先降速，而不是封了再认；
+5. 套餐窗口闸门（pool-hold，2026-11-12）：全池账号都有「过期后实查确认枯竭」
+   证据且无未来窗口时，快速拒绝 plan 渠道请求直到下一个已知窗口——套餐真空
+   期（如 09:00 到期 → 19:00 放量）不再让每个请求白撞 5 轮账号×验证码求解。
+   判定口径在 models.Account.next_window_start（保守优先：未知/陈旧一律放行），
+   billing 刷新发现可用窗口即主动解除（quota.fetch_quota）。
 
 api.z.ai / bigmodel 渠道不经过本闸门（key 渠道与 plan 渠道的风险面不同）。
 """
@@ -38,6 +43,10 @@ class Gate:
         self.edge_hits = 0
         self._busy_hits: list[float] = []
         self._busy_until = 0.0
+        # 套餐窗口闸门（pool-hold）：与上面两个 hold 不同，锚的是**墙钟 epoch**
+        # ——它必须与 billing 窗口的 expires_at / effective_at 对时，monotonic
+        # 在这里是错的时钟。到期自动解除 + 额度恢复主动清除（quota.fetch_quota）
+        self._pool_hold_until = 0.0  # wall-clock epoch
 
     # ── 边缘封禁 ──────────────────────────────────────────────────────────
     def edge_remaining(self) -> float:
@@ -77,13 +86,45 @@ class Gate:
             self._busy_until = max(self._busy_until, now + hold)
             self._busy_hits.clear()
 
+    # ── 套餐窗口闸门（pool-hold）──────────────────────────────────────────
+    def pool_hold_remaining(self, now: float | None = None) -> float:
+        return max(0.0, self._pool_hold_until - (now if now is not None else time.time()))
+
+    def note_pool_exhausted(self, next_start: float, now: float | None = None) -> None:
+        """全池确认枯竭后暂停 plan 渠道，直到下一个已知窗口（或上限兜底）。
+
+        next_start 是全池最小的未来 effective_at（epoch 秒）；-1 = 有枯竭证据
+        但不知何时恢复，直接用 GATE_POOL_HOLD_MAX_SECONDS 兜底——宁可早放行
+        重探一次，也不能把恢复后的窗口吊死在本地闸门里。
+        """
+        cap = settings.GATE_POOL_HOLD_MAX_SECONDS
+        if cap <= 0:
+            return
+        now = now if now is not None else time.time()
+        if next_start is not None and next_start > now:
+            hold = min(next_start - now, float(cap))
+        else:
+            hold = float(cap)
+        self._pool_hold_until = max(self._pool_hold_until, now + hold)
+
+    def clear_pool_hold(self) -> None:
+        """billing 刷新发现可用窗口时解除（quota.fetch_quota 恢复分支调用）。"""
+        self._pool_hold_until = 0.0
+
     # ── 准入 ─────────────────────────────────────────────────────────────
     def hold_reason(self) -> str | None:
-        """当前生效的进程级 hold（边缘封禁优先于忙碌断路器）；无则 None。"""
+        """当前生效的进程级 hold；无则 None。
+
+        优先级：边缘封禁 > 忙碌断路器 > 套餐窗口。前两个是异常保护（IP 被封/
+        真饱和），最后一个只是日常真空期的快速失败——都被挡时回异常的那个，
+        Retry-After 才有信息量。
+        """
         if self.edge_remaining() > 0:
             return "edge_hold"
         if self.busy_remaining() > 0:
             return "busy_hold"
+        if self.pool_hold_remaining() > 0:
+            return "pool_hold"
         return None
 
     def _rate_refused(self) -> bool:
@@ -144,6 +185,9 @@ class Gate:
         busy = self.busy_remaining()
         if busy > 0:
             return max(1, math.ceil(busy))
+        pool = self.pool_hold_remaining()
+        if pool > 0:
+            return max(1, math.ceil(pool))
         now = time.monotonic()
         if settings.GATE_RATE_PER_MIN > 0 and self._window_start > 0 and now - self._window_start < 60:
             return max(1, math.ceil(60 - (now - self._window_start)))
@@ -158,6 +202,7 @@ class Gate:
         self.edge_hits = 0
         self._busy_hits = []
         self._busy_until = 0.0
+        self._pool_hold_until = 0.0
 
 
 gate = Gate()

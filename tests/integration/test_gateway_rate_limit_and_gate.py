@@ -601,7 +601,6 @@ class TestKeyNoBalanceScope:
 @pytest.mark.integration
 class TestGateRefusalFailover:
     """闸门拒绝的调度语义（review P2-1）：hold 与账号无关，不得「连坐」有 Key 账号。"""
-
     async def test_mixed_pool_serves_via_key_during_edge_hold(
         self, gateway_client, fresh_app, monkeypatch
     ):
@@ -641,3 +640,163 @@ class TestGateRefusalFailover:
         assert res.json()["error"]["type"] == "gate_edge_hold"
         assert 1 <= int(res.headers["Retry-After"]) <= 30
         assert not _paths(mock, before)  # hold 期零上游流量
+
+
+@pytest.mark.integration
+class TestPoolWindowGate:
+    """套餐窗口闸门（pool-hold，2026-11-12）：真空期快速失败，不白撞 5 轮账号。
+
+    判定口径 = models.Account.next_window_start 的保守语义：
+      - 全池「确认枯竭」（有余额但窗口全过期 + 过期后实查 quota_verified_at >
+        max(expires)，或余额归零）且无未来窗口 → 拦 429 + Retry-After；
+      - 任意一号快照空/陈旧（不可判定）→ 放行（宁可白撞一次也不错拦）；
+      - billing 刷新发现可用窗口 → 自动解除。
+    """
+
+    # mock 的 sequences 按凭证前 16 位累计，每个用例独立凭证
+    _JWT_PW1 = "hP1w.eyJzdWIiOiJ4In0.sig"
+    _JWT_PW2 = "hP2w.eyJzdWIiOiJ4In0.sig"
+    _JWT_PW3 = "hP3w.eyJzdWIiOiJ4In0.sig"
+
+    async def _no_refresh(self, monkeypatch):
+        from app.routes import gateway as gw
+
+        async def _stub(account):
+            return None
+
+        monkeypatch.setattr(gw, "_safe_refresh", _stub)
+
+    def _dead_snapshot(self, acc, *, verified_offset: float = -1800.0,
+                       future_plans: bool = False, now: float | None = None) -> None:
+        """把账号置成「确认枯竭」形态：窗口过期 + 余额有量 + 过期后实查证据。"""
+        now = now or time.time()
+        acc.quota = {"GLM-5.3": {"total": 100, "used": 100, "remaining": 5,
+                                 "expires_at": now - 3600}}
+        acc.quota_verified_at = now + verified_offset  # 默认过期后 30min 实查
+        if future_plans:
+            acc.plans = [{"entitlements": [
+                {"period": "daily", "effective_at": now + 3600, "ends_at": now + 90000}]}]
+        else:
+            acc.plans = []
+
+    async def test_confirmed_exhaustion_blocks_with_retry_after(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """全池确认枯竭 → 触发 hold，第二个请求入口快速 429 + Retry-After，零上游流量。"""
+        client, mock = gateway_client
+        from app.gate import gate
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_PW1, name="a-pw1")
+        self._dead_snapshot(acc)
+        fresh_app.update_account(acc)
+
+        # 第一请求：EXHAUSTED 号不可选 → 无号 503；exhaust 分支顺带扫池触发 hold
+        before = len(mock.state.calls)
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res1.status_code == 503
+        assert not _paths(mock, before)
+        assert gate.pool_hold_remaining() > 0  # 闸门已被 exhaust 分支触发
+
+        # 第二请求：入口快速失败，gate_pool_hold 语义
+        before2 = len(mock.state.calls)
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 429
+        body2 = res2.json()["error"]
+        assert body2["type"] == "gate_pool_hold"
+        assert "Retry-After" in res2.headers
+        assert not _paths(mock, before2)  # 0 次上游调用
+
+        # 解除路径 1：hold 到期自然失效
+        gate._pool_hold_until = time.time() - 1
+        assert gate.refusal_reason() is None
+
+    async def test_future_window_retry_after_points_to_it(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """plans[] 带未来 effective_at：Retry-After 指向窗口点（cap 内）。"""
+        client, mock = gateway_client
+        from app.gate import gate
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_PW2, name="a-pw2")
+        self._dead_snapshot(acc, future_plans=True)  # 未来 1h 有新窗口
+        fresh_app.update_account(acc)
+
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res1.status_code == 503
+        assert gate.pool_hold_remaining() > 3000  # hold 至未来窗口点（~3600s）
+
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 429
+        wait = int(res2.headers["Retry-After"])
+        assert 3500 <= wait <= 3600  # 指向下一个已知生效点
+
+    async def test_stale_snapshot_does_not_block(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """快照陈旧（quota_verified_at < expires）= 不可判定 → 绝不拦（保守优先）。"""
+        client, mock = gateway_client
+        from app.gate import gate
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_PW3, name="a-pw3")
+        now = time.time()
+        # 有余额但窗口过期，实查时间**早于**过期点 → 无资格判死
+        acc.quota = {"GLM-5.3": {"total": 100, "used": 100, "remaining": 5,
+                                 "expires_at": now - 3600}}
+        acc.quota_verified_at = now - 7200
+        acc.status = Status.EXHAUSTED  # gateway 已把它标死（本请求真实撞过 1113）
+        fresh_app.update_account(acc)
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        assert gate.pool_hold_remaining() == 0  # 闸门未触发：陈旧快照不放证据
+
+    async def test_quota_recovery_clears_hold(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """hold 期间 billing 刷新发现可用窗口 → 自动解除，后续请求放行。"""
+        client, mock = gateway_client
+        from app.gate import gate
+        from app.quota import fetch_quota
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_PW1, name="a-pw-recover")
+        self._dead_snapshot(acc, future_plans=True)
+        fresh_app.update_account(acc)
+        gate.note_pool_exhausted(time.time() + 3600)  # 模拟已触发 hold
+
+        # billing 刷新回「有量未过期」→ fetch_quota 恢复分支清 hold
+        mock.state.sequences[self._JWT_PW1[:16]] = ["ok"]
+        result = await fetch_quota(acc)
+        assert "error" not in result
+        assert gate.pool_hold_remaining() == 0
+        assert gate.refusal_reason() is None
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.ACTIVE  # 顺带确认状态机恢复
+
+    async def test_apikey_fallback_pool_not_blocked(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """hold 生效但池内有 Key 回退（风控禁用形态）：入口预检不拦，Key 通道照常服务。"""
+        client, mock = gateway_client
+        from app.gate import gate
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_PW2, name="a-pw-keyed")
+        acc.api_key = "sk-pw-fallback-key"
+        acc.status = Status.DISABLED  # plan 死（briarlow17 形态），仅 Key 可用
+        fresh_app.update_account(acc)
+        gate.note_pool_exhausted(time.time() + 3600)  # 模拟 plan 渠道已处 hold
+        mock.state.sequences["sk-pw-fallback-key"[:16]] = ["ok"]
+
+        before = len(mock.state.calls)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200  # 入口预检放行（有 Key），Key 通道接住
+        assert _paths(mock, before) == [_KEY_PATH]  # plan 零流量（被 hold 拦在 _try_account）

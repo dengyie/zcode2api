@@ -567,6 +567,29 @@ async def _dispatch(req_id, body, incoming_headers, provider):
     attempts = 0
     providers = _provider_chain(provider)
 
+    # 套餐窗口闸门（pool_hold）入口快速失败：全池确认枯竭且**没有任何 Key 回退
+    # 可用**时直接 429，不再白走 5 轮账号×验证码检查（2026-11-12 线上实证：真空
+    # 期每请求白撞 5 轮、247 次全失败）。有 Key 的号不在此拦——Key 花自己的
+    # 余额，与套餐窗口无关，交给正常循环走 _try_account 的「gate 拒→切 Key」。
+    if (
+        "zai" in providers
+        and gate.refusal_reason() == "pool_hold"
+        and not any(
+            a.has_apikey_fallback()
+            for a in store.list_accounts("zai")
+            if a.mode == "jwt"
+        )
+    ):
+        wait = gate.retry_after()
+        logs.req_err(req_id, f"套餐窗口闸门 pool_hold，入口快速失败（Retry-After {wait}s）")
+        reqlog.finish_error(req_id, "gate_pool_hold", status=429)
+        return JSONResponse(
+            {"error": {"message": f"套餐窗口真空期（全池额度耗尽），请 {wait}s 后重试",
+                       "type": "gate_pool_hold"}},
+            status_code=429,
+            headers={"Retry-After": str(wait)},
+        )
+
     for pi, active_provider in enumerate(providers):
         while attempts < MAX_ACCOUNT_ATTEMPTS:
             account = store.select(
@@ -644,14 +667,15 @@ async def _dispatch(req_id, body, incoming_headers, provider):
                 f"{providers[pi + 1]}",
             )
 
-    # 进程级闸门拒绝（边缘封禁/忙碌断路器/分钟预算）期间的兜底：所有 plan 账号
-    # 都被本地拒绝到这里，必须带真实原因与 Retry-After，而不是误导性的
-    # 「无可用账号」。rate_limit/busy_hold 是限流语义回 429（客户端按限流退避
-    # 重试，magpie 同款），edge_hold（IP 被封）回 503。
+    # 进程级闸门拒绝（边缘封禁/忙碌断路器/分钟预算/套餐窗口）期间的兜底：所有
+    # plan 账号都被本地拒绝到这里，必须带真实原因与 Retry-After，而不是误导性的
+    # 「无可用账号」。rate_limit/busy_hold/pool_hold 是限流语义回 429（客户端按
+    # 限流退避重试，magpie 同款；pool_hold 的 Retry-After 指向下一个套餐窗口），
+    # edge_hold（IP 被封）回 503。
     reason = gate.refusal_reason()
     if reason:
         wait = gate.retry_after()
-        status = 429 if reason in ("rate_limit", "busy_hold") else 503
+        status = 429 if reason in ("rate_limit", "busy_hold", "pool_hold") else 503
         logs.req_err(req_id, f"闸门 {reason}，拒绝本请求（Retry-After {wait}s）")
         reqlog.finish_error(req_id, f"gate_{reason}", status=status)
         return JSONResponse(
@@ -662,6 +686,9 @@ async def _dispatch(req_id, body, incoming_headers, provider):
         )
 
     logs.req_err(req_id, "无可用账号 / 额度均已耗尽 / 并发已满")
+    # 池里全是「已标 EXHAUSTED」的号时走不到上面 exhaust 分支（select 先滤掉），
+    # 套餐窗口闸门在这里补触发——重启后真空期首请求也能进入快速失败闭环
+    _note_pool_exhausted(trigger=None)
     reqlog.finish_error(req_id, "无可用账号 / 额度均已耗尽 / 并发已满", status=503)
     return JSONResponse(
         {"error": {"message": "所有账号均不可用、额度已用完或并发已满，请在后台检查账号状态", "type": "no_available_account"}},
@@ -776,6 +803,51 @@ def _key_no_balance_cooling(account_id: str, now: float | None = None) -> bool:
         _key_no_balance.pop(account_id, None)  # 到期自然重探
         return False
     return True
+
+
+def _note_pool_exhausted(trigger: Account | None = None) -> None:
+    """账号 Plan 通道判额度耗尽后，评估是否触发套餐窗口闸门（pool_hold）。
+
+    调用时机两处：① _try_account 的 exhaust 分支（本请求真实撞到 1113/额度
+    耗尽，trigger=该账号）；② _dispatch 的「无可用账号」兜底（全池已被标
+    EXHAUSTED、select 直接滤光，见下）。判定口径（保守优先，绝不误拦——
+    2026-11-12 线上 247 次真空期白撞教训）：只有当**全部** JWT 账号都返回
+    「确认枯竭」（每个号都有过期后实查证据 quota_verified_at > 最新
+    expires_at，且无当前可用窗口）时才拦；任意一号是可用（0.0）或不可判定
+    （None——快照空/陈旧/新号）都不拦。next_start 取全池最小未来
+    effective_at；无未来窗口给 -1，由 gate 用上限兜底。
+
+    额度恢复由 quota.fetch_quota 的可用窗口分支主动 clear_pool_hold，形成
+    「拦截 → 后台刷新确认 → 恢复即解」闭环。
+    """
+    accounts = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
+    if not accounts:
+        return
+    verdicts = []
+    for a in accounts:
+        verdict = a.next_window_start()
+        if verdict is None:
+            return  # 任一号不可判定 → 放行，让真实请求去定生死
+        verdicts.append(verdict)
+    if any(v == 0.0 for v in verdicts):
+        return  # 任一号当前可用 → 不拦（-1.0 = 枯竭但无未来窗口，照拦）
+    future = [v for v in verdicts if v > 0]
+    next_start = min(future) if future else -1.0
+    now = time.time()
+    if gate.pool_hold_remaining(now) > 0:
+        return  # 已在 hold 中：刷新到更早的窗口点才有意义，否则不动
+    gate.note_pool_exhausted(next_start, now=now)
+    when = (
+        time.strftime("%m-%d %H:%M", time.localtime(next_start))
+        if next_start > 0
+        else f"未知（{settings.GATE_POOL_HOLD_MAX_SECONDS}s 后重探）"
+    )
+    trigger_note = f"（{trigger.name} 判额度耗尽）" if trigger else ""
+    logs.warn(
+        "gate",
+        f"套餐窗口闸门触发：全池 {len(accounts)} 号确认枯竭{trigger_note}，"
+        f"暂停 plan 渠道至 {when}",
+    )
 
 
 def _limit() -> int:
@@ -1245,6 +1317,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         else:
                             _mark(account, Status.EXHAUSTED, "额度已用完")
                         _spawn_bg(_safe_refresh(account))
+                        _note_pool_exhausted(account)
                     logs.warn(req_id, f"账号 {account.name} 额度用完，切换下一个")
                     return _NEXT_ACCOUNT
 
@@ -1283,6 +1356,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         if channel == "zai":
                             _mark(account, Status.EXHAUSTED, "429 1113 无余额（套餐额度耗尽）")
                             _spawn_bg(_safe_refresh(account))
+                            _note_pool_exhausted(account)
                             logs.warn(
                                 req_id,
                                 f"账号 {account.name} 429 为 1113 无余额（Plan），标记额度耗尽并换号",

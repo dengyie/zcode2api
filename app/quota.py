@@ -13,6 +13,7 @@ import uuid
 import httpx
 
 from . import business_error, constants, logs, settings
+from .gate import gate
 from .models import Account, Status, expires_epoch, window_expired, window_usable
 from .store import store
 
@@ -263,6 +264,11 @@ async def fetch_quota(account: Account) -> dict:
                 account.status = Status.ACTIVE
                 account.last_error = None
                 account.cooling_until = None
+        # 套餐窗口闸门解除：任一号实查到可用窗口（哪怕它本来状态就健康，如
+        # hold 期间未被消息请求碰过的号），全池「确认枯竭」的前提即被推翻。
+        # 放在状态机之外——闸门是进程级状态，不与单账号状态耦合（2026-11-12）。
+        if has_daily or has_bonus:
+            gate.clear_pool_hold()
     elif errors:
         # billing 回了业务错误、但没拿到任何窗口：**不据此判死**。
         # 上游对「体验套餐/新号」的 billing 支持并不一致（老实证：billing 全空
