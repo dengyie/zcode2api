@@ -150,10 +150,13 @@ async def set_enabled(account_id: str, payload: dict = Body(...)):
     enabled = bool(payload.get("enabled", True))
     store.set_enabled(acc.provider, account_id, enabled)
     if enabled:
-        # 人工启用 = 明确要求立即重试：清掉 Key 无资源包（1113）的选号冷却
+        # 人工启用 = 明确要求立即重试：清掉 Key 无资源包（1113）与
+        # 模型级额度耗尽（1005）的选号冷却
+        from ..plan_guard import clear_account as _pg_clear_account
         from .gateway import clear_key_no_balance
 
         clear_key_no_balance(account_id)
+        _pg_clear_account(account_id)
     return {"ok": True}
 
 

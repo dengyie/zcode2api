@@ -887,6 +887,8 @@ class TestPlanModelExhaust:
     _JWT_ME1 = "hMe1.eyJzdWIiOiJ4In0.sig"
     _JWT_ME2 = "hMe2.eyJzdWIiOiJ4In0.sig"
     _JWT_ME3 = "hMe3.eyJzdWIiOiJ4In0.sig"
+    _JWT_ME4 = "hMe4.eyJzdWIiOiJ4In0.sig"
+    _JWT_ME5 = "hMe5.eyJzdWIiOiJ4In0.sig"
 
     async def _no_refresh(self, monkeypatch):
         from app.routes import gateway as gw
@@ -961,15 +963,87 @@ class TestPlanModelExhaust:
     async def test_billing_recovery_clears_cooling(
         self, gateway_client, fresh_app, monkeypatch
     ):
-        """quota.fetch_quota 实查到可用窗口 → 整号清除模型冷却。"""
+        """quota.fetch_quota 实查到可用窗口 → 定向清除该模型的冷却（2.7.30）。
+
+        接线测试：走真实 fetch_quota（不 stub _safe_refresh），mock 默认 balance
+        返回 GLM-5.3 可用窗口 → 断言（A, GLM-5.3）冷却被清。"""
+        client, mock = gateway_client
+        from app import plan_guard, quota
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)  # messages 路径不刷，fetch_quota 由本用例直调
+        acc = seed_account(fresh_app, self._JWT_ME2, name="a-me2")
+        plan_guard.note(acc.id, "GLM-5.3", time.time() + 3600)
+        assert plan_guard.cooling(acc.id, "GLM-5.3")
+
+        await quota.fetch_quota(acc)  # mock 默认 GLM-5.3 remaining=2e6 未过期
+
+        assert not plan_guard.cooling(acc.id, "GLM-5.3")  # billing 事实推翻冷却
+
+    async def test_billing_recovery_does_not_clear_other_model(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """定向清除不连坐（review P2 根因）：billing 账本里不存在的模型，冷却
+        原样保留——billing 只能证明「在账且可用」的模型恢复了，证明不了其它
+        模型没耗尽。否则旗舰冷却会被 Flash 窗口反复洗掉，1005 重探从
+        1 次/30min 退化成 1 次/60s（billing 去抖间隔）。"""
+        client, mock = gateway_client
+        from app import plan_guard, quota
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_ME4, name="a-me4")
+        plan_guard.note(acc.id, "GLM-5.3", time.time() + 3600)        # mock 默认账本在账且可用
+        plan_guard.note(acc.id, "GLM-5.3-Flash", time.time() + 3600)  # 不在 mock 账本
+
+        await quota.fetch_quota(acc)
+
+        assert not plan_guard.cooling(acc.id, "GLM-5.3")        # 在账且可用 → 清
+        assert plan_guard.cooling(acc.id, "GLM-5.3-Flash")      # 不在账 → 冷却保留
+
+    async def test_429_1113_plan_marks_cooling(self, gateway_client, fresh_app, monkeypatch):
+        """429+1113（Plan 通道）打模型级冷却：与 1005 同口径（gateway.py:1381）。"""
         client, mock = gateway_client
         from app import plan_guard
+        from tests.conftest import seed_account
 
-        acc_id = "acct-x"
-        plan_guard.note(acc_id, "GLM-5.3", time.time() + 3600)
-        assert plan_guard.cooling(acc_id, "GLM-5.3")
-        plan_guard.clear_account(acc_id)
-        assert not plan_guard.cooling(acc_id, "GLM-5.3")
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_ME5, name="a-me5")
+        mock.state.sequences[self._JWT_ME5[:16]] = ["no_balance_1113"]  # 429+1113
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        assert plan_guard.cooling(acc.id, "GLM-5.3")  # Plan 分支同步打点
+
+        # 账号被救活（ACTIVE）后同模型请求不再撞 1113
+        acc.status = Status.ACTIVE
+        acc.quota = {"GLM-5.3-Flash": {"remaining": 100, "expires_at": time.time() + 3600}}
+        acc.quota_verified_at = time.time()
+        fresh_app.update_account(acc)
+        before = len(mock.state.calls)
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 503
+        assert not _paths(mock, before)  # 冷却跳号，零上游流量
+
+    async def test_key_1113_does_not_touch_plan_guard(self, gateway_client, fresh_app, monkeypatch):
+        """Key 通道 1113 不打模型级冷却（channel 守卫）：Key 无资源包 ≠ Plan
+        模型额度耗尽，误打点会把 Plan 通道健康模型连坐 30 分钟。"""
+        client, mock = gateway_client
+        from app import plan_guard
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, _JWT_1113_KEY, name="a-key1113-pg")
+        acc.api_key = "sk-key1113-pg-test"
+        acc.status = Status.DISABLED  # 仅 Key 可用
+        fresh_app.update_account(acc)
+        mock.state.sequences["sk-key1113-pg-te"[:16]] = ["no_balance_1113"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        assert gw._key_no_balance.get(acc.id) is not None  # Key 冷却记忆有
+        assert not plan_guard.cooling(acc.id, "GLM-5.3")   # 模型级冷却不误打
 
     async def test_ttl_expiry_reprobes(self, monkeypatch):
         """TTL 到期自动摘除（自然重探），不等 billing。"""
