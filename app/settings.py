@@ -162,10 +162,10 @@ GATE_POOL_PROBE_MIN_SECONDS = _int("ZCODE_GATE_POOL_PROBE_MIN", 300)
 
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
-# 单账号并发上限。2026-11-04 线上实测曾写死为 2；2026-11-13 用户要求拉高到 10
-# （生效期 3 亿窗口、两号余量充足，3008 瞬态争用由既有短退避重试吸收）：
-# 不读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台 meta 覆盖
-ACCOUNT_CONCURRENCY = 10
+# 单账号并发上限。上游 ZCode 单账号并发写死 3（用户 2026-11-13 口径，此前的
+# 「2」为当时实测保守值）——本地 cap 高于它只会常态化吃 3008 短退避，故取 3：
+# 超限自动切下一账号。不读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台 meta 覆盖
+ACCOUNT_CONCURRENCY = 3
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面

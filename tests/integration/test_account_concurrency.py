@@ -43,7 +43,7 @@ class TestAccountConcurrency:
         mock.state.conc_max = {}
 
     async def test_single_account_limits_to_cap(self, gateway_client, fresh_app):
-        """单账号并发封顶（现为 10）：14 并发恰 10 成功，其余 503；单号
+        """单账号并发封顶（现为 3）：cap+4 并发恰 cap 成功，其余 503；单号
         max_concurrent ≤ cap。"""
         client, mock = gateway_client
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-cc")
@@ -108,8 +108,8 @@ class TestAccountConcurrency:
         assert statuses == [200, 200]
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
 
-    def test_env_default_is_ten(self):
-        assert settings.ACCOUNT_CONCURRENCY == 10
+    def test_env_default_is_three(self):
+        assert settings.ACCOUNT_CONCURRENCY == 3
 
     async def test_429_wait_does_not_hold_concurrency_slot(
         self, gateway_client, fresh_app, monkeypatch
