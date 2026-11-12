@@ -825,7 +825,8 @@ def _note_pool_exhausted(trigger: Account | None = None) -> None:
     2026-11-12 线上 247 次真空期白撞教训）：只有当**全部** JWT 账号都返回
     「确认枯竭」（每个号都有过期后实查证据 quota_verified_at > 最新
     expires_at，且无当前可用窗口）时才拦；任意一号是可用（0.0）或不可判定
-    （None——快照空/陈旧/新号）都不拦。next_start 取全池最小未来
+    （None——快照空/陈旧/新号）都不拦，但会补 _safe_refresh 后台实查把证据
+    链续上（见下方 stale 分支注释）。next_start 取全池最小未来
     effective_at；无未来窗口给 -1，由 gate 用上限兜底。
 
     额度恢复由 quota.fetch_quota 的可用窗口分支主动 clear_pool_hold，形成
@@ -835,11 +836,24 @@ def _note_pool_exhausted(trigger: Account | None = None) -> None:
     if not accounts:
         return
     verdicts = []
+    stale: list[Account] = []
     for a in accounts:
         verdict = a.next_window_start()
         if verdict is None:
-            return  # 任一号不可判定 → 放行，让真实请求去定生死
+            stale.append(a)
+            continue
         verdicts.append(verdict)
+    if stale:
+        # 证据链未闭合（快照空/陈旧）→ 不拦（保守优先），但**补后台实查**把
+        # 证据链续上。没有这一步是死锁：EXHAUSTED 号被 select 滤掉后不会有任何
+        # 请求真实撞到它们（exhaust 分支的刷新也就永不执行），quota_verified_at
+        # 永远停在上一个日窗之前 → 全池 None → 闸门永不触发（2026-11-12 线上
+        # 实证：真空期 34/34 请求全裸 503，0 次 pool_hold 拦截）。_safe_refresh
+        # 自带 60s 去抖，一轮 billing 后 verified_at 越过 max_ends，下一请求
+        # 即进入快速失败闭环——裸 503 时代从「整个真空期」缩到「一轮实查」
+        for a in stale:
+            _spawn_bg(_safe_refresh(a))
+        return  # 不可判定 → 放行，让真实请求去定生死
     if any(v == 0.0 for v in verdicts):
         return  # 任一号当前可用 → 不拦（-1.0 = 枯竭但无未来窗口，照拦）
     future = [v for v in verdicts if v > 0]
