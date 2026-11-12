@@ -656,8 +656,8 @@ async def update_settings(payload: dict = Body(...)):
         except (TypeError, ValueError):
             raise HTTPException(400, "刷新间隔必须是非负整数") from None
         store.set_setting("quota_refresh_interval", str(interval))
-    # account_concurrency 已写死为 2（2026-11-04 线上实测），不再接受后台修改；
-    # PUT 中携带该键直接忽略（不报错，兼容旧前端 payload）
+    # account_concurrency 已写死（2026-11-04 起；现值 10，见 settings.py），
+    # 不再接受后台修改；PUT 中携带该键直接忽略（不报错，兼容旧前端 payload）
     if "claim_round_interval" in payload:
         try:
             interval = max(0, int(payload["claim_round_interval"]))

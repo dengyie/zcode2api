@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from app import settings
 from app.affinity import affinity_manager
 from app.models import Status
 from app.routes import gateway as gw
@@ -179,8 +180,10 @@ class TestLoadBalancingAndAffinity:
         # 预先将 S1 绑定到 a
         affinity_manager.bind("zai:hdr:session-s1", a.id)
 
-        # 模拟 a 当前在飞为 2（已达上限）
-        gw._inflight[a.id] = 2
+        # 模拟 a 当前在飞已满（达并发上限）
+        from app import settings as _settings
+
+        gw._inflight[a.id] = _settings.ACCOUNT_CONCURRENCY
 
         try:
             # 发起 S1 的请求，由于 a 满载，自动溢出到 b 且不报 503
@@ -262,7 +265,8 @@ class TestLoadBalancingAndAffinity:
 
         monkeypatch.setattr(gw.captcha_manager, "model_requests_need_captcha", _delayed_captcha)
 
-        # 突发并发 4 个请求打单账号
+        # 突发并发 cap+4 个请求打单账号
+        cap = settings.ACCOUNT_CONCURRENCY
         async with asyncio.TaskGroup() as tg:
             tasks = [
                 tg.create_task(
@@ -271,14 +275,14 @@ class TestLoadBalancingAndAffinity:
                         json={"model": "GLM-5.2", "messages": [{"role": "user", "content": f"race {i}"}]},
                     )
                 )
-                for i in range(4)
+                for i in range(cap + 4)
             ]
 
         statuses = sorted(t.result().status_code for t in tasks)
-        # 恰有 2 个成功，其余 503
-        assert statuses == [200, 200, 503, 503]
-        # mock 记录到的最大在飞请求数严格 <= 2
-        assert mock.state.conc_max.get(a.jwt_token[:16], 0) <= 2
+        # 恰有 cap 个成功，其余 503
+        assert statuses == [200] * cap + [503] * 4
+        # mock 记录到的最大在飞请求数严格 <= cap
+        assert mock.state.conc_max.get(a.jwt_token[:16], 0) <= cap
 
     async def test_repeated_single_turn_requests_load_balance(self, gateway_client, fresh_app):
         """纯单轮相同 Prompt 请求：无 Header 时必须交替负载均衡，不因内容相同被错误绑死。"""

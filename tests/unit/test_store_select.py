@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from app import settings
 from app.models import Status
 from app.store import Store
 
@@ -32,7 +33,7 @@ class TestStoreSelectLoadBalancing:
         a = fresh_app.add_account("zai", "a", "jwt.token.a")
         b = fresh_app.add_account("zai", "b", "jwt.token.b")
 
-        # 尽管 a 有 1 个在飞请求、b 有 0 个，但 a 是会话亲和号且未达上限 2 -> 坚持选 a
+        # 尽管 a 有 1 个在飞请求、b 有 0 个，但 a 是会话亲和号且未达上限 -> 坚持选 a
         inflight = {a.id: 1, b.id: 0}
         pick = fresh_app.select("zai", inflight=inflight, pinned_id=a.id)
         assert pick is not None
@@ -42,8 +43,9 @@ class TestStoreSelectLoadBalancing:
         a = fresh_app.add_account("zai", "a", "jwt.token.a")
         b = fresh_app.add_account("zai", "b", "jwt.token.b")
 
-        # a 是亲和号，但已达并发上限 2（2/2） -> 自动溢出到有余量的 b（0/2）
-        inflight = {a.id: 2, b.id: 0}
+        # a 是亲和号，但已达并发上限（cap/cap） -> 自动溢出到有余量的 b
+        cap = settings.ACCOUNT_CONCURRENCY
+        inflight = {a.id: cap, b.id: 0}
         pick = fresh_app.select("zai", inflight=inflight, pinned_id=a.id)
         assert pick is not None
         assert pick.id == b.id
@@ -72,7 +74,8 @@ class TestStoreSelectLoadBalancing:
         a = fresh_app.add_account("zai", "a", "jwt.token.a")
         b = fresh_app.add_account("zai", "b", "jwt.token.b")
 
-        # 全满（均达 2 并发） -> 返回 None（触发网关 503）
-        inflight = {a.id: 2, b.id: 2}
+        # 全满（均达并发上限） -> 返回 None（触发网关 503）
+        cap = settings.ACCOUNT_CONCURRENCY
+        inflight = {a.id: cap, b.id: cap}
         pick = fresh_app.select("zai", inflight=inflight)
         assert pick is None

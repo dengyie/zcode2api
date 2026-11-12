@@ -42,17 +42,19 @@ class TestAccountConcurrency:
         mock.state.conc_in = {}
         mock.state.conc_max = {}
 
-    async def test_single_account_limits_to_two(self, gateway_client, fresh_app):
-        """单账号 4 并发：恰 2 成功，其余 503；单号 max_concurrent ≤ 2。"""
+    async def test_single_account_limits_to_cap(self, gateway_client, fresh_app):
+        """单账号并发封顶（现为 10）：14 并发恰 10 成功，其余 503；单号
+        max_concurrent ≤ cap。"""
         client, mock = gateway_client
         acc = _seed(fresh_app, "hC.eyJzdWIiOiJjIn0.sig", "a-cc")
 
+        cap = settings.ACCOUNT_CONCURRENCY
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
-                     for _ in range(4)]
+                     for _ in range(cap + 4)]
         statuses = sorted(t.result().status_code for t in tasks)
-        assert statuses == [200, 200, 503, 503]
-        assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
+        assert statuses == [200] * cap + [503] * 4
+        assert _per_key_max(mock, acc.jwt_token[:16]) <= cap
 
     async def test_two_accounts_all_succeed(self, gateway_client, fresh_app):
         """双账号 4 并发：每号 ≤2，全部成功。"""
@@ -88,10 +90,10 @@ class TestAccountConcurrency:
 
         async with asyncio.TaskGroup() as tg:
             tasks = [tg.create_task(client.post("/v1/messages", json=_MSG_BODY))
-                     for _ in range(4)]
+                     for _ in range(settings.ACCOUNT_CONCURRENCY + 4)]
         statuses = sorted(t.result().status_code for t in tasks)
-        assert statuses == [200, 200, 503, 503]
-        assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
+        assert statuses == [200] * settings.ACCOUNT_CONCURRENCY + [503] * 4
+        assert _per_key_max(mock, acc.jwt_token[:16]) <= settings.ACCOUNT_CONCURRENCY
 
     async def test_meta_one_ignored(self, gateway_client, fresh_app):
         """写死后 meta 覆盖作废：即使 meta=1，仍按 2 放行。"""
@@ -106,8 +108,8 @@ class TestAccountConcurrency:
         assert statuses == [200, 200]
         assert _per_key_max(mock, acc.jwt_token[:16]) <= 2
 
-    def test_env_default_is_two(self):
-        assert settings.ACCOUNT_CONCURRENCY == 2
+    def test_env_default_is_ten(self):
+        assert settings.ACCOUNT_CONCURRENCY == 10
 
     async def test_429_wait_does_not_hold_concurrency_slot(
         self, gateway_client, fresh_app, monkeypatch

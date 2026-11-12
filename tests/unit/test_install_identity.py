@@ -253,17 +253,17 @@ def test_cli_add_account_schedules_install(fresh_app, monkeypatch):
 class TestConcurrencySetting:
     """2026-11-04 线上实测写死：单账号并发恒为 2，env / meta / PUT 一律无效。"""
 
-    def test_pinned_2(self, fresh_app):
-        assert fresh_app.account_concurrency() == 2
+    def test_pinned_10(self, fresh_app):
+        assert fresh_app.account_concurrency() == 10
 
     def test_meta_value_ignored(self, fresh_app):
         # 历史遗留 meta（如线上 account_concurrency=4）必须被作废
         fresh_app.set_setting("account_concurrency", "8")
-        assert fresh_app.account_concurrency() == 2
+        assert fresh_app.account_concurrency() == 10
 
     def test_bad_meta_value_ignored(self, fresh_app):
         fresh_app.set_setting("account_concurrency", "abc")
-        assert fresh_app.account_concurrency() == 2
+        assert fresh_app.account_concurrency() == 10
 
     async def test_put_settings_no_longer_writable(self, fresh_app):
         async with _admin_client(fresh_app) as client:
@@ -272,9 +272,9 @@ class TestConcurrencySetting:
                                    headers={"Authorization": "Bearer zcode"})
             assert res.status_code == 200  # 键被静默忽略，不再 400
             from app.store import store as live_store
-            assert live_store.account_concurrency() == 2
+            assert live_store.account_concurrency() == 10
 
             res = await client.get("/admin/api/settings",
                                    headers={"Authorization": "Bearer zcode"})
             assert res.status_code == 200
-            assert res.json()["account_concurrency"] == 2
+            assert res.json()["account_concurrency"] == 10
