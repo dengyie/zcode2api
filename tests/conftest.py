@@ -93,6 +93,11 @@ def fresh_app(tmp_path, monkeypatch):
     from app.gate import gate as upstream_gate
 
     upstream_gate.reset()
+    # pool_hold 证据链补查的进程级节流记忆同理：不 reset 的话先执行的
+    # stale 用例会占掉后续用例的探查窗口（2026-11-12 review P2）
+    from app.routes import gateway as gateway_probe_module
+
+    gateway_probe_module._pool_probe_last.clear()
     from app import auth_admin as auth_admin_module
     if hasattr(auth_admin_module, "reset_failures"):
         auth_admin_module.reset_failures()

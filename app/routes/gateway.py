@@ -800,6 +800,11 @@ _inflight: dict[str, int] = {}
 # 后台手动启用账号时清除（用户明确意图 = 立即重试）。
 _key_no_balance: dict[str, float] = {}
 
+# pool_hold 证据链补查的进程级节流记忆：account_id → 上次探查发起时刻
+# （epoch）。真空期 balances 为空时证据点永不闭合，无此闸则每条请求都对
+# 全池 stale 号 spawn billing（review P1 整改，2026-11-12）。重启即忘
+_pool_probe_last: dict[str, float] = {}
+
 
 def clear_key_no_balance(account_id: str) -> None:
     """后台启用/凭证变更时清除该号的 Key 无余额冷却，允许立即重探。"""
@@ -850,8 +855,17 @@ def _note_pool_exhausted(trigger: Account | None = None) -> None:
         # 永远停在上一个日窗之前 → 全池 None → 闸门永不触发（2026-11-12 线上
         # 实证：真空期 34/34 请求全裸 503，0 次 pool_hold 拦截）。_safe_refresh
         # 自带 60s 去抖，一轮 billing 后 verified_at 越过 max_ends，下一请求
-        # 即进入快速失败闭环——裸 503 时代从「整个真空期」缩到「一轮实查」
+        # 即进入快速失败闭环——裸 503 时代从「整个真空期」缩到「一轮实查」。
+        # 探查另有**进程级节流**（review P1 整改）：60s 去抖挡不住「balances
+        # 为空 → 证据点不打 → 账号永远 stale → 每请求都 spawn」的持续形态
+        # （线上实锤 22:49 刷新跑了但 verified_at 未动），首探立即、后续按
+        # GATE_POOL_PROBE_MIN_SECONDS 每号限频，把 billing 轰炸压回 monitor 量级
+        now = time.time()
         for a in stale:
+            last_probe = _pool_probe_last.get(a.id, 0.0)
+            if now - last_probe < settings.GATE_POOL_PROBE_MIN_SECONDS:
+                continue
+            _pool_probe_last[a.id] = now
             _spawn_bg(_safe_refresh(a))
         return  # 不可判定 → 放行，让真实请求去定生死
     if any(v == 0.0 for v in verdicts):

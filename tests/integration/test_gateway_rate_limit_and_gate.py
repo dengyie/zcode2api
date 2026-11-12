@@ -922,6 +922,44 @@ class TestPoolWindowGate:
         assert res3.status_code == 429
         assert res3.json()["error"]["type"] == "gate_pool_hold"
 
+    async def test_stale_probe_throttled_when_evidence_never_closes(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """review P1 钉子：真空期上游 balances 为空 → fetch_quota 拿不到窗口
+        → 证据点永不闭合 → 账号永远 stale。无节流时每条请求都 spawn billing
+        实查（每分钟一轮 × 14h 真空期 = 风控拦截源）；进程级节流下首探立即、
+        GATE_POOL_PROBE_MIN_SECONDS 内不再重发。"""
+        import asyncio
+
+        client, mock = gateway_client
+        from app.routes import gateway as gw
+        from tests.conftest import seed_account
+
+        refreshed: list[str] = []
+
+        async def _fake_refresh(account):
+            # 模拟「balances 空」形态：刷新跑了但证据点不闭合
+            refreshed.append(account.id)
+
+        monkeypatch.setattr(gw, "_safe_refresh", _fake_refresh)
+        acc = seed_account(fresh_app, self._JWT_PW2, name="a-pw-throttle")
+        now = time.time()
+        acc.quota = {"GLM-5.3": {"total": 100, "used": 100, "remaining": 5,
+                                 "expires_at": now - 3600}}
+        acc.quota_verified_at = now - 7200  # 陈旧
+        acc.status = Status.EXHAUSTED
+        fresh_app.update_account(acc)
+
+        res1 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res1.status_code == 503
+        await asyncio.sleep(0)
+        assert refreshed == [acc.id]  # 首探立即
+
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 503
+        await asyncio.sleep(0)
+        assert refreshed == [acc.id]  # 节流生效：窗口内不重发
+
 
 @pytest.mark.integration
 class TestPlanModelExhaust:

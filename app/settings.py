@@ -151,6 +151,14 @@ GATE_BUSY_HOLD_SECONDS = _int("ZCODE_GATE_BUSY_HOLD_SECONDS", 180)
 # 防吊死客户端（无未来窗口时按上限兜底）；0 = 关闭闸门。判定/解除口径见
 # models.Account.next_window_start 与 quota.fetch_quota 的恢复分支
 GATE_POOL_HOLD_MAX_SECONDS = _int("ZCODE_GATE_POOL_HOLD_MAX", 3600)
+# 证据链补查的进程级节流（2.7.31 review 整改）：真空期上游 balances 为空时
+# （2026-11-12 线上实锤：22:49 refresh 跑了但 verified_at 没动——quota_map
+# 空 → 证据点不打 → 账号永远 stale），若无节流每条请求都会对全池 stale 号
+# spawn billing 实查，60s 去抖挡不住「每分钟一轮 × 整个真空期」的持续轰炸
+# （fetch_quota 一次 = 3 条 GET，是 monitor 1800s 节奏的 60 倍，vault 明载
+# billing 连续查询易触发拦截，403 还会把号标 INVALID）。首探立即、后续每
+# 号最多按此间隔重探；balances 一旦列出窗口，一轮实查即闭合证据链
+GATE_POOL_PROBE_MIN_SECONDS = _int("ZCODE_GATE_POOL_PROBE_MIN", 300)
 
 # 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
 # ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
