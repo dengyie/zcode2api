@@ -103,7 +103,7 @@
 (async()=>{
   await renderAdminHeader();
   const key=await adminKey.get();
-  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='login.html';
   document.getElementById('endpoint').textContent=location.origin+'/v1/messages';
   load();
 })();

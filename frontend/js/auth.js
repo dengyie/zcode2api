@@ -40,7 +40,7 @@ const adminKey=_keyStore('zcode2api_admin_key');
 async function verifyKey(url,key){
   return (await fetch(url,{headers:key?{Authorization:`Bearer ${key}`}:{}})).ok;
 }
-function adminLogout(){adminKey.clear();location.href='/admin/login';}
+function adminLogout(){adminKey.clear();location.href='login.html';}
 
 /* 统一的后台 API 调用封装 */
 async function api(method,path,body){

@@ -38,8 +38,18 @@ async def admin_login():
     return _html("login.html")
 
 
+@router.get("/admin/login.html", include_in_schema=False)
+async def admin_login_html():
+    return _html("login.html")
+
+
 @router.get("/admin/accounts", include_in_schema=False)
 async def admin_accounts():
+    return _html("accounts.html")
+
+
+@router.get("/admin/accounts.html", include_in_schema=False)
+async def admin_accounts_html():
     return _html("accounts.html")
 
 
@@ -48,8 +58,18 @@ async def admin_monitoring():
     return _html("monitoring.html")
 
 
+@router.get("/admin/monitoring.html", include_in_schema=False)
+async def admin_monitoring_html():
+    return _html("monitoring.html")
+
+
 @router.get("/admin/settings", include_in_schema=False)
 async def admin_settings():
+    return _html("settings.html")
+
+
+@router.get("/admin/settings.html", include_in_schema=False)
+async def admin_settings_html():
     return _html("settings.html")
 
 

@@ -4,13 +4,14 @@ async function renderAdminHeader(){
   if(!mount)return;
   let version='';
   try{const r=await fetch((window.ZCODE_API_BASE || '') + '/meta');if(r.ok)version='v'+(await r.json()).version;}catch{}
-  const active=mount.dataset.active||location.pathname;
+  // 相对文件名导航：同源 pretty URL 与任意静态托管（GitHub Pages 等）通吃
+  const here=location.pathname.split("/").pop()||"accounts.html";
   const nav=[
-    ['/admin/accounts','账号池'],
-    ['/admin/monitoring','请求监控'],
-    ['/admin/settings','设置'],
+    ["accounts.html","账号池"],
+    ["monitoring.html","请求监控"],
+    ["settings.html","设置"],
   ].map(([href,label])=>
-    `<a href="${href}" class="admin-nav-link${href===active?' active':''}">${label}</a>`
+    `<a href="${href}" class="admin-nav-link${href===here?' active':''}">${label}</a>`
   ).join('');
   mount.innerHTML=`
     <header class="admin-header">

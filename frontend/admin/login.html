@@ -32,13 +32,13 @@
       const key=el.value.trim();
       if(!key)return;
       try{
-        if(await verifyKey(ADMIN_API+'/verify',key)){await adminKey.set(key);location.href='/admin/accounts';}
+        if(await verifyKey(ADMIN_API+'/verify',key)){await adminKey.set(key);location.href='accounts.html';}
         else showToast('密码无效','error');
       }catch{showToast('连接失败','error');}
     }
     (async()=>{
       const key=await adminKey.get();
-      if(key)try{if(await verifyKey(ADMIN_API+'/verify',key))location.href='/admin/accounts';}catch{}
+      if(key)try{if(await verifyKey(ADMIN_API+'/verify',key))location.href='accounts.html';}catch{}
     })();
   </script>
 </body>

@@ -236,16 +236,5 @@ ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGI
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
 APP_VERSION = "2.7.34"
 
-_FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
-
-
-def frontend_version() -> str:
-    """前端版本号（frontend/version 文件，每次读取 → 前端独立发版即生效）。
-
-    文件缺失/为空时回退 APP_VERSION，保证本地开发与旧部署不破。
-    """
-    try:
-        v = _FRONTEND_VERSION_FILE.read_text("utf-8").strip()
-        return v or APP_VERSION
-    except OSError:
-        return APP_VERSION
+# 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
+# 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

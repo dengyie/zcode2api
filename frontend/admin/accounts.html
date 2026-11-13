@@ -195,7 +195,7 @@ const NOTCH_COLORS=['var(--notch-1)','var(--notch-2)','var(--notch-3)','var(--no
 (async()=>{
   await renderAdminHeader();
   const key=await adminKey.get();
-  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='/admin/login';
+  if(!key||!await verifyKey(ADMIN_API+'/verify',key).catch(()=>false))return location.href='login.html';
   await load();
   startPolling();
 })();
