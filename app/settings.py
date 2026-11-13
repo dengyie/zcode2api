@@ -204,6 +204,14 @@ AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
 # 「CN billing + US messages」双 IP 异常信号；captcha 签发出口由 gateway
 # 的同一 egress tag 驱动自动对齐（app/egress.py「token 出口=请求出口」）。
 MESSAGES_FORCE_DIRECT = _bool("ZCODE_MESSAGES_FORCE_DIRECT", False)
+# billing/claim 链路出口（2026-11-13 tebi 线上实证）："direct"（历史缺省，
+# GCP 类大厂 ASN 直连可用）或 "proxy"（机房小 ASN 直连 IP 被 billing 风控
+# 拒——preview 空投放/429、验证码 token 3007；走家宽代理 3/3 号立即可领）。
+# 覆盖四处：_billing_request / report_activation（trust_env）、claim 验证码
+# egress tag——三者必须同出口，token 与请求 IP 不一致会被判 unusual activity。
+BILLING_EGRESS = (os.getenv("ZCODE_BILLING_EGRESS", "direct").strip().lower() or "direct")
+if BILLING_EGRESS not in ("direct", "proxy"):
+    BILLING_EGRESS = "direct"
 # 营销触达 / 活动投放查询端点（测试时指向 Mock 上游）
 ZCODE_MARKETING_TOUCH_URL = os.getenv("ZCODE_MARKETING_TOUCH_URL", constants.MARKETING_TOUCH_URL)
 # 激活事件上报（测试时指向 Mock 上游）
@@ -214,7 +222,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.31"
+APP_VERSION = "2.7.32"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

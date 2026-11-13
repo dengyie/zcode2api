@@ -205,10 +205,12 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
     headers = dict(kwargs.pop("headers"))
     url = path if path.startswith("http") else f"{settings.ZCODE_BILLING_BASE}{path}"
     try:
-        # trust_env=False：billing 全家桶直连。实测「解码直连 + claim 直连」才能过
-        # 上游风控（claim 走 US 出口被拒「unusual activity」，直连 code:0）；
-        # messages 端点与此相反（直连曾被 3012 风控），仍走 env 的 US 代理。
-        async with httpx.AsyncClient(timeout=25, trust_env=False) as client:
+        # 出口由 settings.BILLING_EGRESS 决定（trust_env 按 direct/proxy 切）。
+        # 2026-11-13 tebi 实证：GCP 大厂 ASN 直连可用（历史缺省），机房小 ASN
+        # 直连 IP 会被 billing 风控拒（preview 空投放/429、验证码 3007）——
+        # 走家宽代理 3/3 号立即可领。messages 端点与此独立（egress.py 判定）。
+        trust_env = settings.BILLING_EGRESS == egress.PROXY
+        async with httpx.AsyncClient(timeout=25, trust_env=trust_env) as client:
             res = await client.request(
                 method, url,
                 headers=headers, **kwargs,
@@ -505,12 +507,12 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
         raise ClaimError(blocked)
 
     plan_id, plan_name, grants = await _auto_pick_plan(account, plan_id)
-    # claim 的 billing 请求走 trust_env=False 直连，验证码必须同样直连解，
-    # 否则 token 的出口与请求出口不一致，上游判 unusual activity。
+    # claim 的 billing 请求出口见 _billing_request（BILLING_EGRESS）；
+    # 验证码必须同出口解，否则 token 的出口与请求出口不一致，上游判 unusual activity。
     verify_param, verify_region = await captcha_manager.get_verify_param(
-        egress_tag=egress.DIRECT
+        egress_tag=settings.BILLING_EGRESS
     )
-    config = await captcha_manager.fetch_config(egress.DIRECT)
+    config = await captcha_manager.fetch_config(settings.BILLING_EGRESS)
     headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
 
     body = await _billing_request(
@@ -521,7 +523,7 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     if code == 0:
         return _claim_outcome(body, plan_id, plan_name, grants)
     if code == 3007:
-        captcha_manager.invalidate(egress.DIRECT)  # 被拒的码出池，避免下轮复用
+        captcha_manager.invalidate(settings.BILLING_EGRESS)  # 被拒的码出池，避免下轮复用
     raise _fail_error(code, body)
 
 
