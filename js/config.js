@@ -1,5 +1,4 @@
-/* zcode2api — 前后端分离配置（2.7.34）。
- * 前端可部署到任意静态源；跨源部署时在部署产物里改这一行：
- *   window.ZCODE_API_BASE = "https://zcode.mangoqwq.com";
- * 默认空 = 同源相对路径（本机 /static 服务形态）。 */
-window.ZCODE_API_BASE = window.ZCODE_API_BASE || "";
+/* zcode2api — 前后端分离配置（GitHub Pages 托管形态）。
+ * 本部署源为 https://dengyie.github.io/zcode2api/ （自定义域 blog.mangoqwq.com/zcode2api/），
+ * API 指向生产 zcode-hub。 */
+window.ZCODE_API_BASE = "https://zcode.mangoqwq.com";
