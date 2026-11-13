@@ -23,6 +23,26 @@ _STOP_REASON_MAP = {
 }
 
 
+class UpstreamStreamError(Exception):
+    """上游在 SSE 流内下发的 error 事件（overloaded_error / api_error 等）。
+
+    200 已发出后上游无法再改 HTTP 状态，只会在流里塞 `{"type":"error",...}`。
+    这类错误必须显式向上抛，由 HTTP 层转成协议对应的错误事件——静默丢弃会让
+    客户端把半截回答当成功（2.7.33 修复）。
+    """
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code or "upstream_error"
+
+
+def error_sse(message: str, code: str | None = None) -> str:
+    """OpenAI 兼容的流式错误行（紧跟 `data: [DONE]` 之前输出）。"""
+    payload = {"error": {"message": message, "type": "upstream_stream_error",
+                         "code": code or "upstream_error"}}
+    return _sse(payload)
+
+
 def _as_int(value: object) -> int | None:
     try:
         return int(value)  # type: ignore[arg-type]
@@ -287,6 +307,14 @@ class StreamConverter:
 
     def feed_events(self, evt: dict) -> list[dict]:
         etype = evt.get("type")
+        if etype == "error":
+            err = evt.get("error")
+            if isinstance(err, dict):
+                raise UpstreamStreamError(
+                    str(err.get("message") or err.get("type") or "上游流式错误"),
+                    str(err.get("type") or "") or None,
+                )
+            raise UpstreamStreamError(str(err or "上游流式错误"))
         if etype == "message_start":
             msg = evt.get("message") or {}
             if msg.get("id"):
@@ -327,7 +355,14 @@ class StreamConverter:
                 self.usage["completion_tokens"] = out
                 self._sync_usage_total()
             return [self._chunk_event({}, finish_reason=self.finish_reason)]
-        return []  # content_block_stop / message_stop / ping / error 等无需产出
+        # 兼容未带 type 名的上游错误事件（部分中转只发 {"error": {...}}）
+        if isinstance(evt.get("error"), dict):
+            err = evt["error"]
+            raise UpstreamStreamError(
+                str(err.get("message") or err.get("type") or "上游流式错误"),
+                str(err.get("type") or "") or None,
+            )
+        return []  # content_block_stop / message_stop / ping 等无需产出
 
     def _chunk_event(self, delta: dict, finish_reason: str | None = None) -> dict:
         payload: dict = {

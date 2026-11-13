@@ -138,6 +138,76 @@ async def test_new_account_with_empty_billing_still_selectable(gateway_client, f
     assert "待首次请求验证" in (after.last_error or "")
 
 
+_JWT_COOLING = "cooling1.payload.signature"
+_JWT_BONUS = "bonus001.payload.signature"
+_JWT_PLANS = "plans001.payload.signature"
+
+
+async def test_cooling_not_downgraded_to_exhausted(gateway_client, fresh_app):
+    """冷却期内的号刷新到「无可用窗口」时保留 COOLING（2.7.33）。
+
+    EXHAUSTED 的 is_selectable 恒 False（不看 cooling_until）——降级等于把还在
+    指数退避的号永久踢出池子；保留 COOLING 让冷却到期后自然重探。
+    """
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_COOLING, name="a-cooling")
+    acc.status = Status.COOLING
+    acc.cooling_until = time.time() + 600
+    acc.last_error = "命中风控，指数退避冷却"
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_COOLING, "balance_expired")
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.COOLING
+    assert after.is_cooling() is True
+    assert "冷却" in (after.last_error or "")
+
+
+async def test_bonus_plan_revives_exhausted_account_without_balance_windows(
+    gateway_client, fresh_app
+):
+    """balance 空但 plans 有生效的一次性赠送池 → EXHAUSTED 复活（2.7.33）。
+
+    原实现只在 quota_map 非空时计算 has_bonus，空 balances 的号永远无法复活。
+    """
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_BONUS, name="a-bonus")
+    now = time.time()
+    acc.status = Status.EXHAUSTED
+    acc.last_error = "额度已用完"
+    acc.plans = [{"plan_id": "gift", "entitlements": [
+        {"period": "one_time", "effective_at": now - 60, "ends_at": now + 3600},
+    ]}]
+    acc.plan = acc.plans[0]
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_BONUS, "billing_empty")
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.ACTIVE
+    assert after.last_error is None
+    assert after.is_selectable() is True
+
+
+async def test_empty_billing_plans_do_not_wipe_local_plan_cache(gateway_client, fresh_app):
+    """billing/current 返回空 plans 时不得洗掉已知套餐（2.7.33）。"""
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_PLANS, name="a-plans")
+    acc.plans = [{"plan_id": "keep-me"}]
+    acc.plan = {"plan_id": "keep-me"}
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_PLANS, "billing_empty")
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.plans == [{"plan_id": "keep-me"}]
+    assert after.plan == {"plan_id": "keep-me"}
+
+
 
 _JWT_TRIAL = "trial001.payload.signature"
 

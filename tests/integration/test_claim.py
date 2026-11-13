@@ -488,6 +488,61 @@ class TestAutoClaimOnPoolEntry:
         mock.state.claim_scenario = "claim_claimed"
         assert await auto_claim_all_plans(acc) == []
 
+    async def test_auto_claim_3007_stops_after_first_plan(self, claim_env, monkeypatch):
+        """验证码被拒单发即止：3007 后不再打第二个套餐（2.7.33）。
+
+        拒码是上游风险信号，继续换套餐重打 = 白烧求解 + 加剧风控。
+        """
+        import app.claim as claim_module
+
+        _client, _mock, _stub, acc = claim_env
+        plans = [
+            {"plan_id": "p1", "name": "P1", "priority": 10, "grants": []},
+            {"plan_id": "p2", "name": "P2", "priority": 5, "grants": []},
+        ]
+        calls: list[str] = []
+
+        async def fake_preview(_acc):
+            return plans
+
+        async def fake_claim(_acc, plan_id=None):
+            calls.append(plan_id)
+            raise claim_module.ClaimError("验证码校验失败，请重试", code=3007)
+
+        monkeypatch.setattr(claim_module, "preview_plans", fake_preview)
+        monkeypatch.setattr(claim_module, "claim", fake_claim)
+
+        outcomes = await claim_module.auto_claim_all_plans(acc)
+        assert calls == ["p1"]  # 只打第一个套餐
+        assert len(outcomes) == 1
+        assert outcomes[0]["ok"] is False and outcomes[0]["code"] == 3007
+
+    async def test_auto_claim_1003_treated_as_idempotent_success(self, claim_env, monkeypatch):
+        """1003「已经领取过」= 幂等成功，且不中断后续套餐（2.7.33）。"""
+        import app.claim as claim_module
+
+        _client, _mock, _stub, acc = claim_env
+        plans = [
+            {"plan_id": "p1", "name": "P1", "priority": 10, "grants": []},
+            {"plan_id": "p2", "name": "P2", "priority": 5, "grants": []},
+        ]
+        calls: list[str] = []
+
+        async def fake_preview(_acc):
+            return plans
+
+        async def fake_claim(_acc, plan_id=None):
+            calls.append(plan_id)
+            raise claim_module.ClaimError("该套餐已经领取过", code=1003)
+
+        monkeypatch.setattr(claim_module, "preview_plans", fake_preview)
+        monkeypatch.setattr(claim_module, "claim", fake_claim)
+
+        outcomes = await claim_module.auto_claim_all_plans(acc)
+        assert calls == ["p1", "p2"]
+        assert len(outcomes) == 2
+        assert all(o["ok"] is True and o["already_claimed"] is True for o in outcomes)
+
     async def test_auto_claim_skips_non_jwt(self, claim_env, fresh_app):
         from app.claim import auto_claim_all_plans
 

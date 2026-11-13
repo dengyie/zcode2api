@@ -726,7 +726,7 @@ function closeClaimModal(){
 
 async function doExport(){
   try{
-    const d=await api('GET','/export');
+    const d=await api('POST','/export');
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([JSON.stringify(d,null,2)],{type:'application/json'}));
     a.download='zcode-accounts.json';a.click();

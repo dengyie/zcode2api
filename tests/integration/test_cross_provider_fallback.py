@@ -131,6 +131,38 @@ class TestCrossProviderFallback:
         # Bigmodel pool empty, no fallback back to zai (bigmodel 已在 chain 末尾)
         assert res.status_code == 503
 
+    async def test_attempt_budget_is_per_provider(
+        self, gateway_client, fresh_app, stub_captcha, monkeypatch
+    ):
+        """尝试预算是按 provider 计的（2.7.33）。
+
+        旧实现 `attempts` 在 provider 循环外共享：zai 池里第一个号失败就烧掉整份
+        预算（MAX_ACCOUNT_ATTEMPTS），bigmodel 一次也轮不到，降级链名存实亡。
+        这里把预算压到 1，zai 号 401 失败后 bigmodel 必须仍然被尝试。
+        """
+        from app.routes import gateway as gw
+
+        client, mock = gateway_client
+        stub_captcha.needs_captcha = False
+        _setup(mock)
+        monkeypatch.setattr(gw, "MAX_ACCOUNT_ATTEMPTS", 1)
+
+        zai_acc = fresh_app.add_account("zai", "zai-budget",
+                                        "xpf5.eyJzdWIiOiJ6NWYifQ.sig")
+        bm_acc = fresh_app.add_account("bigmodel", "bm-budget", "xpf6-bigmodel-api-key")
+        mock.state.sequences[zai_acc.jwt_token[:16]] = ["auth_invalid"]
+
+        res = await client.post("/v1/messages", json={
+            "model": "GLM-5.3",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+
+        assert res.status_code == 200, res.text
+        calls = _messages_calls(mock)
+        assert any(c[1] == "/api/anthropic/v1/messages" for c in calls), calls
+        assert bm_acc.use_count == 1
+        assert zai_acc.use_count == 0
+
     async def test_cross_provider_affinity_does_not_leak(
         self, gateway_client, fresh_app, stub_captcha
     ):

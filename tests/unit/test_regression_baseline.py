@@ -71,12 +71,49 @@ class TestRejectionSignals:
     def test_plain_400_not_exhausted(self):
         assert not _is_exhausted(400, "bad request")
 
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    def test_5xx_never_exhausted(self, status):
+        """5xx 是上游故障：正文里的 "rate limit exceeded" 等文案不得把号踢成 EXHAUSTED。"""
+        assert not _is_exhausted(status, "rate limit exceeded")
+        assert not _is_exhausted(status, "insufficient balance")
+
     @pytest.mark.parametrize("text", ["captcha required", "verify token invalid", "Verify Failed"])
     def test_captcha_error(self, text):
         assert _is_captcha_error(text)
 
     def test_auth_401_not_captcha(self):
         assert not _is_captcha_error("invalid credentials")
+
+
+class TestCaptchaChallengeDetection:
+    def _resp(self, status: int, headers: dict | None = None):
+        import httpx
+
+        return httpx.Response(status, headers=headers or {})
+
+    def test_header_challenge(self):
+        from app.constants import CAPTCHA_HEADER
+        from app.routes.gateway import _detect_captcha_challenge
+
+        resp = self._resp(200, {CAPTCHA_HEADER: "challenge-param"})
+        assert _detect_captcha_challenge(resp, "") == "header"
+
+    def test_body_3007_on_http_200(self):
+        """200 + {"code":3007}：上游用 200 承载业务错误时必须仍识别为挑战。"""
+        from app.routes.gateway import _detect_captcha_challenge
+
+        resp = self._resp(200)
+        assert _detect_captcha_challenge(resp, '{"code":3007,"msg":"verify failed"}') == "in-body-3007"
+
+    def test_text_challenge_on_403(self):
+        from app.routes.gateway import _detect_captcha_challenge
+
+        assert _detect_captcha_challenge(self._resp(403), "captcha required") == "text"
+
+    def test_plain_403_not_challenge(self):
+        from app.routes.gateway import _detect_captcha_challenge
+
+        assert _detect_captcha_challenge(self._resp(403), "forbidden") is None
 
 
 # ── Account 状态机（models.py 原语义）─────────────────────────────────────────

@@ -41,6 +41,16 @@ _STORE_BINDING_MODULES = (
 
 
 @pytest.fixture(autouse=True)
+def allow_anonymous_gateway(monkeypatch):
+    """测试默认放行「未配置网关 key」的请求（2.7.33 起线上默认 fail-closed）。
+
+    绝大多数用例只关心调度/协议行为，不配 key；鉴权本身由 test_gateway_auth
+    用显式 key 或在本夹具之上再关掉开关来覆盖。
+    """
+    monkeypatch.setattr(settings, "GATEWAY_ALLOW_NO_KEY", True)
+
+
+@pytest.fixture(autouse=True)
 def reset_constants_version():
     """每次测试前后将客户端伪装版本重置为基线版本，防止跨用例污染。"""
     constants.set_active_version(constants.DEFAULT_CLIENT_APP_VERSION)
@@ -141,6 +151,9 @@ async def gateway_client(fresh_app, mock_server, monkeypatch, stub_captcha):
     """挂好 Mock 上游的网关 ASGI 客户端。返回 (client, mock_app)。"""
     mock_app, port = mock_server
     base = f"http://127.0.0.1:{port}"
+    # 网关默认 fail-closed（2.7.33）：测试用例不逐一配 key，显式打开放行开关，
+    # 鉴权行为本身由 test_gateway_auth 用显式 key / 默认开关关闭来覆盖。
+    monkeypatch.setattr(settings, "GATEWAY_ALLOW_NO_KEY", True)
     monkeypatch.setattr(settings, "UPSTREAM", {
         "zai": f"{base}/api/v1/zcode-plan/anthropic/v1/messages",
         "zai_fallback": f"{base}/api/anthropic/v1/messages",

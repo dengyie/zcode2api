@@ -236,6 +236,39 @@ class TestStreamConverter:
         assert conv.feed({"type": "ping"}) == []
         assert conv.feed({"type": "content_block_stop", "index": 0}) == []
 
+    def test_error_event_raises(self):
+        """上游流内 error 事件必须显式抛出，不能静默丢成「成功」。"""
+        import pytest
+
+        from app.openai_compat import UpstreamStreamError
+
+        conv = StreamConverter("GLM-5.3")
+        with pytest.raises(UpstreamStreamError) as ei:
+            conv.feed({"type": "error",
+                       "error": {"type": "overloaded_error", "message": "overloaded"}})
+        assert "overloaded" in str(ei.value)
+        assert ei.value.code == "overloaded_error"
+
+    def test_error_object_without_type_raises(self):
+        import pytest
+
+        from app.openai_compat import UpstreamStreamError
+
+        conv = StreamConverter("GLM-5.3")
+        with pytest.raises(UpstreamStreamError):
+            conv.feed({"error": {"message": "boom"}})
+
+    def test_error_sse_shape(self):
+        import json
+
+        from app.openai_compat import error_sse
+
+        line = error_sse("boom", "api_error")
+        assert line.startswith("data: ") and line.endswith("\n\n")
+        payload = json.loads(line[len("data: "):])
+        assert payload["error"]["message"] == "boom"
+        assert payload["error"]["code"] == "api_error"
+
 
 class TestJsonModeAndEffort:
     """结构化输出与思考强度：anthropic wire 没有 response_format，用 system 指令逼近。"""

@@ -82,6 +82,10 @@ CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
 # 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
 # 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 240)
+# 同时运行的求解器进程上限（含预热与热路径现解）。每次求解是一个真 Chromium
+# （数百 MB + 单核），池空突发时若无上限会按并发请求数同时拉起 N 个浏览器，
+# 在 1–2GB 小机上直接把内存打满（2.7.33）。超出的求解排队，而不是并行。
+CAPTCHA_MAX_CONCURRENT_SOLVES = max(1, _int("ZCODE_CAPTCHA_MAX_SOLVES", 2))
 # 预热哪个出口的 token 池：空 = 跟随 messages 上游的实际出口（推荐）。
 # 可强制 "proxy" / "direct"；非预热出口按需现解（claim 一小时一轮，够用）。
 CAPTCHA_POOL_EGRESS = (os.getenv("ZCODE_CAPTCHA_POOL_EGRESS", "").strip().lower() or "")
@@ -204,6 +208,9 @@ AUTO_SYNC_CLIENT_VERSION = _bool("ZCODE_AUTO_SYNC_CLIENT_VERSION", True)
 # 「CN billing + US messages」双 IP 异常信号；captcha 签发出口由 gateway
 # 的同一 egress tag 驱动自动对齐（app/egress.py「token 出口=请求出口」）。
 MESSAGES_FORCE_DIRECT = _bool("ZCODE_MESSAGES_FORCE_DIRECT", False)
+# 网关密钥未配置时是否放行（默认拒：未配置 = 公开代理，任何人可白嫖账号池）。
+# 仅本地开发/测试可显式打开；生产请务必在后台设置 Gateway API Key（2.7.33）。
+GATEWAY_ALLOW_NO_KEY = _bool("ZCODE_GATEWAY_ALLOW_NO_KEY", False)
 # billing/claim 链路出口（2026-11-13 tebi 线上实证）："direct"（历史缺省，
 # GCP 类大厂 ASN 直连可用）或 "proxy"（机房小 ASN 直连 IP 被 billing 风控
 # 拒——preview 空投放/429、验证码 token 3007；走家宽代理 3/3 号立即可领）。
@@ -222,7 +229,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.32"
+APP_VERSION = "2.7.33"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

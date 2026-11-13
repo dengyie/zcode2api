@@ -202,7 +202,11 @@ async def test_round_no_accounts_warns_on_state_change_only(fresh_app, monkeypat
     import app.claim as claim_module
 
     warns: list[str] = []
-    monkeypatch.setattr(claim_module.logs, "warn", lambda tag, msg: warns.append(msg))
+    # 只收 claim 标签：logs.warn 是共享模块，version_tracker 等组件的告警会混进来
+    monkeypatch.setattr(
+        claim_module.logs, "warn",
+        lambda tag, msg: warns.append(msg) if tag == "claim" else None,
+    )
 
     async def fake_round_fn(acc, skip_plan_ids=None):
         return []

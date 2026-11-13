@@ -7,6 +7,7 @@ import time
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from .. import logs, reqlog
 from ..auth_admin import verify_admin_key
@@ -535,11 +536,13 @@ async def claim(payload: dict = Body(default=None)):
 @router.get("/claim/captcha-config")
 async def claim_captcha_config():
     """手动领取用：阿里验证码 SDK 初始化参数（前端浏览器内完成人机验证）。"""
+    from .. import settings as app_settings
     from ..captcha import captcha_manager
-    from ..egress import DIRECT
 
-    # claim 全链路走直连（billing 请求 trust_env=False），验证码配置同源拉取
-    config = await captcha_manager.fetch_config(DIRECT)
+    # 出口必须跟随 claim 全链路（BILLING_EGRESS）：验证码 token 由某出口签发后，
+    # 换出口使用会被上游判 unusual activity（3012）。此前写死 DIRECT，在
+    # BILLING_EGRESS=proxy 部署下会让手动领取拿到直连出口的验证码配置（2.7.33）。
+    config = await captcha_manager.fetch_config(app_settings.BILLING_EGRESS)
     return {
         "enabled": bool(config.get("enabled", True)),
         "scene_id": config.get("sceneId") or "",
@@ -636,20 +639,27 @@ async def get_settings():
 
 @router.put("/settings")
 async def update_settings(payload: dict = Body(...)):
-    if "admin_key" in payload:
-        key = (payload["admin_key"] or "").strip()
+    def _check_key(value: object, label: str) -> str:
+        key = str(value or "").strip()
         if not key:
-            raise HTTPException(400, "后台密钥不能为空")
+            raise HTTPException(400, f"{label}不能为空")
+        if len(key) < 12:
+            # 弱密钥（短口令/默认词）在公网代理上等于没有鉴权：统一要求 ≥12 字符。
+            raise HTTPException(400, f"{label}至少 12 个字符（建议随机串）")
+        return key
+
+    if "admin_key" in payload:
+        key = str(payload["admin_key"] or "").strip()
         if "…" in key or key == "••••":
             pass  # 前端回填的掩码，不改密
         else:
-            store.set_setting("admin_key", key)
+            store.set_setting("admin_key", _check_key(key, "后台密钥"))
     if "gateway_key" in payload:
-        key = (payload["gateway_key"] or "").strip()
+        key = str(payload["gateway_key"] or "").strip()
         if "…" in key or key == "••••":
             pass
         else:
-            store.set_setting("gateway_key", key)
+            store.set_setting("gateway_key", _check_key(key, "网关密钥"))
     if "quota_refresh_interval" in payload:
         try:
             interval = max(0, int(payload["quota_refresh_interval"]))
@@ -702,9 +712,11 @@ async def check_zcode_version_now():
 
 
 # ── 导入 / 导出 ─────────────────────────────────────────────────────────────
-@router.get("/export")
+# 导出包内含 JWT / API Key 明文：只允许 POST（GET 会被浏览器预取、进历史与
+# Referer），并显式禁止缓存（2.7.33）。
+@router.post("/export")
 async def export_accounts():
-    return store.export()
+    return JSONResponse(store.export(), headers={"Cache-Control": "no-store"})
 
 
 @router.post("/import")

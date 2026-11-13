@@ -291,6 +291,12 @@ class ResponsesStreamConverter:
             "parallel_tool_calls": True,
         }
 
+    def fail(self, message: str, code: str | None = None) -> list[str]:
+        """流中途失败：产出 response.failed 终态事件（对齐 Responses 协议）。"""
+        final = self._response_skeleton("failed", [])
+        final["error"] = {"code": code or "upstream_error", "message": message}
+        return [self._event("response.failed", {"response": final})]
+
     def start(self) -> list[str]:
         return [
             self._event("response.created", {"response": self._response_skeleton("in_progress", [])}),

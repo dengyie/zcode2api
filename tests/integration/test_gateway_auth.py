@@ -34,8 +34,27 @@ def gateway_key(fresh_app):
 
 @pytest.mark.integration
 class TestGatewayAuth:
-    async def test_no_key_configured_allows_anonymous(self, gateway_client, fresh_app):
-        """未配置 key 时保持放行（现有部署的默认形态，回归锁定）。"""
+    async def test_no_key_configured_fails_closed_by_default(
+        self, gateway_client, fresh_app, monkeypatch
+    ):
+        """未配置 key 且未开放行开关 → 403（默认 fail-closed，2.7.33）。
+
+        conftest 为了免去逐用例配 key，默认把 GATEWAY_ALLOW_NO_KEY 打开；
+        这里显式关掉，锁定生产默认形态。
+        """
+        from app import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "GATEWAY_ALLOW_NO_KEY", False)
+        client, _mock = gateway_client
+        assert fresh_app.gateway_key() == ""
+        res = await client.post("/v1/messages", json=_MESSAGES_BODY)
+        assert res.status_code == 403
+        assert "未配置" in res.json()["detail"]
+
+    async def test_no_key_configured_allows_anonymous_when_opted_in(
+        self, gateway_client, fresh_app
+    ):
+        """显式放行开关（本地开发/测试）下保持匿名可用。"""
         assert fresh_app.gateway_key() == ""
         res = await gateway_client[0].post("/v1/messages", json=_MESSAGES_BODY)
         assert res.status_code != 401 and res.status_code != 403

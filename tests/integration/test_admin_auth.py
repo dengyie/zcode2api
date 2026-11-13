@@ -88,3 +88,49 @@ class TestSettingsSecretMask:
         assert res.status_code == 200
         assert fresh_app.admin_key() == "keep-this-admin-key"
         assert fresh_app.account_concurrency() == 3
+
+
+@pytest.mark.integration
+class TestAdminAuthHardening:
+    """2.7.33：非 ASCII 密钥、查询串鉴权、导出方法/缓存、密钥强度。"""
+
+    async def test_non_ascii_key_rejected_without_500(self):
+        """compare_digest(str) 遇非 ASCII 会 TypeError → 500；必须稳定拒绝。
+
+        HTTP 层发不出非 ASCII 头（httpx 用 ascii 编码），所以直接对比较函数
+        断言：不抛 TypeError，且不等于配置值。
+        """
+        from app import auth_admin
+
+        assert auth_admin._key_equal("密钥🚀", "zcode") is False
+        assert auth_admin._key_equal("zcode", "zcode") is True
+
+    async def test_query_param_auth_removed(self, gateway_client):
+        """?app_key= 已移除：URL 里的密钥会进日志/历史/Referer。"""
+        from app import auth_admin
+
+        auth_admin.reset_failures()
+        client, _ = gateway_client
+        res = await client.get("/admin/api/verify?app_key=zcode")
+        assert res.status_code == 401
+
+    async def test_export_requires_post_and_no_store(self, gateway_client):
+        client, _ = gateway_client
+        headers = {"Authorization": "Bearer zcode"}
+        assert (await client.get("/admin/api/export", headers=headers)).status_code == 405
+        res = await client.post("/admin/api/export", headers=headers)
+        assert res.status_code == 200
+        assert res.headers.get("cache-control") == "no-store"
+
+    async def test_short_gateway_key_rejected(self, gateway_client):
+        client, _ = gateway_client
+        headers = {"Authorization": "Bearer zcode"}
+        res = await client.put("/admin/api/settings", json={"gateway_key": "short"},
+                               headers=headers)
+        assert res.status_code == 400
+        assert "12" in res.json()["detail"]
+        # 强密钥可写入
+        ok = await client.put("/admin/api/settings",
+                              json={"gateway_key": "sk-0123456789abcdef"},
+                              headers=headers)
+        assert ok.status_code == 200

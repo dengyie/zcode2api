@@ -81,6 +81,31 @@ def _kill_orphan_chromium() -> int:
     return killed
 
 
+def _cleanup_stale_profiles(max_age_seconds: int = 3600) -> int:
+    """清掉 puppeteer 留下的旧临时 profile 目录（2.7.33）。
+
+    Chromium 被 SIGKILL 后 `--user-data-dir=/tmp/puppeteer_dev_chrome_profile-*`
+    不会被删，长期运行会堆满 /tmp（单个目录几十 MB）。只删 mtime 超过
+    max_age 的——并发求解中活跃浏览器的 profile 一直在写，不会被误删。
+    """
+    import glob
+    import shutil
+    import tempfile
+
+    removed = 0
+    cutoff = time.time() - max_age_seconds
+    pattern = os.path.join(tempfile.gettempdir(), "puppeteer_dev_chrome_profile-*")
+    for path in glob.glob(pattern):
+        try:
+            if os.path.getmtime(path) > cutoff:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 class _Token:
     __slots__ = ("param", "region", "born_at", "egress")
 
@@ -103,6 +128,8 @@ class CaptchaManager:
         self._refill_task: asyncio.Task | None = None
         self._refilling = False
         self._config_lock = asyncio.Lock()
+        # 求解并发上限（进程级）：池空突发时不按请求数拉起 N 个 Chromium
+        self._solve_sem = asyncio.Semaphore(settings.CAPTCHA_MAX_CONCURRENT_SOLVES)
         # 配置按出口缓存：上游按出口 IP 给不同的 captcha 配置（实测直连 region=cn、
         # 走 US 代理 region=sgp），混用会把错地区的 token 配到请求上。
         self._config_cache: dict[str, dict] = {}
@@ -175,6 +202,18 @@ class CaptchaManager:
                 self._config_cache[tag] = captcha
                 self._config_cache_at[tag] = _now_ms()
                 return captcha
+            # 两条出口都失败：优先沿用该出口上一次成功拉到的配置（stale-while-
+            # error）。退回 CAPTCHA_DEFAULTS 会让 model_requests_need_captcha()
+            # 认为「该带码」，而实际配置可能是 skip_model_request=true —— 给
+            # 官方不会带码的请求带上验证码头 = 3012 的结构性嫌疑（2.7.33）。
+            stale = self._config_cache.get(tag)
+            if stale:
+                logs.warn(
+                    "captcha",
+                    f"获取配置失败（出口={tag}，含兜底），沿用上次缓存配置"
+                    f"（{type(err).__name__ if err else '无响应'}: {err}）",
+                )
+                return stale
             logs.warn(
                 "captcha",
                 f"获取配置失败（出口={tag}，含兜底），使用默认: "
@@ -338,7 +377,9 @@ class CaptchaManager:
         last_err: str | None = None
         for attempt in range(1, settings.CAPTCHA_SOLVE_RETRIES + 1):
             try:
-                param = await self._run_solver(scene, region, prefix, tag)
+                # 进程级并发上限：超出排队等前一个浏览器退出，避免内存被打满
+                async with self._solve_sem:
+                    param = await self._run_solver(scene, region, prefix, tag)
             except Exception as err:  # noqa: BLE001
                 last_err = str(err)
                 param = None
@@ -418,6 +459,11 @@ class CaptchaManager:
             orphans = _kill_orphan_chromium()
             if orphans:
                 logs.warn("captcha", f"清理孤儿 Chromium 进程 {orphans} 个")
+            # 被 SIGKILL 的浏览器留下的临时 profile 目录没人删：每次求解顺手清
+            # 一遍陈旧目录（>1h），避免 /tmp 长期膨胀（2.7.33）
+            stale = _cleanup_stale_profiles()
+            if stale:
+                logs.info("captcha", f"清理陈旧浏览器 profile 目录 {stale} 个")
 
         param = None
         for line in stdout.decode("utf-8", "ignore").splitlines():
