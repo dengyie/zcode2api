@@ -136,6 +136,21 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="zcode-hub", version=settings.APP_VERSION, lifespan=lifespan)
 
+    # 前后端分离：前端默认同源 /static 服务，设置 ZCODE_CORS_ORIGINS 后即可
+    # 部署到任意源跨域调用本 API（Bearer 鉴权，无 cookie，CSRF 面为零）。
+    origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+    if origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+            max_age=86400,
+        )
+
     app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
 
     app.include_router(pages.router)

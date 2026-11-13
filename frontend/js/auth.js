@@ -1,5 +1,5 @@
 /* zcode2api — Auth module (localStorage 加密存储后台密钥) */
-const ADMIN_API = '/admin/api';
+const ADMIN_API = (window.ZCODE_API_BASE || '') + '/admin/api';
 
 const _ENC = new TextEncoder(), _DEC = new TextDecoder();
 const _SECRET = 'zcode2api-admin';

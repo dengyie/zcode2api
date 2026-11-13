@@ -1,27 +1,26 @@
 """页面路由：登录、账号管理、设置。
 
-前端文件来自独立部署目录（settings.FRONTEND_DIR，前后端分离）——
-改前端只需 rsync 该目录，无需重启后端。
+前后端分离（2026-11-14）：后端只做**纯静态文件服务**（FileResponse，etag/
+last-modified 协商缓存），不做任何服务端模板替换；前端资源可整体 rsync 到
+任意静态源，配合 ZCODE_CORS_ORIGINS 即可跨源调用本 API。业务数据一律走
+/admin/api/*（JSON + Bearer），与页面完全解耦。
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from .. import settings
 
 router = APIRouter()
 
-_TOKEN = "{{APP_VERSION}}"
 
-
-def _html(name: str) -> HTMLResponse:
+def _html(name: str) -> FileResponse:
     path = settings.FRONTEND_DIR / "admin" / name
     if not path.exists():
         raise HTTPException(404, "页面不存在")
-    body = path.read_text(encoding="utf-8").replace(_TOKEN, settings.frontend_version())
-    return HTMLResponse(body, headers={"Cache-Control": "no-store"})
+    return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @router.get("/", include_in_schema=False)

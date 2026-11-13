@@ -212,6 +212,10 @@ MESSAGES_FORCE_DIRECT = _bool("ZCODE_MESSAGES_FORCE_DIRECT", False)
 # 网关密钥未配置时是否放行（默认拒：未配置 = 公开代理，任何人可白嫖账号池）。
 # 仅本地开发/测试可显式打开；生产请务必在后台设置 Gateway API Key（2.7.33）。
 GATEWAY_ALLOW_NO_KEY = _bool("ZCODE_GATEWAY_ALLOW_NO_KEY", False)
+# 前后端分离跨域白名单（2.7.34）：前端部署到独立源（GitHub Pages/CF Pages/独立
+# nginx）时填该源，逗号分隔；默认空 = 仅同源（不输出 CORS 头）。鉴权是纯
+# Bearer 头（无 cookie），跨域无 CSRF 面。
+CORS_ORIGINS = os.getenv("ZCODE_CORS_ORIGINS", "")
 # billing/claim 链路出口（2026-11-13 tebi 线上实证）："direct"（历史缺省，
 # GCP 类大厂 ASN 直连可用）或 "proxy"（机房小 ASN 直连 IP 被 billing 风控
 # 拒——preview 空投放/429、验证码 token 3007；走家宽代理 3/3 号立即可领）。
@@ -230,7 +234,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.33"
+APP_VERSION = "2.7.34"
 
 _FRONTEND_VERSION_FILE = FRONTEND_DIR / "version"
 

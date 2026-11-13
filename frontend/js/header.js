@@ -3,7 +3,7 @@ async function renderAdminHeader(){
   const mount=document.getElementById('admin-header');
   if(!mount)return;
   let version='';
-  try{const r=await fetch('/meta');if(r.ok)version='v'+(await r.json()).version;}catch{}
+  try{const r=await fetch((window.ZCODE_API_BASE || '') + '/meta');if(r.ok)version='v'+(await r.json()).version;}catch{}
   const active=mount.dataset.active||location.pathname;
   const nav=[
     ['/admin/accounts','账号池'],

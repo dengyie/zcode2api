@@ -134,3 +134,31 @@ class TestAdminAuthHardening:
                               json={"gateway_key": "sk-0123456789abcdef"},
                               headers=headers)
         assert ok.status_code == 200
+
+
+@pytest.mark.integration
+class TestCorsSeparation:
+    """前后端分离（2.7.34）：CORS 白名单语义——默认同源，设 ZCODE_CORS_ORIGINS 才放行。"""
+
+    async def test_no_cors_headers_by_default(self):
+        from httpx import ASGITransport, AsyncClient
+
+        from app.main import create_app
+
+        async with AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://t") as c:
+            r = await c.get("/meta", headers={"Origin": "https://fe.example.com"})
+            assert "access-control-allow-origin" not in r.headers
+
+    async def test_cors_origin_allowlisted(self, monkeypatch):
+        from httpx import ASGITransport, AsyncClient
+
+        from app import settings
+        from app.main import create_app
+
+        monkeypatch.setattr(settings, "CORS_ORIGINS", "https://fe.example.com")
+        async with AsyncClient(transport=ASGITransport(app=create_app()), base_url="http://t") as c:
+            r = await c.get("/meta", headers={"Origin": "https://fe.example.com"})
+            assert r.headers.get("access-control-allow-origin") == "https://fe.example.com"
+            # 未列入的源不放行
+            r2 = await c.get("/meta", headers={"Origin": "https://evil.example.com"})
+            assert "access-control-allow-origin" not in r2.headers
