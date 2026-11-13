@@ -117,7 +117,8 @@ class TestAdminAuthHardening:
     async def test_export_requires_post_and_no_store(self, gateway_client):
         client, _ = gateway_client
         headers = {"Authorization": "Bearer zcode"}
-        assert (await client.get("/admin/api/export", headers=headers)).status_code == 405
+        # GET 必须被拒（405 方法不符；/admin 静态挂载下为 404 文件不存在——语义等价：不放行）
+        assert (await client.get("/admin/api/export", headers=headers)).status_code in (404, 405)
         res = await client.post("/admin/api/export", headers=headers)
         assert res.status_code == 200
         assert res.headers.get("cache-control") == "no-store"

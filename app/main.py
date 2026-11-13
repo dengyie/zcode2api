@@ -151,11 +151,16 @@ def create_app() -> FastAPI:
             max_age=86400,
         )
 
-    app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
+
 
     app.include_router(pages.router)
     app.include_router(admin_api.router)
     app.include_router(gateway.router)
+    app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
+    # 前端相对资产路径（js/... css/...）在 /admin/* 页面形态下的服务点；路由
+    # （/admin/api/*、/admin/login 等）注册在前，优先级高于本挂载。
+    app.mount("/admin", StaticFiles(directory=str(settings.FRONTEND_DIR / "admin"), html=True),
+              name="admin-static")
     return app
 
 
