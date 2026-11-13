@@ -169,6 +169,7 @@ GATE_POOL_PROBE_MIN_SECONDS = _int("ZCODE_GATE_POOL_PROBE_MIN", 300)
 # 单账号并发上限。上游 ZCode 单账号并发写死 3（用户 2026-11-13 口径，此前的
 # 「2」为当时实测保守值）——本地 cap 高于它只会常态化吃 3008 短退避，故取 3：
 # 超限自动切下一账号。不读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台 meta 覆盖
+# （2→10→3 纠正：上游 ZCode 单账号并发写死 3，本地闸必须同值，放更宽只会吃 3008）
 ACCOUNT_CONCURRENCY = 3
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。

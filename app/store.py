@@ -182,8 +182,8 @@ class Store:
             return settings.QUOTA_REFRESH_INTERVAL
 
     def account_concurrency(self) -> int:
-        """单账号并发上限。写死 2（2026-11-04 线上实测）：env 与后台 meta 覆盖
-        一律作废（历史 meta 值如 account_concurrency=4 自动失效）。"""
+        """单账号并发上限。写死 3（2→10→3 纠正：上游 ZCode 单账号并发即 3）：
+        env 与后台 meta 覆盖一律作废（历史 meta 值如 account_concurrency=4 自动失效）。"""
         return settings.ACCOUNT_CONCURRENCY
 
     def claim_round_interval(self) -> int:

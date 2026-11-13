@@ -917,7 +917,7 @@ def _note_pool_exhausted(trigger: Account | None = None) -> None:
 
 
 def _limit() -> int:
-    """当前并发上限。写死 2（2026-11-04 线上实测），env/meta 一律无效。"""
+    """当前并发上限。写死 3（对齐上游 ZCode 单账号并发），env/meta 一律无效。"""
     return store.account_concurrency()
 
 
