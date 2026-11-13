@@ -1128,8 +1128,20 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
         return True
 
     def _jump_to_fallback() -> bool:
-        """风控/鉴权后跳过所有 plan 系渠道，直达 api-key 渠道（如持有）。"""
+        """风控/鉴权后跳过所有 plan 系渠道，直达 api-key 渠道（如持有）。
+
+        Key 处于 1113 无余额冷却时直接跳过：1113 是永久态，尝试必然 429 1113
+        （有界重探 = 冷却到期后第一次触发才会真正尝试，~1h 一探）。否则每次
+        进程级停摆（如边缘 405）都会让全部账号刷一遍「429 1113 无余额」失败
+        记录，把真实根因（405 边缘封禁）淹死在账号失败日志里。
+        """
         fallback = "zai_fallback" if account.provider == "zai" else "bigmodel"
+        if _key_no_balance_cooling(account.id):
+            logs.warn(
+                req_id,
+                f"账号 {account.name} Key 无余额冷却中，跳过 Key 回退（保留根因记录）",
+            )
+            return False
         return _jump_to_channel(target=fallback)
 
     try:
