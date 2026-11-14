@@ -226,20 +226,11 @@ class TetherPoolEgress:
 
     # ── 健康循环 ───────────────────────────────────────────────────────────
     async def health_once(self, account) -> bool:
-        """轻探针：ip-api 经该账号网关 URL。True=可用。"""
-        proxy = egress.account_proxy(account)
-        st, raw = await asyncio.to_thread(self._http_get_via, "http://ip-api.com/json/?fields=query", proxy)
-        try:
-            return json.loads(raw).get("query") is not None
-        except Exception:
-            return False
-
-    def _http_get_via(self, url: str, proxy: str | None):
-        req = urllib.request.Request(url, headers={"User-Agent": "zcode-hub-egress-health"})
-        op = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-        with op.open(req, timeout=20) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+        """轻探针：Plan 通道经该账号网关 URL（与 rebalance 同一零 strike 口径，
+        3012 JSON = 节点通、边缘放行）。连接级失败/边缘 HTML = 不健康。"""
+        st, raw = await self._probe_via(
+            account, egress.account_proxy(account), account.jwt_token or "")
+        return st != 0 and _edge_kind(raw) == "JSON-APP"
 
     async def _loop(self) -> None:
         from . import logs
@@ -251,22 +242,27 @@ class TetherPoolEgress:
                         settings.EGRESS_SUPPLY != "tetherpool":
                     continue
                 accounts = [a for a in store.list_accounts("zai")
-                            if a.enabled and a.provider == "zai"]
+                            if a.enabled and a.provider == "zai"
+                            and egress.tetherpool_enabled_for(a)]
                 if not accounts:
                     continue
                 for account in accounts:
-                    if not account.egress_node:
-                        # 绑定引导（幂等，TP 粘性）：egress_node 是 ban 目标 +
-                        # 互斥 exclude_node 集合的来源，缺了风控约束无从落地
-                        if not await self.ensure_binding(account):
+                    try:
+                        if not account.egress_node:
+                            # 绑定引导（幂等，TP 粘性）：egress_node 是 ban 目标 +
+                            # 互斥 exclude_node 集合的来源，缺了风控约束无从落地
+                            if not await self.ensure_binding(account):
+                                logs.warn("egress_pool",
+                                          f"[health] {account.name} 绑定引导失败（下轮重试）")
+                                continue
+                        if not await self.health_once(account):
                             logs.warn("egress_pool",
-                                      f"[health] {account.name} 绑定引导失败（下轮重试）")
-                            continue
-                    if not await self.health_once(account):
+                                      f"[health] {account.name} 出口探针失败 → rebalance")
+                            await self.rebalance(account, reason="health_probe_fail",
+                                                 ban=False)
+                    except Exception as exc:  # noqa: BLE001 - 单账号故障不夭折整轮
                         logs.warn("egress_pool",
-                                  f"[health] {account.name} 出口探针失败 → rebalance")
-                        await self.rebalance(account, reason="health_probe_fail",
-                                             ban=False)
+                                  f"[health] {account.name} 探针异常（跳过）: {exc!r}")
             except Exception as exc:  # noqa: BLE001 - 健康循环永不中止
                 logs.warn("egress_pool", f"健康循环异常（下轮重试）: {exc!r}")
                 await asyncio.sleep(30)

@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app import egress, egress_pool, settings
@@ -205,3 +207,46 @@ def test_conn_fail_tags_are_isolated():
     assert not egress.conn_fail_clustered(tag_b)  # per-account 隔离
     egress.clear_conn_fails(tag_a)
     egress.clear_conn_fails(tag_b)
+
+
+@pytest.mark.asyncio
+async def test_health_loop_bootstraps_binding_and_probes(tp_mode, monkeypatch):
+    """健康循环：未绑定账号先 ensure_binding（egress_node 落地 = 风控互斥前提），
+    已绑定账号探针失败 → rebalance(ban=False)。"""
+    from app import store as store_mod
+
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    monkeypatch.setattr(settings, "TP_HEALTH_INTERVAL", 0)
+
+    acc = store.add_account("zai", "h1", "h.eyJzdWIiOiJ1In0.sig")
+    acc.id = "acc-h1"
+    acc.enabled = True
+
+    calls = {"bind": 0, "probe": 0, "rebalance": 0}
+
+    async def fake_tp_acquire(account, force_rebalance=False, extra_exclude=None):
+        calls["bind"] += 1
+        account.egress_node = "node-boot"
+        return {"node_name": "node-boot"}
+
+    async def fake_health_once(account):
+        calls["probe"] += 1
+        return False
+
+    async def fake_rebalance(account, reason, ban=True):
+        calls["rebalance"] += 1
+
+    monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fake_health_once)
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+
+    egress_pool.egress_pool.start()
+    try:
+        await asyncio.sleep(0.15)
+    finally:
+        await egress_pool.egress_pool.stop()
+    assert calls["bind"] >= 1
+    assert acc.egress_node == "node-boot"
+    assert calls["probe"] >= 1
+    assert calls["rebalance"] >= 1
