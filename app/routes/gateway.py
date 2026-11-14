@@ -1306,6 +1306,11 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             cm = client.stream("POST", url, headers=headers, content=payload)
             try:
                 resp = await cm.__aenter__()
+            except asyncio.CancelledError:
+                # 客户端断开（取消是常态）也要释放连接池——GC 回收延迟会积 fd
+                await client.aclose()
+                _drop_gate()
+                raise
             except httpx.HTTPError as err:
                 await client.aclose()
                 _drop_gate()
@@ -1349,9 +1354,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             # 透传，客户端拿到「200 但没有 message」。JSON 正文一次读净：合法响应改走内存
             # 流（下游消费逻辑不变），业务错误码映射成等价 HTTP 状态走下面统一分支。
             if status_code < 400 and resp.headers.get("content-type", "").startswith("application/json"):
-                raw = await resp.aread()
-                await cm.__aexit__(None, None, None)
-                await client.aclose()
+                try:
+                    raw = await resp.aread()
+                finally:
+                    # aread 异常（ReadTimeout/协议错）也不能漏 cm/client 关闭
+                    await cm.__aexit__(None, None, None)
+                    await client.aclose()
                 cm = client = None  # 已关闭，_Upstream.close 容忍 None
                 decoded = raw.decode("utf-8", "ignore")
                 data = _safe_json(decoded)
@@ -1370,9 +1378,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             if status_code >= 400:
                 _drop_gate()  # 本趟上游尝试已结束；continue 的下一趟会重新申请
                 if text is None:
-                    text = (await resp.aread()).decode("utf-8", "ignore")
-                    await cm.__aexit__(None, None, None)
-                    await client.aclose()
+                    try:
+                        text = (await resp.aread()).decode("utf-8", "ignore")
+                    finally:
+                        # 同上：aread 异常时也要保证响应体/客户端释放
+                        await cm.__aexit__(None, None, None)
+                        await client.aclose()
 
                 # 验证码挑战：三形态任一命中即清池重试（不改账号状态）。zcode-plan
                 # 渠道上即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。

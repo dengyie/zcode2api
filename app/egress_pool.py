@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 
 from . import egress, settings
+from .models import PROVIDERS
 
 _NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _PROBE_BODY = json.dumps({"model": "GLM-5.3-Flash", "max_tokens": 16,
@@ -69,16 +70,18 @@ def gateway_url_for(account) -> str:
 
 def _other_nodes(account) -> list[str]:
     """其它绑定账号的 TP 节点名（互斥 exclude_node 集合，风控核心：
-    任何时刻不允许两个账号共用一个节点）。"""
+    任何时刻不允许两个账号共用一个节点）。扫全 provider（add_account 给任何
+    命中灰度名单的账号发网关 URL，bigmodel 账号节点同样占位——review 2026-11-15）。"""
     from .store import store
 
     out = []
-    for a in store.list_accounts("zai"):
-        if a.id == account.id:
-            continue
-        node = getattr(a, "egress_node", None)
-        if node:
-            out.append(node)
+    for provider in PROVIDERS:
+        for a in store.list_accounts(provider):
+            if a.id == account.id:
+                continue
+            node = getattr(a, "egress_node", None)
+            if node:
+                out.append(node)
     return out
 
 
@@ -140,13 +143,23 @@ class TetherPoolEgress:
         self._loop_task: asyncio.Task | None = None
         self._rebalance_at: dict[str, float] = {}  # account_id → monotonic 去抖
         self._inflight: set[asyncio.Task] = set()  # 健康检查任务强引用（防 GC）
+        self._locks: dict[str, asyncio.Lock] = {}  # account_id → rebalance 互斥
+                                                 # （TOCTOU 收口：同账号串行，
+                                                 #   跨账号仍可并发——互斥由
+                                                 #   exclude_node 保证）
+
+    def _account_lock(self, account_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(account_id, asyncio.Lock())
 
     # ── 绑定/换节点编排 ────────────────────────────────────────────────────
     async def ensure_binding(self, account) -> bool:
-        """懒引导：egress_node 为空的绑定账号 acquire 一次（幂等，TP 粘性）。"""
+        """懒引导：egress_node 为空的绑定账号 acquire 一次（幂等，TP 粘性）。
+
+        必须带 exclude_node=其它账号节点（风控核心）：首次分配正是节点归属
+        发生的时刻，不带互斥 = 新账号可静默落到已属其它账号的节点。"""
         if account.egress_node:
             return True
-        d = await tp_acquire(account)
+        d = await tp_acquire(account, extra_exclude=_other_nodes(account))
         if not d:
             return False
         account.egress_node = d.get("node_name")
@@ -157,13 +170,20 @@ class TetherPoolEgress:
     async def rebalance(self, account, reason: str, ban: bool = True) -> bool:
         """换该账号的 TP 绑定节点：可选 ban 旧节点 → force_rebalance（最多
         3 轮，每轮即时探针验证）→ 成功更新 egress_node 并持久化。"""
+        # TOCTOU 收口：同账号 rebalance 串行（exclude 快照→发布窗口最长 2-3 分钟，
+        # 并发触发会互不可见）；跨账号并发无妨——互斥由 exclude_node 保证
+        async with self._account_lock(account.id):
+            return await self._rebalance_locked(account, reason, ban)
+
+    async def _rebalance_locked(self, account, reason: str, ban: bool) -> bool:
         from . import logs
         from .store import store
         now = time.monotonic()
         if now - self._rebalance_at.get(account.id, 0) < settings.TP_REBALANCE_DEBOUNCE:
             logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")
             return False
-        self._rebalance_at[account.id] = now
+        # 去抖位延后到首次 acquire 成功才置位（review 2026-11-15：先置位会让
+        # acquire 失败的 no-op rebalance 吃掉后续 120s 内更高优的 ban 触发）
 
         old_node = account.egress_node
         jwt = account.jwt_token or ""
@@ -180,6 +200,7 @@ class TetherPoolEgress:
             if not d:
                 logs.warn("egress_pool", f"{account.name} acquire 失败/池枯——保持旧绑定")
                 return False
+            self._rebalance_at[account.id] = now  # 真正开始换了才计数去抖
             node = d.get("node_name")
             exit_ip = d.get("exit_ip")
             logs.info("egress_pool",
@@ -196,6 +217,10 @@ class TetherPoolEgress:
             if kind == "JSON-APP":
                 account.egress_node = node
                 store.update_account(account)
+                # 换节点 = 出口 IP 变化：验证码 token 绑定签发出口 IP（tag 恒定
+                # 但底层 IP 变了），旧 token 继续用必然 3012——清池重签
+                from .captcha import captcha_manager
+                captcha_manager.invalidate(probe_url)
                 logs.info("egress_pool",
                           f"✅ {account.name} 出口已换 {old_node or '?'} → {node}"
                           f"（exit={exit_ip}），探针 JSON-APP 放行")
@@ -205,25 +230,50 @@ class TetherPoolEgress:
             await tp_ban(node, reason, {"http_status": st, "body_kind": kind,
                                         "probe": "post_rebalance"}, account.name)
             old_node = node
-        logs.warn("egress_pool", f"{account.name} 3 轮 rebalance 均未通过探针——保持旧绑定，人工复核")
+        # 3 轮全败：TP 服务端绑定已随最后一次 force_rebalance 移到最后候选
+        # （已被 ban 或探不通）——再 acquire 一轮并探针验收，拿到可用绑定即
+        # 提交（旧节点无法显式回绑：TP 不可指定节点；有 exclude + 探针兜底，
+        # 至少保证 hub 记录 = TP 实际绑定 = 探针可用，互斥集合不再被污染）
+        d = await tp_acquire(account, force_rebalance=True,
+                             extra_exclude=_other_nodes(account))
+        if d and d.get("node_name"):
+            node = d.get("node_name")
+            st, raw = await self._probe_via(account, probe_url, jwt)
+            if st == 0 or _edge_kind(raw) != "JSON-APP":
+                logs.warn("egress_pool",
+                          f"{account.name} 3 轮均败，回绑候选 {node} 探针仍不过"
+                          f"（TP 绑定停留在此，人工介入）")
+                account.egress_node = node  # hub 记录对齐 TP 实际绑定
+                store.update_account(account)
+                return False
+            logs.warn("egress_pool",
+                      f"{account.name} 3 轮均败，第 4 轮 {node} 探针放行——恢复服务")
+            account.egress_node = node
+            store.update_account(account)
+            return True
+        logs.warn("egress_pool",
+                  f"{account.name} 3 轮均败且回绑 acquire 失败"
+                  f"（TP 绑定停在最后候选 {account.egress_node}，人工介入）")
         return False
 
     async def verify_then_rebalance(self, account, reason: str) -> None:
         """连接失败触发器（gateway 调用）：先探针验证绑定节点，探针通 = 链路
         瞬态（只留痕，不换节点防漂移）；探针不通 = 节点死 → rebalance 换绑。
-        rebalance 自带 120s 去抖，同账号风暴下最多每 2 分钟换一次。"""
+        rebalance 自带 120s 去抖；同账号探针走 _account_lock 串行——N 个在飞
+        请求同时失败只扇出 1 次探针（review 2026-11-15：无去重 = N 并发探针）。"""
         from . import logs
 
-        if not account.egress_node:
-            await self.rebalance(account, reason=reason, ban=False)
-            return
-        if await self.health_once(account):
-            logs.info("egress_pool",
-                      f"{account.name} 连接失败后探针通——瞬态抖动，保持绑定 {account.egress_node}")
-            return
-        logs.warn("egress_pool",
-                  f"{account.name} 连接失败且探针不通（{account.egress_node}）→ rebalance")
-        await self.rebalance(account, reason=reason, ban=False)
+        async with self._account_lock(account.id):
+            if not account.egress_node:
+                await self._rebalance_locked(account, reason=reason, ban=False)
+                return
+            if await self.health_once(account):
+                logs.info("egress_pool",
+                          f"{account.name} 连接失败后探针通——瞬态抖动，保持绑定 {account.egress_node}")
+                return
+            logs.warn("egress_pool",
+                      f"{account.name} 连接失败且探针不通（{account.egress_node}）→ rebalance")
+            await self._rebalance_locked(account, reason=reason, ban=False)
 
     async def _probe_via(self, account, proxy_url: str, jwt: str):
         """经账号网关代理的真实 Plan 通道探针（零 strike 面：3012 归因口径）。

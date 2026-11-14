@@ -409,6 +409,18 @@ class Account:
             return fp
         return None
 
+    def egress_view(self) -> str | None:
+        """egress 的后台展示形态：剥离 userinfo（网关 URL 形态含固定口令段，
+        后台可见拓扑但不回显凭据——review 2026-11-15）。"""
+        url = self.egress
+        if not url:
+            return url
+        head, sep, tail = str(url).rpartition("@")
+        if sep and "://" in head:
+            scheme, _, _host = head.partition("://")
+            return f"{scheme}://***@{tail}"
+        return url
+
     def public_view(self) -> dict:
         """返回给前端的视图（脱敏 token）。"""
         secret = self.secret or ""
@@ -437,7 +449,8 @@ class Account:
             "selectable": self.is_selectable(),
             # per-account 出口绑定（2.7.36）：None = 共享出口；排障「该账号从
             # 哪个 IP 出去」一眼可读。egress_node = TetherPool 分配节点名（2.7.39）
-            "egress": self.egress,
+            # egress 剥离 userinfo（拓扑可见、凭据不回显——review 2026-11-15）
+            "egress": self.egress_view(),
             "egress_node": self.egress_node,
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,

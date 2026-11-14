@@ -54,6 +54,8 @@ def via(url, method="GET", body=None, headers=None, proxy=None, timeout=40):
         return r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001 - 连接级失败 ≠ 封禁，调用方判 "?"
+        return 0, f"{type(exc).__name__}: {exc}"
 
 
 results = []
@@ -65,11 +67,11 @@ for acc_id, name, blob in rows:
         continue
     port = egress_url.rsplit(":", 1)[1]
 
-    # 1) 出口 IP（该 listener 实际出口）
-    st, raw = via("http://ip-api.com/json/?fields=query,isp",
+    # 1) 出口 IP（该账号网关实际出口；ip-api 明文 HTTP 经 clash 网关不稳，改 ipify）
+    st, raw = via("https://api.ipify.org?format=json",
                   proxy=egress_url, timeout=15)
     try:
-        ip = json.loads(raw).get("query", "?")
+        ip = json.loads(raw).get("ip", "?")
     except Exception:
         ip = "?"
 

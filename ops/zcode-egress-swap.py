@@ -349,7 +349,7 @@ def get_db_secrets():
 
 
 def swap(state, hit):
-    """一次完整换 IP 流程。返回 True=已切换成功。
+    """一次完整换 IP 流程。返回 True=已切换成功；None=hub 自治跳过（不计数）。
 
     per-account 出口隔离（2.7.36）：命中账号绑定了专属 listener（Account.egress）
     时走按账号换 IP（只动该账号的 zcode-acc-NN 组）；未绑定走共享组全池换 IP
@@ -360,9 +360,10 @@ def swap(state, hit):
     egress_url = account_egress_url(hit.get("account_id") or "")
     if egress_url and ":9101@" in egress_url:
         # 2.7.39 TP 供给：hub 内自治 rebalance（egress_pool），agent 的 mihomo
-        # 换钉对本账号不再是数据面——跳过避免告警噪音
+        # 换钉对本账号不再是数据面——跳过避免告警噪音。返回 None 让调用方
+        # 不消耗冷却/每日配额（hub 自治触发器已在 hub 侧处理，review 2026-11-15）
         log("INFO", f"账号 {hit['account']} 出口为 TetherPool 网关绑定（hub 自治），跳过 mihomo 换钉")
-        return False
+        return None
     if egress_url:
         return _swap_one_account(state, hit, egress_url,
                                  ban=hit.get("reason") != "node_unreachable")
@@ -455,7 +456,11 @@ def _swap_one_account(state, hit, egress_url, ban=True):
         log("WARN", "出口 IP 未变化（同线/未生效）——由直连探针把关")
 
     # 3) 直连探针（走该账号自己的 listener，零 strike）
-    st, kind, body = direct_probe(jwt, proxy=f"http://127.0.0.1:{port}")
+    try:
+        st, kind, body = direct_probe(jwt, proxy=f"http://127.0.0.1:{port}")
+    except Exception as exc:  # SSL EOF 等逃逸会中止 cycle（00:07/00:10 实证）
+        log("ALERT", f"[per-account] 直连探针异常 {type(exc).__name__}: {exc}——按探针失败处置")
+        st, kind, body = 0, "PROBE-FAIL", f"{type(exc).__name__}: {exc}"[:140]
     log("INFO", f"直连探针(端口 {port}): HTTP {st} {kind} {body}")
     if kind != "JSON-APP":
         log("ALERT", f"[per-account] 新节点 {target} 仍被边缘封——已 ban，待下轮再换")
@@ -574,7 +579,11 @@ def _swap_shared(state, hit):
         if ip_new == ip_old:
             log("WARN", "出口 IP 未变化（同线/未生效）——继续用该节点验证，异常由探针把关")
         # 4) 双探针：直连（零 strike）→ hub 端到端（闸门感知重试）
-        st, kind, body = direct_probe(jwt)
+        try:
+            st, kind, body = direct_probe(jwt)
+        except Exception as exc:  # 同 _swap_one_account：异常逃逸会中止 cycle
+            log("ALERT", f"[shared] 直连探针异常 {type(exc).__name__}: {exc}——按探针失败处置")
+            st, kind, body = 0, "PROBE-FAIL", f"{type(exc).__name__}: {exc}"[:140]
         log("INFO", "直连探针: HTTP %s %s %s" % (st, kind, body))
         if kind == "HTML-EDGE":
             log("WARN", "新节点 %s 仍被边缘封——ban 后换下一轮" % cand)
@@ -722,19 +731,29 @@ def cycle(state):
     if edge_hits and cooldown_and_quota_ok():
         target_hit = edge_hits[-1]
     elif conn_hits and cooldown_and_quota_ok():
+        # 2.7.39+：连接失败归 hub 自治（verify_then_rebalance）——仅 listener
+        # 绑定账号仍由 agent 聚类兜底（TP 网关账号已被 hub 接管，聚类只统计
+        # listener 账号，避免每日配额被 hub 自治账号的瞬态失败烧光）
         per = {}
         for h in conn_hits:
+            eg = account_egress_url(h["account_id"]) or ""
+            if eg and ":9101@" in eg:
+                continue
             per[h["account_id"]] = per.get(h["account_id"], 0) + 1
-        worst_id, cnt = max(per.items(), key=lambda kv: kv[1])
-        if cnt >= 3:  # 同账号 600s 内 ≥3 次连接失败 = 节点死亡疑似
-            target_hit = dict(next(h for h in conn_hits if h["account_id"] == worst_id),
-                              reason="node_unreachable",
-                              detail=f"600s 内 {cnt} 次连接失败[node_dead]")
-            log("WARN", f"账号 {target_hit['account']} 连接失败聚类（{cnt} 次）——节点死亡疑似")
+        if per:
+            worst_id, cnt = max(per.items(), key=lambda kv: kv[1])
+            if cnt >= 3:  # 同账号 600s 内 ≥3 次连接失败 = 节点死亡疑似
+                target_hit = dict(next(h for h in conn_hits if h["account_id"] == worst_id),
+                                  reason="node_unreachable",
+                                  detail=f"600s 内 {cnt} 次连接失败[node_dead]")
+                log("WARN", f"账号 {target_hit['account']} 连接失败聚类（{cnt} 次）——节点死亡疑似")
     elif unhealthy:
-        # 主动健康：免冷却（连续 2 次探测失败已内建防抖），每轮最多换 2 个
+        # 主动健康：免冷却（连续 2 次探测失败已内建防抖），每轮最多换 2 个；
+        # swap 返回 None（hub 自治跳过）不消耗配额
         for u in unhealthy[:2]:
             ok = swap(state, u)
+            if ok is None:
+                continue
             state["last_swap_epoch"] = time.time()
             state["swap_count"] = state.get("swap_count", 0) + 1
             state["last_result"] = ("ok" if ok else "failed") + "@" + bj_str()
@@ -747,6 +766,9 @@ def cycle(state):
         return
     now = time.time()
     ok = swap(state, target_hit)
+    if ok is None:
+        save_state(state)
+        return
     state["last_swap_epoch"] = now
     state["swap_count"] = state.get("swap_count", 0) + 1
     state["last_result"] = ("ok" if ok else "failed") + "@" + bj_str()

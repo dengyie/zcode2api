@@ -119,9 +119,15 @@ class Store:
             ).fetchall()
             for row in rows:
                 try:
-                    account = Account.from_dict(json.loads(row["data"]))
-                except (json.JSONDecodeError, TypeError) as exc:
-                    # 静默跳过 = 启动期数据丢失无人知晓（2026-11-14 review）
+                    blob = json.loads(row["data"])
+                    if not isinstance(blob, dict):
+                        raise TypeError(f"账号行非 object: {type(blob).__name__}")
+                    account = Account.from_dict(blob)
+                except (json.JSONDecodeError, TypeError, AttributeError,
+                        ValueError, KeyError) as exc:
+                    # 静默跳过 = 启动期数据丢失无人知晓（2026-11-14 review）；
+                    # 非 objecJSON/缺字段（from_dict 的 .items()/键访问）都不能
+                    # 崩掉整个启动——单行损坏只跳过该行（2026-11-15 review）
                     logs.err("store", f"账号行损坏已跳过: {exc}")
                     continue
                 if account.provider in self._accounts:
@@ -296,6 +302,7 @@ class Store:
                                 changed.append(account)
                         elif old and ":9101@" in old:
                             account.egress = None  # 模式回退残留清理
+                            account.egress_node = None  # 语义对齐：无 TP 出口即无 TP 节点
                             changed.append(account)
                 for account in changed:
                     self._persist_account(account)
@@ -310,6 +317,7 @@ class Store:
                     old = account.egress
                     if old and ":9101@" in old:
                         account.egress = None
+                        account.egress_node = None  # 语义对齐（回滚不留 TP 节点）
                         changed.append(account)
                     elif not account.egress:
                         self._assign_egress(account)

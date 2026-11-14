@@ -210,17 +210,18 @@ def test_conn_fail_tags_are_isolated():
 
 
 @pytest.mark.asyncio
-async def test_health_loop_bootstraps_binding_and_probes(tp_mode, monkeypatch):
+async def test_health_loop_bootstraps_binding_and_probes(tp_mode, monkeypatch, tmp_path):
     """健康循环：未绑定账号先 ensure_binding（egress_node 落地 = 风控互斥前提），
-    已绑定账号探针失败 → rebalance(ban=False)。"""
+    已绑定账号探针失败 → rebalance(ban=False)。DB 走 tmp_path 隔离
+    （Store() 直开真实 dev 库已两次污染：2026-11-14 ×8 行 / 2026-11-15 ×2 行）。"""
     from app import store as store_mod
 
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
     store = store_mod.Store()
     monkeypatch.setattr(store_mod, "store", store)
     monkeypatch.setattr(settings, "TP_HEALTH_INTERVAL", 0)
 
     acc = store.add_account("zai", "h1", "h.eyJzdWIiOiJ1In0.sig")
-    acc.id = "acc-h1"
     acc.enabled = True
 
     calls = {"bind": 0, "probe": 0, "rebalance": 0}
@@ -264,7 +265,7 @@ async def test_verify_then_rebalance_transient_keeps_binding(tp_mode, monkeypatc
         rebalanced.append(reason)
 
     monkeypatch.setattr(egress_pool.egress_pool, "health_once", fake_health)
-    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+    monkeypatch.setattr(egress_pool.egress_pool, "_rebalance_locked", fake_rebalance)
 
     acc = _account(acc_id="acc-v1", name="v1")
     acc.egress_node = "node-alive"
@@ -285,7 +286,7 @@ async def test_verify_then_rebalance_dead_node_swaps(tp_mode, monkeypatch):
         rebalanced.append((reason, ban))
 
     monkeypatch.setattr(egress_pool.egress_pool, "health_once", fake_health)
-    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+    monkeypatch.setattr(egress_pool.egress_pool, "_rebalance_locked", fake_rebalance)
 
     acc = _account(acc_id="acc-v2", name="v2")
     acc.egress_node = "node-dead"
@@ -301,9 +302,75 @@ async def test_verify_then_rebalance_unbound_bootstraps(tp_mode, monkeypatch):
     async def fake_rebalance(account, reason, ban=True):
         rebalanced.append(reason)
 
-    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+    monkeypatch.setattr(egress_pool.egress_pool, "_rebalance_locked", fake_rebalance)
 
     acc = _account(acc_id="acc-v3", name="v3")
     assert acc.egress_node is None
     await egress_pool.egress_pool.verify_then_rebalance(acc, reason="node_unreachable")
     assert rebalanced == ["node_unreachable"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_binding_passes_exclude_node(tp_mode, monkeypatch):
+    """绑定引导（风控核心）：首次 acquire 必须带 exclude_node=其它账号节点。"""
+    from app import store as store_mod
+
+    monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)  # _other_nodes 读模块级单例
+
+    captured = {}
+
+    async def fake_tp_acquire(account, force_rebalance=False, extra_exclude=None):
+        captured["exclude"] = extra_exclude
+        account.egress_node = "node-new"
+        return {"node_name": "node-new"}
+
+    monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
+
+    other = store.add_account("zai", "other", "h.eyJzdWIiOiJvIn0.sig")
+    other.egress_node = "node-held-by-other"
+    me = store.add_account("zai", "me", "h.eyJzdWIiOiJtIn0.sig")
+
+    ok = await egress_pool.egress_pool.ensure_binding(me)
+    assert ok
+    assert "node-held-by-other" in (captured["exclude"] or []), \
+        "首次绑定必须互斥排除其它账号节点（风控核心）"
+
+
+@pytest.mark.asyncio
+async def test_rebalance_recovers_after_all_rounds_fail(tp_mode, monkeypatch):
+    """rebalance 3 轮全败：服务端绑定已随 force_rebalance 移走——第 4 轮
+    acquire+探针验收，hub 记录必须对齐 TP 实际绑定（不留在旧节点）。"""
+    seq = {"probe": 0}
+
+    async def fake_tp_ban(node, reason, evidence, account_name):
+        pass
+
+    async def fake_tp_acquire(account, force_rebalance=False, extra_exclude=None):
+        return {"node_name": f"node-cand-{seq['probe']}"}
+
+    async def fake_probe(account, proxy_url, jwt):
+        seq["probe"] += 1
+        return 0, "ConnectError: dead"  # 前三轮全部探不通
+
+    monkeypatch.setattr(egress_pool, "tp_ban", fake_tp_ban)
+    monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
+    monkeypatch.setattr(egress_pool.egress_pool, "_probe_via", fake_probe)
+
+    acc = _account(acc_id="acc-r1", name="r1")
+    acc.egress_node = "node-old"
+
+    ok = await egress_pool.egress_pool.rebalance(acc, reason="health_probe_fail", ban=False)
+    assert ok is False  # 未达成健康换绑
+    assert acc.egress_node != "node-old", \
+        "hub 记录不得停留在已被 force_rebalance 移走的旧节点（分叉=互斥集合被污染）"
+    assert acc.egress_node == "node-cand-3"  # TP 实际绑定（第 3 候选）
+
+
+def tmp_db_factory(monkeypatch):
+    import pathlib
+    import tempfile
+    d = pathlib.Path(tempfile.mkdtemp(prefix="egress-test-"))
+    monkeypatch.setattr(settings, "DB_PATH", d / "test-accounts.db")
+    return d / "test-accounts.db"

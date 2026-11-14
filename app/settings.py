@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -191,7 +192,13 @@ EGRESS_LISTENERS = [u.strip() for u in os.getenv("ZCODE_EGRESS_LISTENERS", "").s
 # 出口供给源（2.7.39 Mode B 灰度）：listeners = 本地 mihomo listener 池（现状）；
 # tetherpool = 账号绑定 TetherPool 分配（每账号独立 IP，数据面走 :9101 网关，
 # 云端池 1553 us-west 节点）。灰度名单 = 账号名逗号分隔，空 = 全量。
-EGRESS_SUPPLY = os.getenv("ZCODE_EGRESS_SUPPLY", "listeners").strip() or "listeners"
+EGRESS_SUPPLY = (os.getenv("ZCODE_EGRESS_SUPPLY", "listeners").strip() or "listeners").lower()
+if EGRESS_SUPPLY not in ("listeners", "tetherpool"):
+    # 拼错静默回落 listeners = 灰度开关形同虚设（review 2026-11-15）——显式
+    # 纠偏 + 告警留痕
+    print(f"[settings] 警告: ZCODE_EGRESS_SUPPLY={EGRESS_SUPPLY!r} 非法，回落 listeners",
+          file=sys.stderr)
+    EGRESS_SUPPLY = "listeners"
 TP_API = os.getenv("ZCODE_TP_API", "http://127.0.0.1:9100").strip()
 TP_GATEWAY = os.getenv("ZCODE_TP_GATEWAY", "127.0.0.1:9101").strip()
 TP_TOKEN_FILE = os.getenv("ZCODE_TP_TOKEN_FILE", "/personal/tebi-zcode-hub/tetherpool_token")
@@ -201,7 +208,7 @@ TP_TYPE = os.getenv("ZCODE_TP_TYPE", "clash_proxy").strip()
 TP_TIER = os.getenv("ZCODE_TP_TIER", "standard").strip()
 TP_GRAY_ACCOUNTS = [g.strip() for g in os.getenv("ZCODE_TP_GRAY_ACCOUNTS", "").split(",") if g.strip()]
 TP_REBALANCE_DEBOUNCE = _int("ZCODE_TP_REBALANCE_DEBOUNCE", 120)
-TP_HEALTH_INTERVAL = _int("ZCODE_TP_HEALTH_INTERVAL", 300)
+TP_HEALTH_INTERVAL = max(_int("ZCODE_TP_HEALTH_INTERVAL", 300), 30)  # 下限防 0 自旋
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -265,7 +272,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.39"
+APP_VERSION = "2.7.40"
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

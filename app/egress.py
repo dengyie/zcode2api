@@ -173,11 +173,15 @@ def account_proxy(account) -> str | None:
 
     supply=tetherpool（2.7.39 Mode B）时返回确定性构造的网关代理 URL
     （TP 绑定服务端粘性，URL 不随 rebalance 变化——换节点是 TP 侧路由变更）。
+    仅灰度命中账号（tetherpool_enabled_for）走 TP——绕过灰度会让非灰度账号
+    静默上 TP 无人引导/健康检查（review 2026-11-15）。
     """
     if not settings.PER_ACCOUNT_EGRESS:
         return None
     if settings.EGRESS_SUPPLY == "tetherpool":
-        return tetherpool_gateway_url(account)
+        if tetherpool_enabled_for(account):
+            return tetherpool_gateway_url(account)
+        return getattr(account, "egress", None)  # 非灰度：维持既有绑定/listener
     return getattr(account, "egress", None)
 
 
