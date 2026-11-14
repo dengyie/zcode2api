@@ -255,6 +255,13 @@ class TetherPoolEgress:
                 if not accounts:
                     continue
                 for account in accounts:
+                    if not account.egress_node:
+                        # 绑定引导（幂等，TP 粘性）：egress_node 是 ban 目标 +
+                        # 互斥 exclude_node 集合的来源，缺了风控约束无从落地
+                        if not await self.ensure_binding(account):
+                            logs.warn("egress_pool",
+                                      f"[health] {account.name} 绑定引导失败（下轮重试）")
+                            continue
                     if not await self.health_once(account):
                         logs.warn("egress_pool",
                                   f"[health] {account.name} 出口探针失败 → rebalance")
