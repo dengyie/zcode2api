@@ -10,9 +10,9 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from . import logs, settings
-from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
 from .captcha import captcha_manager
 from .claim import claim_round
+from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
 from .quota import monitor
 from .routes import admin_api, gateway, pages
 from .version_tracker import version_tracker
