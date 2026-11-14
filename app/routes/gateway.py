@@ -91,6 +91,10 @@ def _normalize_body(body: dict) -> dict:
     model = body.get("model")
     if isinstance(model, str) and "/" in model:
         model = "/".join(model.split("/")[1:])
+        # 2026-11-15 实证：剥离 provider 前缀后必须回写 body["model"]——此前仅在
+        # 别名改写时回写，`zai/GLM-5.3-Flash` 这类「无别名命中」的请求把带前缀的
+        # 原名透传给上游，换来必然的 400 code 3006（model not allowed）。
+        body["model"] = model
     if isinstance(model, str):
         # 先按大小写别名改写，再兜底「已退役型号」→ 当前主力型号。上游对退役名
         # 一律 3006（model not allowed），原样透传只会让客户端拿必然失败的结果。
