@@ -36,7 +36,7 @@ GRP = "zcode-us-residential"
 DB = "file:/data/zcode-hub/data/accounts.db?mode=ro"
 PLAN_URL = "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
 HUB = "http://127.0.0.1:8790/v1/messages"
-EGRESS_PROXY = "http://127.0.0.1:11030"
+PROXY = "http://127.0.0.1:11030"
 STATE_FILE = "/personal/tebi-zcode-hub/zcode-egress-swap-state.json"
 TOKEN_FILE = "/personal/tebi-zcode-hub/tetherpool_token"
 
@@ -49,7 +49,7 @@ POLL = 60               # 检测轮询间隔
 
 NOPROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PROXY_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({"http": EGRESS_PROXY, "https": EGRESS_PROXY}))
+    urllib.request.ProxyHandler({"http": PROXY, "https": PROXY}))
 
 
 def now_bj():

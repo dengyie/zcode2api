@@ -25,7 +25,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, "/personal/clash")
-from clash_lock import ClashConfigLock, atomic_write_text  # noqa: E402
+from clash_lock import ClashConfigLock  # noqa: E402
 
 import yaml  # noqa: E402
 
@@ -121,8 +121,13 @@ def main():
         backup = path + ".bak-zcode-listeners-" + time.strftime("%Y%m%d-%H%M%S")
         shutil.copyfile(path, backup)
         with ClashConfigLock():
-            atomic_write_text(path, yaml.safe_dump(cfg, allow_unicode=True,
-                                                   sort_keys=False, width=100))
+            # 同目录临时件 + os.replace 原子替换（NFS 单写者纪律：持锁写）
+            import os as _os
+            tmp = path + ".zcal-tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False,
+                                       width=100))
+            _os.replace(tmp, path)
         changed_files.append((path, backup))
         log(f"✓ {path} 已写入（备份 {backup}）")
 
