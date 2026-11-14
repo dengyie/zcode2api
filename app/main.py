@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import logs, settings
+from . import egress_pool, logs, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import monitor
@@ -117,6 +117,7 @@ async def lifespan(app: FastAPI):
     claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）
     version_tracker.init_from_store()
     version_tracker.start()   # 官方版本自动探测与同步
+    egress_pool.start()       # TetherPool 出口健康循环（supply=tetherpool 时生效）
     _run_install_sequence_on_start()
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
@@ -130,6 +131,7 @@ async def lifespan(app: FastAPI):
         await monitor.stop()
         await claim_round.stop()
         await version_tracker.stop()
+        await egress_pool.stop()
         await captcha_manager.close()
 
 

@@ -16,7 +16,7 @@ import time
 import uuid
 from contextlib import closing
 
-from . import logs, settings
+from . import egress, logs, settings
 from .models import PROVIDERS, Account, Status
 
 _TBL = "accounts"
@@ -252,7 +252,12 @@ class Store:
                     return a  # 跳过重复 token
             self._assign_fingerprint(account)  # 入池即分配独立设备指纹
             account.install_id = str(uuid.uuid4())  # 安装身份：稳定安装令牌
-            self._assign_egress(account)  # 入池即分配专属出口（每账号一个 IP）
+            if egress.tetherpool_enabled_for(account):
+                # TP 供给：网关 URL 确定性构造（同步、无 HTTP；TP 绑定由
+                # egress_pool 后台引导/网关首请求粘性建立）
+                account.egress = egress.tetherpool_gateway_url(account)
+            else:
+                self._assign_egress(account)  # 入池即分配专属出口（每账号一个 IP）
             self._accounts[provider].append(account)
             self._persist_account(account)
         return account
@@ -272,22 +277,48 @@ class Store:
         account.egress = free
 
     def ensure_egress_assignments(self) -> None:
-        """启动补分配：无 egress 绑定的账号按 created_at 序领取空闲 listener。"""
-        if not settings.EGRESS_LISTENERS:
+        """启动/供给切换补分配（2.7.39 supply 感知）：
+
+        - tetherpool：灰度命中账号 → 网关 URL（确定性构造）；非灰度账号若持
+          网关 URL（模式回退残留）→ 清空回落 listener/共享。
+        - listeners：网关 URL 形态的 egress 清空重领 listener（回滚通道）。
+        """
+        if settings.EGRESS_SUPPLY == "tetherpool":
+            with self._lock:
+                changed: list[Account] = []
+                for items in self._accounts.values():
+                    for account in sorted(items, key=lambda x: x.created_at):
+                        old = account.egress
+                        if egress.tetherpool_enabled_for(account):
+                            want = egress.tetherpool_gateway_url(account)
+                            if account.egress != want:
+                                account.egress = want
+                                changed.append(account)
+                        elif old and ":9101@" in old:
+                            account.egress = None  # 模式回退残留清理
+                            changed.append(account)
+                for account in changed:
+                    self._persist_account(account)
+            if changed:
+                logs.ok("store", f"per-account 出口补分配（tetherpool 供给）{len(changed)} 个账号")
             return
+        # listeners 供给：网关 URL 残留清空 + listener 池分配（2.7.36 行为）
         with self._lock:
             changed: list[Account] = []
             for items in self._accounts.values():
                 for account in sorted(items, key=lambda x: x.created_at):
-                    if account.egress:
-                        continue
-                    self._assign_egress(account)
-                    if account.egress:
+                    old = account.egress
+                    if old and ":9101@" in old:
+                        account.egress = None
                         changed.append(account)
+                    elif not account.egress:
+                        self._assign_egress(account)
+                        if account.egress:
+                            changed.append(account)
             for account in changed:
                 self._persist_account(account)
         if changed:
-            logs.ok("store", f"per-account 出口补分配 {len(changed)} 个账号")
+            logs.ok("store", f"per-account 出口补分配（listeners 供给）{len(changed)} 个账号")
 
     @staticmethod
     def _assign_fingerprint(account: Account) -> None:

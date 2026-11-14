@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import time
 from urllib.parse import urlsplit
 from urllib.request import getproxies
 
@@ -169,10 +170,41 @@ def account_proxy(account) -> str | None:
     BILLING_EGRESS 等既有旋钮）；返回 URL 时调用方必须以
     `proxy=url, trust_env=False` 构建客户端——显式代理与 env 代理混用会被
     NO_PROXY 匹配歧义化。
+
+    supply=tetherpool（2.7.39 Mode B）时返回确定性构造的网关代理 URL
+    （TP 绑定服务端粘性，URL 不随 rebalance 变化——换节点是 TP 侧路由变更）。
     """
     if not settings.PER_ACCOUNT_EGRESS:
         return None
+    if settings.EGRESS_SUPPLY == "tetherpool":
+        return tetherpool_gateway_url(account)
     return getattr(account, "egress", None)
+
+
+def tetherpool_enabled_for(account) -> bool:
+    """该账号是否由 TetherPool 供给出口（supply=tetherpool 且命中灰度名单，
+    名单空 = 全量）。"""
+    if settings.EGRESS_SUPPLY != "tetherpool" or not settings.PER_ACCOUNT_EGRESS:
+        return False
+    if settings.TP_GRAY_ACCOUNTS:
+        return getattr(account, "name", None) in settings.TP_GRAY_ACCOUNTS
+    return True
+
+
+def tetherpool_gateway_url(account) -> str:
+    """per-account TetherPool 网关代理 URL（确定性构造，与 TP acquire 返回的
+    gateway_proxy_url 同构）。
+
+    username 承载路由约束（TP 网关按它解析 + 粘性绑定）；TP 侧 rebalance
+    只改服务端绑定，URL 恒定 → hub 侧代理对象零重建。"""
+    tp_account = "zh-" + str(getattr(account, "id", "") or "")
+    username = (f"{tp_account}__type_{settings.TP_TYPE}"
+                f"__region_{settings.TP_REGION}__tier_{settings.TP_TIER}"
+                f"__service_{settings.TP_SERVICE}")
+    host = settings.TP_GATEWAY
+    if "://" not in host:
+        host = "http://" + host
+    return f"http://{username}:tetherpool@{host.split('://', 1)[-1]}"
 
 
 def egress_tag_for(account, fallback_tag: str) -> str:
@@ -182,3 +214,29 @@ def egress_tag_for(account, fallback_tag: str) -> str:
     否则沿用调用方的传统 2 值 tag（proxy/direct，全局语义不变）。
     """
     return account_proxy(account) or fallback_tag
+
+
+# ── 连接失败聚类（2.7.39：节点不可达 → TetherPool rebalance 的触发器）────────
+# 键 = 出口 tag（per-account 模式 = 网关 URL），值 = 失败时间戳（monotonic）。
+_CONN_FAIL_TIMES: dict[str, list[float]] = {}
+CONN_FAIL_WINDOW = 600.0
+CONN_FAIL_THRESHOLD = 3
+
+
+def note_conn_fail(tag: str, now: float | None = None) -> None:
+    """记录一次该出口的连接失败（调度循环内同步调用，单循环原子）。"""
+    ts = time.monotonic() if now is None else now
+    times = [t for t in _CONN_FAIL_TIMES.get(tag, []) if ts - t < CONN_FAIL_WINDOW]
+    times.append(ts)
+    _CONN_FAIL_TIMES[tag] = times
+
+
+def conn_fail_clustered(tag: str) -> bool:
+    """该出口在窗口内连接失败是否已达聚类阈值（节点不可达疑似）。"""
+    times = [t for t in _CONN_FAIL_TIMES.get(tag, [])
+             if time.monotonic() - t < CONN_FAIL_WINDOW]
+    return len(times) >= CONN_FAIL_THRESHOLD
+
+
+def clear_conn_fails(tag: str) -> None:
+    _CONN_FAIL_TIMES.pop(tag, None)

@@ -19,7 +19,17 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import ClientDisconnect
 
-from .. import body_transform, business_error, constants, egress, logs, plan_guard, reqlog, settings
+from .. import (
+    body_transform,
+    business_error,
+    constants,
+    egress,
+    egress_pool,
+    logs,
+    plan_guard,
+    reqlog,
+    settings,
+)
 from ..affinity import affinity_manager, extract_context_key
 from ..agent import build_request
 from ..auth_admin import verify_gateway_key
@@ -1300,6 +1310,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 await client.aclose()
                 _drop_gate()
                 account.record_result(False, f"连接失败: {err}")
+                # per-account 出口隔离（2.7.39）：同出口连接失败聚类（600s ≥3 次）
+                # = 节点不可达 → TetherPool rebalance 换该账号的绑定节点
+                egress.note_conn_fail(_messages_egress(account))
+                if egress.conn_fail_clustered(_messages_egress(account)) and \
+                        settings.EGRESS_SUPPLY == "tetherpool":
+                    _spawn_bg(egress_pool.rebalance(
+                        account, reason="node_unreachable", ban=False))
+                    egress.clear_conn_fails(_messages_egress(account))
                 # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan
                 if account.status in (Status.INVALID, Status.DISABLED):
                     store.update_account(account)
@@ -1377,9 +1395,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     store.update_account(account)
                     logs.err(
                         req_id,
-                        f"上游边缘封禁（IP 级），全池暂停 plan 渠道 {wait}s"
+                        f"上游边缘封禁（IP 级），暂停该账号出口 {wait}s"
                         f"（账号 {account.name} 本身不改状态）；上游body={snippet!r}",
                     )
+                    # per-account 出口隔离（2.7.39）：TP 供给下自动 rebalance 换绑定
+                    if settings.EGRESS_SUPPLY == "tetherpool" and \
+                            settings.PER_ACCOUNT_EGRESS:
+                        _spawn_bg(egress_pool.rebalance(
+                            account, reason="edge_405_html", ban=True))
                     if _jump_to_fallback():
                         logs.warn(req_id, f"账号 {account.name} 边缘封禁，切 API Key 回退")
                         needs_captcha = False

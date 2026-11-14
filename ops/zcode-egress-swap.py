@@ -358,6 +358,11 @@ def swap(state, hit):
     （节点死亡/不可达——本地换钉即可，TP 自有健康体系会标 dead，不做隔离）。
     """
     egress_url = account_egress_url(hit.get("account_id") or "")
+    if egress_url and ":9101@" in egress_url:
+        # 2.7.39 TP 供给：hub 内自治 rebalance（egress_pool），agent 的 mihomo
+        # 换钉对本账号不再是数据面——跳过避免告警噪音
+        log("INFO", f"账号 {hit['account']} 出口为 TetherPool 网关绑定（hub 自治），跳过 mihomo 换钉")
+        return False
     if egress_url:
         return _swap_one_account(state, hit, egress_url,
                                  ban=hit.get("reason") != "node_unreachable")
