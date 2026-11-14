@@ -55,11 +55,16 @@ def test_assign_egress_distinct_and_exhaustion(monkeypatch, fresh_app: Store):
     assert a.egress == "http://127.0.0.1:11031"
 
 
-def test_ensure_egress_assignments_backfills(monkeypatch):
+def test_ensure_egress_assignments_backfills(monkeypatch, tmp_path):
+    # 必须隔离 data 目录：Store() 会打开默认 DB（否则测试账号写入仓库 dev DB，
+    # 2026-11-14 review P2 实锤 8 行污染）
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("ZCODE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(settings, "DATA_DIR", data_dir)
+    monkeypatch.setattr(settings, "DB_PATH", data_dir / "accounts.db")
     monkeypatch.setattr(settings, "EGRESS_LISTENERS",
                         ["http://127.0.0.1:11031", "http://127.0.0.1:11032"])
-    store = Store()  # 直接构造（conftest fresh_app 可能已带别的 listeners 状态）
-    store._accounts = {p: [] for p in store._accounts}
+    store = Store()
     a = Account.create("zai", "a", "jwt.token.a")
     b = Account.create("zai", "b", "jwt.token.b")
     store._accounts["zai"] = [a, b]

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 
+import httpx
 import pytest
 
 from app import egress, settings
@@ -1137,3 +1138,51 @@ class TestPlanModelExhaust:
 
         plan_guard.note("acct-y", "GLM-5.3", time.time() - 1)  # 已过期
         assert not plan_guard.cooling("acct-y", "GLM-5.3")
+
+
+class TestEdgeBlockPerAccountIsolation:
+    """per-account 出口隔离（2.7.36）核心语义：一个账号的出口被封只冻结该
+    账号，调度跳号后其余账号照常服务——本变更存在的理由，必须有端到端防护。"""
+
+    async def test_edge_block_on_one_account_serves_via_other(
+            self, gateway_client, fresh_app, monkeypatch):
+        from app.gate import gate
+        from tests.conftest import seed_account
+
+        client, mock = gateway_client
+        monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+        _JWT_ISO_A = "hI1a.eyJzdWIiOiJ4In0.sig"  # 独立凭证：sequences 键不得与其它用例共享
+        _JWT_ISO_B = "hI2b.eyJzdWIiOiJ4In0.sig"
+        acc_a = seed_account(fresh_app, _JWT_ISO_A, name="a-iso")
+        acc_b = seed_account(fresh_app, _JWT_ISO_B, name="b-iso")
+        # 账号绑定互异的（测试内）出口 URL；gateway 的 httpx 客户端在测试里
+        # 剥掉 proxy kwarg（mock 经 ASGI 直达，无需真实代理网络）
+        acc_a.egress = "mock://egress-a"
+        acc_b.egress = "mock://egress-b"
+        tag_a, tag_b = "mock://egress-a", "mock://egress-b"
+
+        real_cls = httpx.AsyncClient
+
+        def _no_proxy_client(*args, **kwargs):
+            kwargs.pop("proxy", None)
+            kwargs["trust_env"] = False
+            return real_cls(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", _no_proxy_client)
+        mock.state.sequences[_JWT_ISO_A[:16]] = ["edge_block_405"]  # A 出口被封
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200  # B 服务，请求不因 A 被封而失败
+
+        # A：出口被 hold、账号本身不改状态不计风控（边缘封禁口径）
+        assert gate.edge_remaining(tag_a) > 0
+        assert gate.hold_reason(tag_b) is None  # B 的出口不受牵连
+        after_a = fresh_app.find("zai", acc_a.id)
+        assert after_a.status == Status.ACTIVE
+        assert after_a.risk_strikes == 0
+
+        # 第二个请求：继续跳过 A、仍由 B 服务（hold 期间稳定可服务）
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 200
+        assert gate.edge_remaining(tag_a) > 0
+        assert gate.edge_remaining(tag_b) == 0

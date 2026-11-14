@@ -235,6 +235,39 @@ class TestCaptchaEgressSeparation:
         with pytest.raises(RuntimeError):
             await mgr._run_solver("s", "cn", "p", egress.PROXY)
 
+    async def test_solver_env_per_account_proxy(self, monkeypatch):
+        """per-account 出口隔离（2.7.36）：显式 proxy 参数注入 solver env——
+        token 出口 = 请求出口 不变式的关键路径。"""
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        mgr = CaptchaManager()
+        captured: dict[str, dict] = {}
+
+        class _FakeProc:
+            pid = 4322
+
+            def kill(self) -> None:
+                pass
+
+            async def communicate(self):
+                return b"VERIFY_PARAM=mock\n", b""
+
+            async def wait(self):
+                return 0
+
+        async def _fake_exec(*args, **kwargs):
+            captured["env"] = kwargs.get("env") or {}
+            return _FakeProc()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+        if hasattr(os, "killpg"):
+            monkeypatch.setattr(os, "killpg", lambda *_a: None)
+
+        acct_proxy = "http://127.0.0.1:11031"
+        await mgr._run_solver("s", "cn", "p", acct_proxy, proxy=acct_proxy)
+        assert captured["env"].get("HTTP_PROXY") == acct_proxy
+        assert captured["env"].get("HTTPS_PROXY") == acct_proxy
+
 
 class TestModelRequestCaptchaGating:
     """`skip_model_request` 语义：官方在模型请求上带不带验证码的等价物。"""

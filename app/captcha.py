@@ -179,15 +179,16 @@ class CaptchaManager:
                 return self._config_cache[tag]
             err: Exception | None = None
 
-            async def _try_fetch(proxy_url: str | None) -> dict | None:
-                """单次拉取；显式 proxy 优先，否则按 tag 走 trust_env 旧语义。"""
+            async def _try_fetch(use_proxy: bool) -> dict | None:
+                """单次拉取：per-account 显式代理优先（trust_env=False，与 env
+                语义解耦）；legacy 模式按 use_proxy 走 trust_env（尊重
+                NO_PROXY，与 2.7.35 前行为一致）。"""
                 try:
-                    if proxy_url:
-                        client_cm = httpx.AsyncClient(timeout=30, proxy=proxy_url,
+                    if proxy:
+                        client_cm = httpx.AsyncClient(timeout=30, proxy=proxy,
                                                       trust_env=False)
                     else:
-                        client_cm = httpx.AsyncClient(timeout=30,
-                                                      trust_env=tag == egress.PROXY)
+                        client_cm = httpx.AsyncClient(timeout=30, trust_env=use_proxy)
                     async with client_cm as client:
                         res = await client.get(
                             f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
@@ -199,12 +200,9 @@ class CaptchaManager:
                     err = exc
                     return None
 
-            def _legacy_primary_proxy() -> str | None:
-                return egress.proxy_url() if tag == egress.PROXY else None
-
             captcha: dict | None = None
             for _ in range(2):  # 15s 走 US 代理偶发 ReadTimeout，同出口重试一次
-                captcha = await _try_fetch(proxy if proxy is not None else _legacy_primary_proxy())
+                captcha = await _try_fetch(tag == egress.PROXY)
                 if captcha:
                     break
             if not captcha and proxy is None:
@@ -281,9 +279,20 @@ class CaptchaManager:
         )
 
     async def _refill_loop(self) -> None:
+        warned_per_account = False
         while True:
             try:
                 tag = self.hot_egress()
+                # per-account 出口隔离（2.7.36）：预热带 tag 的 token 永远不会
+                # 被账号取用（账号 tag = 各自绑定代理 URL）——按关闭处理，防白烧
+                # 求解流量与 Chromium 内存。部署约束：per-account 模式下预热恒关。
+                if settings.PER_ACCOUNT_EGRESS:
+                    if not warned_per_account:
+                        logs.info("captcha", "per-account 出口模式：验证码预热停用（按账号现解）")
+                        warned_per_account = True
+                    await self._evict_expired(tag)
+                    await asyncio.sleep(30)
+                    continue
                 # 无可服务账号（全冷却/禁用/无号）：只淘汰过期 token，不解新码（不产生上游流量）
                 if not self._gate_open():
                     await self._evict_expired(tag)
