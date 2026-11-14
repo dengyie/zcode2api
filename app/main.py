@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import egress_pool, logs, settings
+from . import logs, settings
+from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
 from .captcha import captcha_manager
 from .claim import claim_round
 from .quota import monitor
