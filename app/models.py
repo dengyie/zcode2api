@@ -144,6 +144,11 @@ class Account:
     # 安装身份：入池分配的稳定安装令牌（hub 内部，跨账号不重复，导出时剥离）
     install_id: str | None = None
     installed_at: float | None = None  # 按账号安装序完成时间；None = 未安装
+    # 每账号专属出口（per-account egress，2.7.36）：mihomo listener/proxy URL
+    # （如 http://127.0.0.1:11031）。设计需求 = 每账号一个独立 IP 互相隔离
+    # （上游按出口 IP 风控；共享出口 = 容量瓶颈 + 指纹矛盾）。None = 未绑定
+    # （回落共享出口现状）。绑定必须跨重启稳定——验证码 token 与出口 IP 绑定。
+    egress: str | None = None
 
     @staticmethod
     def create(provider: str, name: str, secret: str) -> Account:
@@ -427,6 +432,9 @@ class Account:
             # 轮询是否会选中它（额度判死/冷却/停用都在这里体现）：后台排障时
             # 「状态 active 但不发请求」最常见的原因就是这一项为 false
             "selectable": self.is_selectable(),
+            # per-account 出口绑定（2.7.36）：None = 共享出口；排障「该账号从
+            # 哪个 IP 出去」一眼可读
+            "egress": self.egress,
             "cooling_until": self.cooling_until,
             "last_error": self.last_error,
             "created_at": self.created_at,

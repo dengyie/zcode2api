@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from app import settings
+from app import egress, settings
 from app.models import Status
 
 # mock 的 sequences/counters 按凭证前 16 位累计（session 级），每个用例必须用
@@ -216,7 +216,7 @@ class TestEdgeBlockBreaker:
         assert after.status == Status.ACTIVE
         assert after.cooling_until is None
         assert after.risk_strikes == 0
-        assert gate.edge_remaining() > 0
+        assert gate.edge_remaining(egress.egress_for(settings.UPSTREAM["zai"])) > 0
 
         # 断路器生效期间第二个请求在本地被拒，不再撞上游、不再吃验证码
         before = len(mock.state.calls)
@@ -246,7 +246,7 @@ class TestEdgeBlockBreaker:
         paths = _paths(mock, before)
         assert paths.count(_PLAN_PATH) == 1
         assert paths.count(_KEY_PATH) == 1
-        assert gate.edge_remaining() > 0  # 回退成功不解除断路器
+        assert gate.edge_remaining(egress.egress_for(settings.UPSTREAM["zai"])) > 0  # 回退成功不解除断路器
         after = fresh_app.find("zai", acc.id)
         assert after.status == Status.ACTIVE
 
@@ -334,7 +334,7 @@ class TestGateBusyHold:
         for i in range(5):
             res = await client.post("/v1/messages", json=_MSG_BODY)
             assert res.status_code == (429 if i == 4 else 503)
-        assert gate.busy_remaining() > 0
+        assert gate.busy_remaining(egress.egress_for(settings.UPSTREAM["zai"])) > 0
 
         # hold 期间新请求本地拦截（限流语义 429，客户端按 Retry-After 退避），不打上游
         before = len(mock.state.calls)
@@ -358,7 +358,7 @@ class TestGateBusyHold:
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200
-        assert gate.busy_remaining() == 0  # 未触发任何 hold
+        assert gate.busy_remaining(egress.egress_for(settings.UPSTREAM["zai"])) == 0  # 未触发任何 hold
 
     async def test_self_healed_3008_does_not_count(
         self, gateway_client, fresh_app, monkeypatch, no_retry_sleep
@@ -375,7 +375,7 @@ class TestGateBusyHold:
 
         res = await client.post("/v1/messages", json=_MSG_BODY)
         assert res.status_code == 200
-        assert gate.busy_remaining() == 0  # 请求最终成功 → 不算饱和
+        assert gate.busy_remaining(egress.egress_for(settings.UPSTREAM["zai"])) == 0  # 请求最终成功 → 不算饱和
 
     async def test_gate_leak_on_client_disconnect(
         self, gateway_client, fresh_app, monkeypatch
@@ -616,7 +616,7 @@ class TestGateRefusalFailover:
         keyed = seed_account(fresh_app, _JWT_MIX_KEY, name="b-keyed")
         keyed.api_key = "sk-mixed-pool-key"
         fresh_app.update_account(keyed)
-        gate.trip_edge()  # 直接处于封禁窗口内
+        gate.trip_edge(egress.egress_for(settings.UPSTREAM["zai"]))  # 直接处于封禁窗口内（按账号出口 tag 分键）
 
         before = len(mock.state.calls)
         res = await client.post("/v1/messages", json=_MSG_BODY)
@@ -634,7 +634,7 @@ class TestGateRefusalFailover:
 
         monkeypatch.setattr(settings, "GATE_EDGE_HOLD_SECONDS", 30)
         seed_account(fresh_app, _JWT_MIX_PLAN, name="a-planonly")
-        gate.trip_edge()
+        gate.trip_edge(egress.egress_for(settings.UPSTREAM["zai"]))
 
         before = len(mock.state.calls)
         res = await client.post("/v1/messages", json=_MSG_BODY)

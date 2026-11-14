@@ -35,6 +35,8 @@ import re
 from urllib.parse import urlsplit
 from urllib.request import getproxies
 
+from . import settings
+
 DIRECT = "direct"
 PROXY = "proxy"
 
@@ -157,3 +159,26 @@ def egress_for(url_or_host: str) -> str:
     if not proxy_url(url_or_host):
         return DIRECT
     return DIRECT if no_proxy_covers(url_or_host) else PROXY
+
+
+# ── per-account 出口隔离（2.7.36，需求 = 每账号一个独立 IP 互相隔离）─────────
+def account_proxy(account) -> str | None:
+    """账号专属代理 URL；未启用 per-account 模式 / 账号未绑定 → None。
+
+    返回 None 时调用方**保持既有共享语义**（trust_env 按 MESSAGES_FORCE_DIRECT /
+    BILLING_EGRESS 等既有旋钮）；返回 URL 时调用方必须以
+    `proxy=url, trust_env=False` 构建客户端——显式代理与 env 代理混用会被
+    NO_PROXY 匹配歧义化。
+    """
+    if not settings.PER_ACCOUNT_EGRESS:
+        return None
+    return getattr(account, "egress", None)
+
+
+def egress_tag_for(account, fallback_tag: str) -> str:
+    """闸门断路器 / 验证码池 / config 缓存的隔离键。
+
+    per-account 模式 = 账号绑定的代理 URL（每账号独立断路器与 token 池）；
+    否则沿用调用方的传统 2 值 tag（proxy/direct，全局语义不变）。
+    """
+    return account_proxy(account) or fallback_tag

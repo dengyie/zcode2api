@@ -13,15 +13,21 @@
 
 1. 滑动分钟窗口内的 plan 渠道请求预算（0 = 关闭）；
 2. plan 渠道全池在飞上限（0 = 关闭）；
-3. 边缘封禁断路器：观察到 405 封 IP 页面后，全进程暂停 plan 渠道 N 秒；
+3. 边缘封禁断路器：观察到 405 封 IP 页面后，暂停 plan 渠道 N 秒；
 4. 忙碌断路器（busy-hold，Magpie BUSY_N/BUSY_HOLD 同款）：3008 在短退避重试
-   后**仍然** 3008（真饱和；一次重试就过去的瞬态争用不计）达到阈值，全进程
-   暂停 plan 渠道一段窗口——封禁前先降速，而不是封了再认；
+   后**仍然** 3008（真饱和；一次重试就过去的瞬态争用不计）达到阈值，暂停
+   plan 渠道一段窗口——封禁前先降速，而不是封了再认；
 5. 套餐窗口闸门（pool-hold，2026-11-12）：全池账号都有「过期后实查确认枯竭」
    证据且无未来窗口时，快速拒绝 plan 渠道请求直到下一个已知窗口——套餐真空
    期（如 09:00 到期 → 19:00 放量）不再让每个请求白撞 5 轮账号×验证码求解。
    判定口径在 models.Account.next_window_start（保守优先：未知/陈旧一律放行），
    billing 刷新发现可用窗口即主动解除（quota.fetch_quota）。
+
+**隔离键（2026-11-14，per-account 出口隔离 2.7.36）**：边缘/忙碌断路器按
+「出口 tag」分键——per-account 模式下 tag = 账号绑定的代理 URL，一个 IP 被封
+/饱和只冻结该 IP 上的账号（调度循环逐账号跳号），不再错杀全池；共享模式
+（开关关/未绑定）所有账号同 tag，语义与旧全池行为一致。pool_hold 与分钟预算
+/在飞上限是全局的（全池额度证据 / 进程级预算）。
 
 api.z.ai / bigmodel 渠道不经过本闸门（key 渠道与 plan 渠道的风险面不同）。
 """
@@ -39,35 +45,36 @@ class Gate:
         self._window_start = 0.0
         self._window_count = 0
         self._inflight = 0
-        self._edge_until = 0.0
-        self.edge_hits = 0
-        self._busy_hits: list[float] = []
-        self._busy_until = 0.0
+        # 边缘封禁/忙碌断路器：按出口 tag 分键（见模块 docstring 隔离键说明）
+        self._edge_until: dict[str, float] = {}
+        self.edge_hits: dict[str, int] = {}
+        self._busy_hits: dict[str, list[float]] = {}
+        self._busy_until: dict[str, float] = {}
         # 套餐窗口闸门（pool-hold）：与上面两个 hold 不同，锚的是**墙钟 epoch**
         # ——它必须与 billing 窗口的 expires_at / effective_at 对时，monotonic
         # 在这里是错的时钟。到期自动解除 + 额度恢复主动清除（quota.fetch_quota）
         self._pool_hold_until = 0.0  # wall-clock epoch
 
     # ── 边缘封禁 ──────────────────────────────────────────────────────────
-    def edge_remaining(self) -> float:
-        return max(0.0, self._edge_until - time.monotonic())
+    def edge_remaining(self, tag: str = "shared") -> float:
+        return max(0.0, self._edge_until.get(tag, 0.0) - time.monotonic())
 
-    def trip_edge(self, seconds: float | None = None) -> None:
-        """记录一次边缘 405 封禁，并在窗口内挡住所有 plan 渠道请求。
+    def trip_edge(self, tag: str = "shared", seconds: float | None = None) -> None:
+        """记录一次边缘 405 封禁，并在窗口内挡住该出口上的 plan 渠道请求。
 
         连续命中只延长窗口（max），不会因后来的短窗口截短长窗口。
         """
         secs = settings.GATE_EDGE_HOLD_SECONDS if seconds is None else seconds
         if secs <= 0:
             return
-        self._edge_until = max(self._edge_until, time.monotonic() + secs)
-        self.edge_hits += 1
+        self._edge_until[tag] = max(self._edge_until.get(tag, 0.0), time.monotonic() + secs)
+        self.edge_hits[tag] = self.edge_hits.get(tag, 0) + 1
 
     # ── 忙碌断路器（3008 真饱和）──────────────────────────────────────────
-    def busy_remaining(self) -> float:
-        return max(0.0, self._busy_until - time.monotonic())
+    def busy_remaining(self, tag: str = "shared") -> float:
+        return max(0.0, self._busy_until.get(tag, 0.0) - time.monotonic())
 
-    def note_busy(self) -> None:
+    def note_busy(self, tag: str = "shared") -> None:
         """记一次「重试后仍 3008」的饱和信号；窗口内累计到阈值即触发忙碌断路器。
 
         只该由「同一请求短退避重试后再次 3008」调用——一次重试就过去的瞬态
@@ -80,13 +87,14 @@ class Gate:
         if threshold <= 0 or hold <= 0:
             return
         now = time.monotonic()
-        self._busy_hits = [t for t in self._busy_hits if now - t < window]
-        self._busy_hits.append(now)
-        if len(self._busy_hits) >= threshold:
-            self._busy_until = max(self._busy_until, now + hold)
-            self._busy_hits.clear()
+        hits = [t for t in self._busy_hits.get(tag, []) if now - t < window]
+        hits.append(now)
+        self._busy_hits[tag] = hits
+        if len(hits) >= threshold:
+            self._busy_until[tag] = max(self._busy_until.get(tag, 0.0), now + hold)
+            self._busy_hits[tag] = []
 
-    # ── 套餐窗口闸门（pool-hold）──────────────────────────────────────────
+    # ── 套餐窗口闸门（pool-hold，全局）────────────────────────────────────
     def pool_hold_remaining(self, now: float | None = None) -> float:
         return max(0.0, self._pool_hold_until - (now if now is not None else time.time()))
 
@@ -112,16 +120,16 @@ class Gate:
         self._pool_hold_until = 0.0
 
     # ── 准入 ─────────────────────────────────────────────────────────────
-    def hold_reason(self) -> str | None:
-        """当前生效的进程级 hold；无则 None。
+    def hold_reason(self, tag: str = "shared") -> str | None:
+        """该出口当前生效的 hold；无则 None。
 
         优先级：边缘封禁 > 忙碌断路器 > 套餐窗口。前两个是异常保护（IP 被封/
-        真饱和），最后一个只是日常真空期的快速失败——都被挡时回异常的那个，
-        Retry-After 才有信息量。
+        真饱和，按出口隔离），最后一个只是日常真空期的快速失败——都被挡时
+        回异常的那个，Retry-After 才有信息量。
         """
-        if self.edge_remaining() > 0:
+        if self.edge_remaining(tag) > 0:
             return "edge_hold"
-        if self.busy_remaining() > 0:
+        if self.busy_remaining(tag) > 0:
             return "busy_hold"
         if self.pool_hold_remaining() > 0:
             return "pool_hold"
@@ -135,22 +143,36 @@ class Gate:
             return False
         return self._window_count >= settings.GATE_RATE_PER_MIN
 
-    def refusal_reason(self) -> str | None:
-        """当前会被 acquire 拒绝的原因（hold 优先，其次分钟预算）；可通行则 None。
+    def refusal_reason(self, tag: str = "shared") -> str | None:
+        """该出口当前会被 acquire 拒绝的原因（hold 优先，其次分钟预算）。
 
-        供调度兜底与验证码前置短路使用：hold 与预算都是进程级状态，与具体
-        账号无关——被拒时换账号同样会被拒，应在调度层一次性行为化。
+        edge/busy 按出口分键：per-account 模式下被拒时**换账号同样要先看
+        新账号的 tag**，调度层应逐账号判定而非一次性行为化。
         """
-        hold = self.hold_reason()
+        hold = self.hold_reason(tag)
         if hold is not None:
             return hold
         if self._rate_refused():
             return "rate_limit"
         return None
 
-    def acquire(self) -> tuple[bool, str]:
+    def global_refusal_reason(self) -> str | None:
+        """请求级兜底检查：只看**全局性**拒绝（套餐窗口 / 分钟预算）。
+
+        edge/busy 在 per-account 出口隔离下按账号 tag 分键，调度循环内逐账号
+        跳号即可——一个 IP 被封不再冻结全池，故不在此处否决整个请求
+        （2026-11-14）。共享模式下所有账号同 tag，全池 hold 时由调度兜底的
+        「全部出口被 hold」检查还原旧请求级行为。
+        """
+        if self.pool_hold_remaining() > 0:
+            return "pool_hold"
+        if self._rate_refused():
+            return "rate_limit"
+        return None
+
+    def acquire(self, tag: str = "shared") -> tuple[bool, str]:
         """尝试占用一个 plan 渠道槽位。返回 (ok, reason)。"""
-        hold = self.hold_reason()
+        hold = self.hold_reason(tag)
         if hold is not None:
             return False, hold
         if self._rate_refused():
@@ -177,12 +199,12 @@ class Gate:
         if self._inflight > 0:
             self._inflight -= 1
 
-    def retry_after(self) -> int:
+    def retry_after(self, tag: str = "shared") -> int:
         """给客户端的 Retry-After（秒），按当前拒绝原因估算。"""
-        edge = self.edge_remaining()
+        edge = self.edge_remaining(tag)
         if edge > 0:
             return max(1, math.ceil(edge))
-        busy = self.busy_remaining()
+        busy = self.busy_remaining(tag)
         if busy > 0:
             return max(1, math.ceil(busy))
         pool = self.pool_hold_remaining()
@@ -198,10 +220,10 @@ class Gate:
         self._window_start = 0.0
         self._window_count = 0
         self._inflight = 0
-        self._edge_until = 0.0
-        self.edge_hits = 0
-        self._busy_hits = []
-        self._busy_until = 0.0
+        self._edge_until = {}
+        self.edge_hits = {}
+        self._busy_hits = {}
+        self._busy_until = {}
         self._pool_hold_until = 0.0
 
 

@@ -125,13 +125,16 @@ class _StubCaptcha:
         self.needs_captcha = True
         self.config = dict(constants.CAPTCHA_DEFAULTS)
 
-    async def fetch_config(self, egress_tag: str | None = None) -> dict:
+    async def fetch_config(self, egress_tag: str | None = None,
+                           proxy: str | None = None) -> dict:
         return dict(self.config)
 
-    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+    async def model_requests_need_captcha(self, egress_tag: str | None = None,
+                                          proxy: str | None = None) -> bool:
         return self.needs_captcha
 
-    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+    async def get_verify_param(self, egress_tag: str | None = None,
+                               proxy: str | None = None) -> tuple[str, str | None]:
         self.solve_count += 1
         self.last_egress = egress_tag
         return "mock-verify-param", None

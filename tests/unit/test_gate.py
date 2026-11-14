@@ -25,7 +25,7 @@ def test_edge_trip_blocks_then_expires(monkeypatch):
     assert g.acquire() == (True, "")
 
     g.trip_edge()
-    assert g.edge_hits == 1
+    assert g.edge_hits == {'shared': 1}
     assert g.edge_remaining() > 0
     # 边缘断路器优先于其它维度：即使有在飞余量也必须挡住
     assert g.acquire() == (False, "edge_hold")
@@ -44,7 +44,7 @@ def test_trip_edge_extends_never_shortens(monkeypatch):
     monkeypatch.setattr(settings, "GATE_EDGE_HOLD_SECONDS", 1)
     g.trip_edge()
     assert g.edge_remaining() > 5
-    assert g.edge_hits == 2
+    assert g.edge_hits == {'shared': 2}
 
 
 def test_edge_hold_zero_disables_breaker(monkeypatch):
@@ -52,7 +52,7 @@ def test_edge_hold_zero_disables_breaker(monkeypatch):
     g = Gate()
     g.trip_edge()
     assert g.edge_remaining() == 0
-    assert g.edge_hits == 0  # 未启用不计命中
+    assert g.edge_hits == {}  # 未启用不计命中
     assert g.acquire() == (True, "")
 
 
@@ -104,7 +104,7 @@ def test_reset_clears_everything(monkeypatch):
     g.trip_edge()
     assert g.acquire() == (False, "edge_hold")
     g.reset()
-    assert g.edge_hits == 0
+    assert g.edge_hits == {}
     assert g.edge_remaining() == 0
     assert g.acquire() == (True, "")
 
@@ -131,7 +131,7 @@ def test_busy_window_slides(monkeypatch):
     monkeypatch.setattr(settings, "GATE_BUSY_HOLD_SECONDS", 10)
     g = Gate()
     g.note_busy()
-    g._busy_hits[0] -= 61  # 第一笔滑出窗口
+    g._busy_hits['shared'][0] -= 61  # 第一笔滑出窗口
     g.note_busy()
     assert g.acquire() == (True, "")
 

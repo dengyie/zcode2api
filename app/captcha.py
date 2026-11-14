@@ -160,8 +160,15 @@ class CaptchaManager:
         return self._pool_sizes.get(tag, 0)
 
     # ── 配置 ─────────────────────────────────────────────────────────────────
-    async def fetch_config(self, egress_tag: str | None = None) -> dict:
-        """取 captcha 配置（按出口缓存）。`egress_tag` 决定拉取走哪条出口。"""
+    async def fetch_config(self, egress_tag: str | None = None,
+                           proxy: str | None = None) -> dict:
+        """取 captcha 配置（按出口缓存）。
+
+        `egress_tag`/`proxy` 决定拉取走哪条出口——per-account 出口隔离下二者
+        都是账号绑定代理 URL；region 由上游按拉取 IP 下发，缓存按 tag 隔离即
+        按 IP 隔离（混用会把错地区的 token 配到请求上）。`proxy` 非 None 时
+        不做跨出口兜底（换出口拉的配置对不上账号 IP）。
+        """
         tag = egress_tag or self.hot_egress()
         ttl = settings.CAPTCHA_CONFIG_CACHE_TTL
         if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
@@ -172,10 +179,16 @@ class CaptchaManager:
                 return self._config_cache[tag]
             err: Exception | None = None
 
-            async def _try_fetch(use_proxy: bool) -> dict | None:
-                """单次拉取（trust_env 按 use_proxy）；成功返回 captcha 配置。"""
+            async def _try_fetch(proxy_url: str | None) -> dict | None:
+                """单次拉取；显式 proxy 优先，否则按 tag 走 trust_env 旧语义。"""
                 try:
-                    async with httpx.AsyncClient(timeout=30, trust_env=use_proxy) as client:
+                    if proxy_url:
+                        client_cm = httpx.AsyncClient(timeout=30, proxy=proxy_url,
+                                                      trust_env=False)
+                    else:
+                        client_cm = httpx.AsyncClient(timeout=30,
+                                                      trust_env=tag == egress.PROXY)
+                    async with client_cm as client:
                         res = await client.get(
                             f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
                         )
@@ -186,14 +199,18 @@ class CaptchaManager:
                     err = exc
                     return None
 
+            def _legacy_primary_proxy() -> str | None:
+                return egress.proxy_url() if tag == egress.PROXY else None
+
             captcha: dict | None = None
             for _ in range(2):  # 15s 走 US 代理偶发 ReadTimeout，同出口重试一次
-                captcha = await _try_fetch(tag == egress.PROXY)
+                captcha = await _try_fetch(proxy if proxy is not None else _legacy_primary_proxy())
                 if captcha:
                     break
-            if not captcha:
+            if not captcha and proxy is None:
                 # 主出口两连败 → 另一条出口兜底（2026-11-04 线上实锤：proxy 整晚
-                # 超时而 direct 稳定；配置拿不到会误开「模型请求带码」→ 3012）
+                # 超时而 direct 稳定；配置拿不到会误开「模型请求带码」→ 3012）。
+                # per-account 模式不做跨出口兜底——换出口拉的配置对不上账号 IP。
                 alt = egress.DIRECT if tag == egress.PROXY else egress.PROXY
                 captcha = await _try_fetch(alt == egress.PROXY)
                 if captcha:
@@ -221,7 +238,8 @@ class CaptchaManager:
             )
             return dict(constants.CAPTCHA_DEFAULTS)
 
-    async def model_requests_need_captcha(self, egress_tag: str | None = None) -> bool:
+    async def model_requests_need_captcha(self, egress_tag: str | None = None,
+                                          proxy: str | None = None) -> bool:
         """模型请求是否该带验证码——官方 `requiresRequestVerification` 的等价物。
 
         bundle 原文：`mode==="start-plan" && enabled!==false && skipModelRequest!==true`。
@@ -229,7 +247,7 @@ class CaptchaManager:
         `X-Aliyun-Captcha-Verify-Param`；hub 长期无条件带，这正是「官方不会干的
         事」，也是 3012 的结构性嫌疑。无配置时官方仍要求验证码，故默认 False。
         """
-        config = await self.fetch_config(egress_tag)
+        config = await self.fetch_config(egress_tag, proxy)
         return config.get("enabled") is not False and config.get("skip_model_request") is not True
 
     # ── 预解池 ───────────────────────────────────────────────────────────────
@@ -334,12 +352,13 @@ class CaptchaManager:
             for token in kept:
                 self._put(token, one)
 
-    async def get_verify_param(self, egress_tag: str | None = None) -> tuple[str, str | None]:
+    async def get_verify_param(self, egress_tag: str | None = None,
+                               proxy: str | None = None) -> tuple[str, str | None]:
         """取一枚可用 token：优先池内现成的（跳过过期），池空才同步现解。
 
-        `egress_tag` 必须是本次请求真实使用的出口（`proxy` / `direct`），
-        否则拿到的 token 与请求 IP 不一致，上游会判 unusual activity。
-        只有热路径出口有池；其它出口现解。
+        `egress_tag` 必须是本次请求真实使用的出口（per-account 模式 = 账号绑定
+        代理 URL），否则拿到的 token 与请求 IP 不一致，上游会判 unusual
+        activity。只有热路径出口有池；其它出口现解。
 
         返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
         """
@@ -362,14 +381,15 @@ class CaptchaManager:
                 return token.param, token.region
 
         # 2) 池空/全过期/非热路径出口：同步现解一次
-        config = await self.fetch_config(tag)
-        token = await self._solve_one(config, tag)
+        config = await self.fetch_config(tag, proxy)
+        token = await self._solve_one(config, tag, proxy)
         if token is None:
             raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
         return token.param, token.region
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
-    async def _solve_one(self, config: dict, tag: str = egress.DIRECT) -> _Token | None:
+    async def _solve_one(self, config: dict, tag: str = egress.DIRECT,
+                         proxy: str | None = None) -> _Token | None:
         scene = config.get("sceneId") or constants.CAPTCHA_DEFAULTS["sceneId"]
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
@@ -379,7 +399,7 @@ class CaptchaManager:
             try:
                 # 进程级并发上限：超出排队等前一个浏览器退出，避免内存被打满
                 async with self._solve_sem:
-                    param = await self._run_solver(scene, region, prefix, tag)
+                    param = await self._run_solver(scene, region, prefix, tag, proxy)
             except Exception as err:  # noqa: BLE001
                 last_err = str(err)
                 param = None
@@ -394,7 +414,8 @@ class CaptchaManager:
         return None
 
     async def _run_solver(
-        self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT
+        self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT,
+        proxy: str | None = None,
     ) -> str | None:
         solver = settings.CAPTCHA_SOLVER_JS
         if not solver.exists():
@@ -404,6 +425,7 @@ class CaptchaManager:
         # 出口必须与取用该 token 的请求一致（见 app/egress.py）：
         #   direct → 剥掉代理变量，chrome 不带 --proxy-server
         #   proxy  → 注入代理变量，solver 用它作 --proxy-server
+        # per-account 模式（2.7.36）：proxy = 账号绑定代理 URL，每账号独立出口
         solver_env = {
             **os.environ,
             "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH),
@@ -414,12 +436,15 @@ class CaptchaManager:
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
                     "ALL_PROXY", "all_proxy"):
             solver_env.pop(key, None)
-        if tag == egress.PROXY:
-            proxy = egress.proxy_url()
-            if not proxy:
-                raise RuntimeError("请求走代理但 env 未配置代理地址，无法对齐验证码出口")
-            solver_env["HTTP_PROXY"] = proxy
-            solver_env["HTTPS_PROXY"] = proxy
+        solver_proxy = proxy if proxy is not None else (
+            egress.proxy_url() if tag == egress.PROXY else None)
+        if solver_proxy:
+            solver_env["HTTP_PROXY"] = solver_proxy
+            solver_env["HTTPS_PROXY"] = solver_proxy
+        elif tag == egress.PROXY:
+            # legacy 共享模式：tag=proxy 但 env 无代理 → 无法对齐验证码出口，
+            # 必须响亮失败（静默求解 = token 与请求 IP 不一致 = 3012）
+            raise RuntimeError("请求走代理但 env 未配置代理地址，无法对齐验证码出口")
         proc = await asyncio.create_subprocess_exec(
             settings.NODE_PATH, str(solver), scene, region, prefix,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),

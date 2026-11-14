@@ -110,8 +110,13 @@ async def fetch_quota(account: Account) -> dict:
     # 出口必须与 billing/claim 链一致：BILLING_EGRESS=proxy 时走家宽代理，
     # direct 时绕过 env/系统代理。此前默认 trust_env=True 会在 proxy 模式下
     # 让「占多数」的 quota 刷新从直连出口出去（与领奖/请求出口错配）。
+    # per-account 出口隔离（2.7.36）：账号绑定专属代理时优先——billing 与
+    # messages 必须同 IP（token/风控同源），否则「双 IP 异常信号」复发。
+    account_proxy = egress.account_proxy(account)
     trust_env = settings.BILLING_EGRESS == egress.PROXY
-    async with httpx.AsyncClient(timeout=20, trust_env=trust_env) as client:
+    client_kw = ({"proxy": account_proxy, "trust_env": False} if account_proxy
+                 else {"trust_env": trust_env})
+    async with httpx.AsyncClient(timeout=20, **client_kw) as client:
         async def _get(path: str):
             try:
                 return await client.get(f"{base}{path}", headers=headers)
@@ -358,7 +363,9 @@ async def fetch_coding_limits(account: Account) -> dict:
         return {"error": "该账号没有 API Key，无法查询 Coding 平面额度"}
     headers = {"authorization": api_key, "accept": "application/json"}
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        account_proxy = egress.account_proxy(account)
+        client_kw = ({"proxy": account_proxy, "trust_env": False} if account_proxy else {})
+        async with httpx.AsyncClient(timeout=20, **client_kw) as client:
             resp = await client.get(constants.CODING_LIMIT_URL, headers=headers)
     except httpx.HTTPError as err:
         return {"error": f"请求上游失败: {err}"}

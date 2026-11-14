@@ -33,17 +33,21 @@ from . import constants, egress, logs, settings, telemetry
 _CLIENT_TIMEOUT = 15
 
 
-async def _fetch_client_configs() -> dict:
+async def _fetch_client_configs(proxy: str | None = None) -> dict:
     """第 1 步：client/configs（免鉴权）。HTTP / 业务码任一失败抛异常。
 
     出口跟随 settings.BILLING_EGRESS（2.7.33）：安装序与激活上报（telemetry）、
     billing/claim 同属一条官方首启模拟链路，必须同出口。此前写死 trust_env=False
     （直连），在 BILLING_EGRESS=proxy 部署下会与领奖/请求出口分裂——出口分裂
     本身就是上游指纹矛盾信号（3012）。direct 模式下与旧行为完全一致。
+    per-account 出口隔离（2.7.36）：`proxy` 传账号绑定代理时优先。
     """
     url = f"{constants.CLIENT_CONFIGS_URL}?app_version={constants.BILLING_APP_VERSION}"
-    trust_env = settings.BILLING_EGRESS == egress.PROXY
-    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT, trust_env=trust_env) as client:
+    if proxy:
+        client_kw = {"proxy": proxy, "trust_env": False}
+    else:
+        client_kw = {"trust_env": settings.BILLING_EGRESS == egress.PROXY}
+    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT, **client_kw) as client:
         res = await client.get(url, headers={"User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}"})
     res.raise_for_status()
     body = res.json()  # 非 JSON 由调用方按 ValueError 容错
@@ -86,7 +90,7 @@ async def run_install_sequence_for_account(account) -> dict:
     user_id = jwt_user_id(account) or ""
 
     try:
-        await _fetch_client_configs()
+        await _fetch_client_configs(proxy=egress.account_proxy(account))
         result["configs_fetched"] = True
     except (httpx.HTTPError, RuntimeError, ValueError) as err:
         result["errors"].append(f"client/configs 失败: {err}")
@@ -94,7 +98,8 @@ async def run_install_sequence_for_account(account) -> dict:
     for element in constants.ACTIVATION_ELEMENTS:
         try:
             await telemetry.post_activation_event(profile, user_id, element,
-                                                  timeout=_CLIENT_TIMEOUT)
+                                                  timeout=_CLIENT_TIMEOUT,
+                                                  proxy=egress.account_proxy(account))
             result["events_reported"].append(element)
         except (httpx.HTTPError, RuntimeError) as err:
             result["errors"].append(str(err))

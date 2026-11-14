@@ -144,10 +144,10 @@ class TestCaptchaEgressSeparation:
     def _manager(self, monkeypatch, hot: str, solved: list[str]) -> CaptchaManager:
         mgr = CaptchaManager()
 
-        async def _config(tag=None):
+        async def _config(tag=None, proxy=None):
             return {"sceneId": "s", "region": "cn", "prefix": "p"}
 
-        async def _solve(config, tag=egress.DIRECT):
+        async def _solve(config, tag=egress.DIRECT, proxy=None):
             solved.append(tag)
             return _Token(f"tok-{tag}", "cn", tag)
 
@@ -155,7 +155,7 @@ class TestCaptchaEgressSeparation:
         monkeypatch.setattr(mgr, "_solve_one", _solve)
         monkeypatch.setattr(CaptchaManager, "hot_egress", lambda self: hot)
 
-        async def _no_refill(need, tag=None):
+        async def _no_refill(need, tag=None, proxy=None):
             return None
 
         monkeypatch.setattr(mgr, "_refill_batch", _no_refill)
@@ -242,7 +242,7 @@ class TestModelRequestCaptchaGating:
     def _manager(self, monkeypatch, config: dict) -> CaptchaManager:
         mgr = CaptchaManager()
 
-        async def _config(tag=None):
+        async def _config(tag=None, proxy=None):
             return dict(config)
 
         monkeypatch.setattr(mgr, "fetch_config", _config)

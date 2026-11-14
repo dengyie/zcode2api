@@ -175,6 +175,14 @@ GATE_POOL_PROBE_MIN_SECONDS = _int("ZCODE_GATE_POOL_PROBE_MIN", 300)
 # 超限自动切下一账号。不读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台 meta 覆盖
 # （2→10→3 纠正：上游 ZCode 单账号并发写死 3，本地闸必须同值，放更宽只会吃 3008）
 ACCOUNT_CONCURRENCY = 3
+# ── per-account 出口隔离（2.7.36，需求 = 每账号一个独立 IP 互相隔离）──────────
+# 依据：①上游按出口 IP 风控（magpie 实证：同 IP 同时用 3 个账号即触发边缘
+# 405 封地址，2 个不封——共享出口下 7 号远超红线）；②3008 风暴全池均匀爆发
+# = 上游按 IP 维度限并发的实证。开关关闭时全链路走共享出口现状（行为零变化）。
+# listener 池 = 逗号分隔的 mihomo listener URL（tebi 上 11031-11037 各钉一个
+# pigeonw 节点）；账号入池/启动补分配时领取，随 data blob 持久化。
+PER_ACCOUNT_EGRESS = _bool("ZCODE_PER_ACCOUNT_EGRESS", False)
+EGRESS_LISTENERS = [u.strip() for u in os.getenv("ZCODE_EGRESS_LISTENERS", "").split(",") if u.strip()]
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -238,7 +246,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.35"
+APP_VERSION = "2.7.36"
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

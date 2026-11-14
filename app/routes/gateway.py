@@ -52,15 +52,21 @@ MODEL_CATALOG = constants.MODEL_CATALOG
 _EXHAUST_KEYWORDS = constants.EXHAUST_KEYWORDS
 
 
-def _messages_egress() -> str:
+def _messages_egress(account: Account | None = None) -> str:
     """messages 通道有效出口 tag（同时驱动 captcha 签发出口，见 app/egress.py）。
 
+    per-account 出口隔离（2.7.36）：账号绑定了专属代理时 tag = 该代理 URL
+    （闸门断路器 / 验证码池 / config 缓存都按它分键，token 出口 = 请求出口）；
+    否则维持全局 2 值 tag（proxy/direct）。
     ZCODE_MESSAGES_FORCE_DIRECT=true 强制直连：2026-11-04 线上实证 env 代理
     出口（GCP IP）被上游持续标记——messages 走代理 17h+ 零成功（3012
     unusual activity），而同账号 billing/claim/telemetry 直连全部正常。
     统一全链路出口，消除「CN billing + US messages」双 IP 异常信号；
     置 false 恢复历史行为（走 env 代理）。
     """
+    proxy = egress.account_proxy(account) if account is not None else None
+    if proxy:
+        return proxy
     if settings.MESSAGES_FORCE_DIRECT:
         return egress.DIRECT
     return egress.egress_for(settings.UPSTREAM["zai"])
@@ -678,7 +684,7 @@ async def _dispatch(req_id, body, incoming_headers, provider):
             plan_channel = account.provider == "zai" and account.uses_plan_channel()
             try:
                 needs_captcha = plan_channel and await captcha_manager.model_requests_need_captcha(
-                    _messages_egress()
+                    _messages_egress(account), egress.account_proxy(account)
                 )
                 result = await _try_account(
                     req_id, account, body, incoming_headers, plan_channel, needs_captcha,
@@ -715,14 +721,27 @@ async def _dispatch(req_id, body, incoming_headers, provider):
                 f"{providers[pi + 1]}",
             )
 
-    # 进程级闸门拒绝（边缘封禁/忙碌断路器/分钟预算/套餐窗口）期间的兜底：所有
-    # plan 账号都被本地拒绝到这里，必须带真实原因与 Retry-After，而不是误导性的
+    # 进程级闸门拒绝（套餐窗口/分钟预算）期间的兜底 + 「全部出口被 edge/busy
+    # hold」的还原形态：必须带真实原因与 Retry-After，而不是误导性的
     # 「无可用账号」。rate_limit/busy_hold/pool_hold 是限流语义回 429（客户端按
     # 限流退避重试，magpie 同款；pool_hold 的 Retry-After 指向下一个套餐窗口），
-    # edge_hold（IP 被封）回 503。
-    reason = gate.refusal_reason()
+    # edge_hold（IP 被封）回 503。per-account 出口隔离（2.7.36）下 edge/busy
+    # 按账号 tag 分键、循环内逐账号跳号——只有**全部**活跃出口都被 hold 才走到
+    # 这里（共享模式 = 旧全池行为，逐字节还原）。
+    reason = gate.global_refusal_reason()
+    hold_tag = "shared"
+    if not reason:
+        active_tags = sorted({
+            _messages_egress(a) for a in store.list_accounts("zai")
+            if a.enabled and a.status is Status.ACTIVE
+        })
+        held = [t for t in active_tags
+                if gate.hold_reason(t) in ("edge_hold", "busy_hold")]
+        if active_tags and len(held) == len(active_tags):
+            hold_tag = held[0]
+            reason = gate.hold_reason(hold_tag)
     if reason:
-        wait = gate.retry_after()
+        wait = gate.retry_after(hold_tag)
         status = 429 if reason in ("rate_limit", "busy_hold", "pool_hold") else 503
         logs.req_err(req_id, f"闸门 {reason}，拒绝本请求（Retry-After {wait}s）")
         reqlog.finish_error(req_id, f"gate_{reason}", status=status)
@@ -1134,7 +1153,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     retries_5xx = 0
     model_name = str(body.get("model") or "-")
     # 验证码必须与本次 zcode-plan 请求同出口（见 app/egress.py）；记下来供失败日志佐证
-    captcha_egress = _messages_egress() if plan_channel else None
+    captcha_egress = _messages_egress(account) if plan_channel else None
     gate_acquired = False
 
     def _drop_gate() -> None:
@@ -1192,22 +1211,24 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 闸门会拒（边缘封禁/忙碌/分钟预算）时不要先花一枚真浏览器解出的
                 # 验证码再被拒掉：池上限只有 2 枚/出口，解一枚 10–40s，空池会把
                 # 每个请求都拖进求解。
-                refuse = gate.refusal_reason()
+                refuse = gate.refusal_reason(_messages_egress(account))
                 if refuse:
                     if _jump_to_fallback():
                         logs.warn(req_id, f"账号 {account.name} 闸门 {refuse}，直接切 API Key 回退")
                         needs_captcha = False
                         continue
-                    # 进程级 hold 与账号无关：换下一个 plan 账号同样会被本地拒绝
-                    #（有 Key 的账号已在上面下沉），交给 dispatch 兜底 503——带真实
-                    # 原因与 Retry-After，而不是在这里终止整个调度
+                    # pool_hold/分钟预算是全局 hold（换 plan 账号同样被拒）；edge/
+                    # busy 已按账号 tag 分键（2.7.36）——只 hold 该账号出口，循环
+                    # 内换下一个账号即可，不在此终止整个调度
                     return _NEXT_ACCOUNT
                 _park_slot(slot_box)
                 try:
                     # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
-                    # 换出口使用会被上游判 unusual activity（3012）。
+                    # 换出口使用会被上游判 unusual activity（3012）。per-account
+                    # 模式下 = 账号绑定代理（token 出口 = 请求出口）。
                     verify_param, verify_region = await captcha_manager.get_verify_param(
-                        egress_tag=_messages_egress()
+                        egress_tag=_messages_egress(account),
+                        proxy=egress.account_proxy(account),
                     )
                 except Exception as err:  # noqa: BLE001
                     logs.req_err(req_id, f"人机校验失败: {err}")
@@ -1240,7 +1261,9 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             # 混合池里排在后面的有 Key 账号永远轮不到。
             gate_acquired = False
             if channel == "zai":
-                ok, why = gate.acquire()
+                # 闸门按账号出口 tag 分键（2.7.36 per-account 出口隔离）：edge/
+                # busy 只 hold 该账号的出口，跳号换下一个账号即可
+                ok, why = gate.acquire(_messages_egress(account))
                 if not ok:
                     if _jump_to_fallback():
                         logs.warn(req_id, f"账号 {account.name} 闸门 {why}，切 API Key 回退")
@@ -1249,15 +1272,25 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     return _NEXT_ACCOUNT
                 gate_acquired = True
 
-            client = httpx.AsyncClient(
-                # read 空闲上限：原 None——挂死的上游无限占用并发槽/闸门/客户端
-                # 连接（2026-11-14 review）。相邻 chunk 间隙 >600s 判死，真实长思考远小于此
-                timeout=httpx.Timeout(connect=30.0, read=settings.UPSTREAM_READ_TIMEOUT,
-                                      write=120.0, pool=30.0),
-                # ZCODE_MESSAGES_FORCE_DIRECT：直连出口须绕过 env/系统代理（与
-                # _messages_egress 的 DIRECT tag 一致，否则 captcha 出口错配 3012）
-                trust_env=not settings.MESSAGES_FORCE_DIRECT,
-            )
+            account_proxy = egress.account_proxy(account)
+            if account_proxy:
+                # per-account 出口隔离：该账号所有上游请求走绑定 listener
+                # （显式 proxy + trust_env=False，与 env 代理语义彻底解耦）
+                client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=30.0, read=settings.UPSTREAM_READ_TIMEOUT,
+                                          write=120.0, pool=30.0),
+                    proxy=account_proxy, trust_env=False,
+                )
+            else:
+                client = httpx.AsyncClient(
+                    # read 空闲上限：原 None——挂死的上游无限占用并发槽/闸门/客户端
+                    # 连接（2026-11-14 review）。相邻 chunk 间隙 >600s 判死，真实长思考远小于此
+                    timeout=httpx.Timeout(connect=30.0, read=settings.UPSTREAM_READ_TIMEOUT,
+                                          write=120.0, pool=30.0),
+                    # ZCODE_MESSAGES_FORCE_DIRECT：直连出口须绕过 env/系统代理（与
+                    # _messages_egress 的 DIRECT tag 一致，否则 captcha 出口错配 3012）
+                    trust_env=not settings.MESSAGES_FORCE_DIRECT,
+                )
             cm = client.stream("POST", url, headers=headers, content=payload)
             try:
                 resp = await cm.__aenter__()
@@ -1312,7 +1345,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # 渠道上即使这一趟没带码也要探测——若上游仍要求验证码，下一趟补码重试。
                 challenge = _detect_captcha_challenge(resp, text) if channel == "zai" else None
                 if challenge:
-                    captcha_manager.invalidate(_messages_egress())
+                    captcha_manager.invalidate(_messages_egress(account))
                     captcha_retries += 1
                     if captcha_retries >= MAX_CAPTCHA_RETRIES:
                         account.record_result(False, "验证码挑战连续失败")
@@ -1326,12 +1359,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         logs.warn(req_id, f"账号 {account.name} 验证码挑战（{challenge}），刷新重试")
                     continue  # 同账号重建请求重试
 
-                # 边缘封禁（IP 级 405）：全进程暂停 plan 渠道，不惩罚账号。
-                # 与下方账号级 3012 严格区分：换账号解决不了 IP 被封，只会把
-                # 其余账号一起送进同一个封禁窗口。
+                # 边缘封禁（IP 级 405）：暂停**该账号出口**上的 plan 渠道，不惩罚
+                # 账号。与下方账号级 3012 严格区分：换账号解决不了 IP 被封——
+                # per-account 出口隔离（2.7.36）下只冻结该账号的 IP，其余账号
+                # 各自的出口不受牵连（调度循环逐账号跳号）。
                 if _is_edge_block(status_code, text):
-                    gate.trip_edge()
-                    wait = gate.retry_after()
+                    edge_tag = _messages_egress(account)
+                    gate.trip_edge(edge_tag)
+                    wait = gate.retry_after(edge_tag)
                     snippet = " ".join(text.split())[:200]
                     account.record_result(False, f"边缘封禁 HTTP {status_code}（IP 级，非账号）")
                     store.update_account(account)
@@ -1558,8 +1593,9 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         continue
                     if _is_concurrency_hit(text):
                         # 请求最终因「并发已满」放弃 Plan 渠道 = 真饱和信号（magpie
-                        # busyCap 口径）；重试中途自愈的不计——突发抖动不该触发全池停摆
-                        gate.note_busy()
+                        # busyCap 口径）；重试中途自愈的不计——突发抖动不该触发停摆。
+                        # 按账号出口 tag 分键（2.7.36）：饱和只降速该账号的 IP
+                        gate.note_busy(_messages_egress(account))
                     account.record_result(False, f"429 重试 {settings.RETRY_429_TIMES} 次耗尽")
                     store.update_account(account)
                     logs.warn(

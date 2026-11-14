@@ -123,8 +123,11 @@ class Store:
                 except (json.JSONDecodeError, TypeError) as exc:
                     # 静默跳过 = 启动期数据丢失无人知晓（2026-11-14 review）
                     logs.err("store", f"账号行损坏已跳过: {exc}")
+                    continue
                 if account.provider in self._accounts:
                     self._accounts[account.provider].append(account)
+        # 启动补分配 per-account 出口（2.7.36；listener 池未配置时为 no-op）
+        self.ensure_egress_assignments()
 
     def _persist_account(self, account: Account) -> None:
         with closing(self._connect()) as conn:
@@ -249,9 +252,42 @@ class Store:
                     return a  # 跳过重复 token
             self._assign_fingerprint(account)  # 入池即分配独立设备指纹
             account.install_id = str(uuid.uuid4())  # 安装身份：稳定安装令牌
+            self._assign_egress(account)  # 入池即分配专属出口（每账号一个 IP）
             self._accounts[provider].append(account)
             self._persist_account(account)
         return account
+
+    def _assign_egress(self, account: Account) -> None:
+        """入池分配专属出口（per-account egress，2.7.36）：从 EGRESS_LISTENERS
+        池取第一个未被占用的 listener URL 固化到账号。池未配置/已耗尽 →
+        保持 None（回落共享出口，warn 留痕）。绑定跨重启稳定（验证码 token
+        与出口 IP 绑定）。"""
+        if account.egress or not settings.EGRESS_LISTENERS:
+            return
+        used = {a.egress for items in self._accounts.values() for a in items if a.egress}
+        free = next((u for u in settings.EGRESS_LISTENERS if u not in used), None)
+        if free is None:
+            logs.warn("store", f"出口 listener 池已耗尽，账号 {account.name} 回落共享出口")
+            return
+        account.egress = free
+
+    def ensure_egress_assignments(self) -> None:
+        """启动补分配：无 egress 绑定的账号按 created_at 序领取空闲 listener。"""
+        if not settings.EGRESS_LISTENERS:
+            return
+        with self._lock:
+            changed: list[Account] = []
+            for items in self._accounts.values():
+                for account in sorted(items, key=lambda x: x.created_at):
+                    if account.egress:
+                        continue
+                    self._assign_egress(account)
+                    if account.egress:
+                        changed.append(account)
+            for account in changed:
+                self._persist_account(account)
+        if changed:
+            logs.ok("store", f"per-account 出口补分配 {len(changed)} 个账号")
 
     @staticmethod
     def _assign_fingerprint(account: Account) -> None:

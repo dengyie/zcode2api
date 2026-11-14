@@ -72,10 +72,14 @@ def dry():
     return os.environ.get("DRY_RUN") == "1"
 
 
-def http(url, method="GET", body=None, headers=None, timeout=15, via_proxy=False):
+def http(url, method="GET", body=None, headers=None, timeout=15, via_proxy=False,
+         _opener=None):
     data = body.encode() if isinstance(body, str) else body
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
-    opener = PROXY_OPENER if via_proxy else NOPROXY_OPENER
+    if _opener is not None:
+        opener = _opener
+    else:
+        opener = PROXY_OPENER if via_proxy else NOPROXY_OPENER
     try:
         r = opener.open(req, timeout=timeout)
         return r.status, r.read().decode("utf-8", "replace")
@@ -131,6 +135,53 @@ def mihomo_name_from_tp(node_name):
         return None
 
 
+PER_ACCOUNT_PORT_BASE = 11031  # zcode-acc-01..07 → 11031-11037（2.7.36 per-account 隔离）
+
+
+def account_egress_url(account_id):
+    """读 hub DB（ro）拿账号绑定的专属出口 listener URL；未绑定返回 None。"""
+    try:
+        con = sqlite3.connect(DB, uri=True)
+        row = con.execute("SELECT data FROM accounts WHERE id=?",
+                          (account_id,)).fetchone()
+        con.close()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return json.loads(row[0]).get("egress")
+
+
+def group_for_listener(egress_url):
+    """http://127.0.0.1:11031 → zcode-acc-01（端口即组序号）。"""
+    try:
+        port = int(str(egress_url).rsplit(":", 1)[1])
+        return "zcode-acc-%02d" % (port - PER_ACCOUNT_PORT_BASE + 1), port
+    except (ValueError, IndexError):
+        return None, None
+
+
+def _opener(proxy):
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+
+
+def tp_banned_nodes():
+    """TetherPool 上 service=zcode-hub 的在隔离节点名集合（换 IP 时避开）。"""
+    try:
+        st, raw = http(TP_BASE + "/v1/feedback/bans?service=" + SERVICE,
+                       headers=tp_headers(), timeout=10)
+        out = set()
+        for b in json.loads(raw or "[]"):
+            if b.get("released_at"):
+                continue
+            if b.get("node_name"):
+                out.add(b["node_name"])
+        return out
+    except Exception:
+        return set()
+
+
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -154,12 +205,12 @@ def detect(watermark):
     con = sqlite3.connect(DB, uri=True)
     try:
         rows = con.execute(
-            "SELECT name, json_extract(data,'$.recent_results') FROM accounts "
+            "SELECT id, name, json_extract(data,'$.recent_results') FROM accounts "
             "WHERE enabled=1").fetchall()
     finally:
         con.close()
     hits, latest = [], watermark
-    for name, arr in rows:
+    for acc_id, name, arr in rows:
         try:
             results = json.loads(arr) if arr else []
         except Exception:
@@ -168,7 +219,7 @@ def detect(watermark):
             at = float(r.get("at") or 0)
             latest = max(latest, at)
             if at > watermark and "边缘封禁" in str(r.get("detail") or ""):
-                hits.append({"at": at, "account": name,
+                hits.append({"at": at, "account": name, "account_id": acc_id,
                              "detail": str(r.get("detail"))[:90]})
     hits.sort(key=lambda h: h["at"])
     return hits, latest
@@ -188,9 +239,9 @@ def _cidr24(ip):
     return None
 
 
-def egress_ip():
+def egress_ip(proxy=PROXY):
     st, raw = http("http://ip-api.com/json/?fields=query,isp",
-                   via_proxy=True, timeout=12)
+                   via_proxy=True, timeout=12, _opener=_opener(proxy))
     try:
         d = json.loads(raw)
         return d.get("query", "?"), d.get("isp", "?")
@@ -198,15 +249,17 @@ def egress_ip():
         return "?", raw.strip()[:60]
 
 
-def direct_probe(jwt):
-    """零 strike 直连探针：JSON-APP=边缘放行（3012 属形状预期值），HTML-EDGE=仍封。"""
+def direct_probe(jwt, proxy=PROXY):
+    """零 strike 直连探针：JSON-APP=边缘放行（3012 属形状预期值），HTML-EDGE=仍封。
+
+    proxy 可指定账号专属 listener（per-account 模式逐账号验证）。"""
     st, raw = http(PLAN_URL, "POST",
                    json.dumps({"model": "GLM-5.3-Flash", "max_tokens": 16,
                                "messages": [{"role": "user", "content": "hi"}]}),
                    {"Authorization": "Bearer " + jwt,
                     "Content-Type": "application/json",
                     "User-Agent": "ZCode/3.17.2"},
-                   timeout=30, via_proxy=True)
+                   timeout=30, via_proxy=True, _opener=_opener(proxy))
     low = raw.lstrip().lower()
     kind = "HTML-EDGE" if (low.startswith("<!doctype") or "<html" in low[:200]
                            or "<title>405" in low) else "JSON-APP"
@@ -244,7 +297,120 @@ def get_db_secrets():
 
 
 def swap(state, hit):
-    """一次完整换 IP 流程。返回 True=已切换成功。"""
+    """一次完整换 IP 流程。返回 True=已切换成功。
+
+    per-account 出口隔离（2.7.36）：命中账号绑定了专属 listener（Account.egress）
+    时走按账号换 IP（只动该账号的 zcode-acc-NN 组）；未绑定走共享组全池换 IP
+    （兼容模式，行为与 2.7.35 一致）。
+    """
+    egress_url = account_egress_url(hit.get("account_id") or "")
+    if egress_url:
+        return _swap_one_account(state, hit, egress_url)
+    return _swap_shared(state, hit)
+
+
+def _swap_one_account(state, hit, egress_url):
+    """per-account：只换命中账号绑定 listener 的出口节点（其余账号零影响）。"""
+    group, port = group_for_listener(egress_url)
+    if not group:
+        log("ALERT", f"账号 {hit['account']} 的 egress {egress_url} 无法解析组名——人工介入")
+        return False
+    jwt, key = get_db_secrets()
+    ip_old, isp_old = egress_ip(f"http://127.0.0.1:{port}")
+    _, g = mihomo_api("GET", "/proxies/" + group)
+    cur_node = g.get("now", "") if isinstance(g, dict) else ""
+    cur_tp = tp_name_from_mihomo(cur_node)
+    log("INFO", "[per-account] 触发: %s（account=%s）；组 %s 当前 %s 出口 %s(%s)"
+        % (hit["detail"], hit["account"], group, cur_node, ip_old, isp_old))
+    if not cur_tp:
+        log("ALERT", f"组 {group} 当前节点 {cur_node} 非 pigeonw 命名——人工介入")
+        return False
+
+    # 1) ban 该账号当前节点（TetherPool 隔离：全池不再分配该 IP）
+    if dry():
+        log("DRY", f"（DRY_RUN 将执行: ban {cur_tp} + 换 {group} 出口节点 + 端口 {port} 探针）")
+        return False
+    st, resp = http(TP_BASE + "/v1/feedback/ban", "POST",
+                    json.dumps({"service": SERVICE, "account": ACCOUNT,
+                                "node_name": cur_tp, "reason": "edge_405_html",
+                                "evidence": {"http_status": 405, "body_kind": "html",
+                                             "observed_at": bj_str(hit["at"]) + "+08:00",
+                                             "hub_detail": hit["detail"],
+                                             "account": hit["account"]}}),
+                    tp_headers(), timeout=15)
+    log("INFO", f"ban({cur_tp}) → HTTP {st} {str(resp)[:150]}")
+
+    # 2) 选新节点：排除其它账号组当前钉的节点 + TP 在隔离节点 + 当前节点
+    banned = tp_banned_nodes()
+    taken = set()
+    for i in range(1, 8):
+        gn = "zcode-acc-%02d" % i
+        if gn == group:
+            continue
+        _, og = mihomo_api("GET", "/proxies/" + gn)
+        if isinstance(og, dict) and og.get("now"):
+            taken.add(og["now"])
+    free = [n for n in (g.get("all") or [])
+            if n != cur_node and n not in taken and tp_name_from_mihomo(n) not in banned]
+    if not free:
+        log("ALERT", f"[per-account] {group} 无可用新节点（其余被占用/隔离）——保持现状人工介入")
+        return False
+    target = free[0]
+
+    st, resp = mihomo_api("PUT", "/proxies/" + group, {"name": target})
+    if st not in (200, 204):
+        log("ALERT", f"PUT {group} → {target} 失败 HTTP {st}")
+        return False
+    time.sleep(2)
+    g2 = mihomo_api("GET", "/proxies/" + group)[1]
+    if g2.get("now") != target:
+        log("ALERT", f"{group} 未按预期选中 {target}（now={g2.get('now')}）")
+        return False
+    ip_new, isp_new = egress_ip(f"http://127.0.0.1:{port}")
+    log("INFO", f"[per-account] 已钉 {target}，出口 {ip_old} → {ip_new}({isp_new})")
+    if ip_new == ip_old:
+        log("WARN", "出口 IP 未变化（同线/未生效）——由直连探针把关")
+
+    # 3) 直连探针（走该账号自己的 listener，零 strike）
+    st, kind, body = direct_probe(jwt, proxy=f"http://127.0.0.1:{port}")
+    log("INFO", f"直连探针(端口 {port}): HTTP {st} {kind} {body}")
+    if kind != "JSON-APP":
+        log("ALERT", f"[per-account] 新节点 {target} 仍被边缘封——已 ban，待下轮再换")
+        http(TP_BASE + "/v1/feedback/ban", "POST",
+             json.dumps({"service": SERVICE, "account": ACCOUNT,
+                         "node_name": tp_name_from_mihomo(target),
+                         "reason": "edge_405_html",
+                         "evidence": {"http_status": st, "body_kind": "html",
+                                      "probe": "per_account_post_swap"}}),
+             tp_headers(), timeout=15)
+        return False
+
+    # 4) hub 端到端（时间预算制，覆盖 edge_hold 闸门全窗）
+    deadline = time.time() + GATE_HOLD + 45
+    st, text, gate, body = None, "", False, ""
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        st, text, gate, body = hub_probe(key)
+        log("INFO", "hub端到端(第%d次): HTTP %s reply=%s gate_hold=%s" % (attempt, st, text, gate))
+        if st == 200:
+            log("INFO", "✅ [per-account] %s 出口已换：%s → %s（%s → %s），流量恢复"
+                % (hit["account"], ip_old, ip_new, cur_tp, tp_name_from_mihomo(target)))
+            return True
+        if gate or st == 503:
+            wait = _retry_after_seconds(body) or 45
+            wait = max(5, min(wait + 2, 75))
+            log("INFO", "hub edge_hold 闸门未过期（剩约 %ss），%ds 后重试" % (wait, wait))
+            time.sleep(wait)
+        else:
+            break
+    log("ALERT", "hub 端到端未达 200（最后 HTTP %s %s）——直连探针已放行、出口已换，人工复核"
+        % (st, body[:120]))
+    return False
+
+
+def _swap_shared(state, hit):
+    """共享出口模式（兼容 2.7.35 行为）：全池换共享组的节点。"""
     _, cur = mihomo_api("GET", "/proxies/" + GRP)
     cur_name = cur.get("now", "")
     cur_nn = mihomo_node_number(cur_name)
