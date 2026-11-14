@@ -182,6 +182,25 @@ def tp_banned_nodes():
         return set()
 
 
+def all_account_groups():
+    """hub DB 里所有已绑定 egress 的账号 → {(组名, 端口)}（组集动态化：
+    扩池只改 ZCODE_EGRESS_LISTENERS，agent 零改动）。"""
+    try:
+        con = sqlite3.connect(DB, uri=True)
+        rows = con.execute(
+            "SELECT DISTINCT json_extract(data,'$.egress') FROM accounts "
+            "WHERE json_extract(data,'$.egress') IS NOT NULL").fetchall()
+        con.close()
+    except sqlite3.Error:
+        return set()
+    out = set()
+    for (url,) in rows:
+        gn, port = group_for_listener(url)
+        if gn:
+            out.add((gn, port))
+    return out
+
+
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -340,33 +359,54 @@ def _swap_one_account(state, hit, egress_url):
                     tp_headers(), timeout=15)
     log("INFO", f"ban({cur_tp}) → HTTP {st} {str(resp)[:150]}")
 
-    # 2) 选新节点：排除其它账号组当前钉的节点 + TP 在隔离节点 + 当前节点
+    # 2) 选新节点：排除其它账号组当前钉的节点（组集动态化）+ TP 在隔离节点
+    #    + 当前节点；并按 /24 段位多样性择优（与 hub 的 avoid_cidr 口径一致）
     banned = tp_banned_nodes()
     taken = set()
-    for i in range(1, 8):
-        gn = "zcode-acc-%02d" % i
+    used_cidrs: dict[str, str] = {}
+    for gn, gp in sorted(all_account_groups()):
         if gn == group:
             continue
         _, og = mihomo_api("GET", "/proxies/" + gn)
         if isinstance(og, dict) and og.get("now"):
             taken.add(og["now"])
+        ip_g, _ = egress_ip(f"http://127.0.0.1:{gp}")
+        c = _cidr24(ip_g)
+        if c:
+            used_cidrs.setdefault(c, gn)
     free = [n for n in (g.get("all") or [])
             if n != cur_node and n not in taken and tp_name_from_mihomo(n) not in banned]
     if not free:
         log("ALERT", f"[per-account] {group} 无可用新节点（其余被占用/隔离）——保持现状人工介入")
         return False
-    target = free[0]
 
-    st, resp = mihomo_api("PUT", "/proxies/" + group, {"name": target})
-    if st not in (200, 204):
-        log("ALERT", f"PUT {group} → {target} 失败 HTTP {st}")
-        return False
-    time.sleep(2)
+    # 逐候选试钉：出口 /24 与在用段位不冲突即选定；全部冲突则按可用性保留末位
+    target = ip_new = isp_new = None
+    last = None
+    for cand in free:
+        st, resp = mihomo_api("PUT", "/proxies/" + group, {"name": cand})
+        if st not in (200, 204):
+            log("WARN", f"PUT {group} → {cand} 失败 HTTP {st}，试下一个")
+            continue
+        time.sleep(1.5)
+        ip_c, isp_c = egress_ip(f"http://127.0.0.1:{port}")
+        c24 = _cidr24(ip_c)
+        if c24 and c24 in used_cidrs:
+            log("INFO", f"[per-account] 候选 {cand} 出口 {ip_c} 与 {used_cidrs[c24]} 同段（{c24}），跳过")
+            last = (cand, ip_c, isp_c)
+            continue
+        target, ip_new, isp_new = cand, ip_c, isp_c
+        break
+    if target is None:
+        if last is None:
+            log("ALERT", f"[per-account] {group} 候选节点全部钉失败——保持现状人工介入")
+            return False
+        target, ip_new, isp_new = last
+        log("WARN", f"[per-account] 候选全部与在用出口同段——按可用性保留 {target}")
     g2 = mihomo_api("GET", "/proxies/" + group)[1]
     if g2.get("now") != target:
         log("ALERT", f"{group} 未按预期选中 {target}（now={g2.get('now')}）")
         return False
-    ip_new, isp_new = egress_ip(f"http://127.0.0.1:{port}")
     log("INFO", f"[per-account] 已钉 {target}，出口 {ip_old} → {ip_new}({isp_new})")
     if ip_new == ip_old:
         log("WARN", "出口 IP 未变化（同线/未生效）——由直连探针把关")

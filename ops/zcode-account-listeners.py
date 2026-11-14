@@ -16,6 +16,7 @@ SOP（对齐 hutao-bridge-guard 先例，见 vault「tebi zashboard 项目开发
 """
 
 import json
+import pathlib
 import shutil
 import socket
 import subprocess
@@ -25,7 +26,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, "/personal/clash")
-from clash_lock import ClashConfigLock  # noqa: E402
+from clash_lock import ClashConfigLock, atomic_write_text  # noqa: E402
 
 import yaml  # noqa: E402
 
@@ -90,7 +91,7 @@ def main():
     groups_needed = {GROUP_FMT.format(nn=i + 1): BASE_PORT + i
                      for i in range(COUNT)}
 
-    changed_files = []
+    writes = []  # (path, payload, backup)
     for path in CONFIGS:
         with open(path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
@@ -118,27 +119,37 @@ def main():
         if check_only or DRY:
             log(f"[DRY] {path}: 将追加 {COUNT} group + {COUNT} listener")
             continue
+        # 渲染先行（yaml.dump 的失败不落盘）；备份名带语义后缀（keeper 不清该形态）
+        payload = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False, width=100)
         backup = path + ".bak-zcode-listeners-" + time.strftime("%Y%m%d-%H%M%S")
-        shutil.copyfile(path, backup)
-        with ClashConfigLock():
-            # 同目录临时件 + os.replace 原子替换（NFS 单写者纪律：持锁写）
-            import os as _os
-            tmp = path + ".zcal-tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False,
-                                       width=100))
-            _os.replace(tmp, path)
-        changed_files.append((path, backup))
-        log(f"✓ {path} 已写入（备份 {backup}）")
+        writes.append((path, payload, backup))
 
-    if check_only or DRY or not changed_files:
+    if check_only or DRY or not writes:
         return
 
     mihomo = mihomo_bin()
     if not mihomo:
         log("!! 找不到 mihomo 二进制——请手动 mihomo -t 校验后再热载")
         sys.exit(2)
-    for path, _ in changed_files:
+
+    # 写入阶段（持锁 + atomic_write_text 保留 mode/uid/gid）：任一文件失败即
+    # 回滚已写文件——杜绝「一份已更新一份未更新」的不一致（2026-11-14 review P3）
+    written: list[tuple[str, str]] = []
+    try:
+        with ClashConfigLock():
+            for path, payload, backup in writes:
+                shutil.copyfile(path, backup)
+                atomic_write_text(pathlib.Path(path), payload)
+                written.append((path, backup))
+                log(f"✓ {path} 已写入（备份 {backup}）")
+    except Exception as exc:
+        log(f"!! 写入失败（{exc}），回滚 {len(written)} 个已写文件保持一致性")
+        for path, backup in reversed(written):
+            shutil.copyfile(backup, path)
+            log(f"↩ 已回滚 {path}")
+        sys.exit(2)
+
+    for path, _ in writes:
         res = subprocess.run([mihomo, "-t", "-f", path], capture_output=True, text=True)
         ok = "test is successful" in (res.stdout + res.stderr)
         log(("✓" if ok else "!!") + f" mihomo -t {path}: "
