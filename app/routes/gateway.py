@@ -1309,15 +1309,25 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
             except httpx.HTTPError as err:
                 await client.aclose()
                 _drop_gate()
-                account.record_result(False, f"连接失败: {err}")
-                # per-account 出口隔离（2.7.39）：同出口连接失败聚类（600s ≥3 次）
-                # = 节点不可达 → TetherPool rebalance 换该账号的绑定节点
-                egress.note_conn_fail(_messages_egress(account))
-                if egress.conn_fail_clustered(_messages_egress(account)) and \
-                        settings.EGRESS_SUPPLY == "tetherpool":
-                    _spawn_bg(egress_pool.rebalance(
-                        account, reason="node_unreachable", ban=False))
-                    egress.clear_conn_fails(_messages_egress(account))
+                # 异常链展开（httpx ConnectError str 不含 cause，仅记顶层 =
+                # 「All connection attempts failed」无从归因）
+                _cause = err.__cause__ or err.__context__
+                _detail = f"连接失败: {err}" + (f" ({type(_cause).__name__}: {_cause})" if _cause else "")
+                account.record_result(False, _detail)
+                # per-account 出口隔离（2.7.39+）：TP 供给下连接失败先探针验证
+                # 绑定节点——住宅链路瞬态抖动是常态，直接 force_rebalance 会
+                # 无意义漂移；探针通 = 瞬态（只冷却），探针不通 = 节点死 →
+                # rebalance（自带换节点验证）。聚类触发器在低流量时段永不达
+                # （60s 冷却稀释采样），已证失效，退役。
+                if settings.EGRESS_SUPPLY == "tetherpool" and \
+                        settings.PER_ACCOUNT_EGRESS:
+                    _spawn_bg(egress_pool.verify_then_rebalance(
+                        account, reason="node_unreachable"))
+                else:
+                    egress.note_conn_fail(_messages_egress(account))
+                    if egress.conn_fail_clustered(_messages_egress(account)):
+                        logs.warn(req_id, f"账号 {account.name} 出口连接失败聚类，人工复核")
+                        egress.clear_conn_fails(_messages_egress(account))
                 # 废 JWT / 风控禁用走 Key 回退失败时不得洗成 cooling，否则冷却结束会重开 Plan
                 if account.status in (Status.INVALID, Status.DISABLED):
                     store.update_account(account)
@@ -1326,7 +1336,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     # 300s 全额冷却会让高峰期白白少一个号（2026-11-14 实测）
                     _mark(account, Status.COOLING, f"连接失败: {err}",
                           cooldown=settings.CONNECT_FAIL_COOLDOWN)
-                logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
+                logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个({_detail[:160]})")
                 return _NEXT_ACCOUNT
 
             status_code = resp.status_code

@@ -139,6 +139,7 @@ class TetherPoolEgress:
     def __init__(self) -> None:
         self._loop_task: asyncio.Task | None = None
         self._rebalance_at: dict[str, float] = {}  # account_id → monotonic 去抖
+        self._inflight: set[asyncio.Task] = set()  # 健康检查任务强引用（防 GC）
 
     # ── 绑定/换节点编排 ────────────────────────────────────────────────────
     async def ensure_binding(self, account) -> bool:
@@ -207,6 +208,23 @@ class TetherPoolEgress:
         logs.warn("egress_pool", f"{account.name} 3 轮 rebalance 均未通过探针——保持旧绑定，人工复核")
         return False
 
+    async def verify_then_rebalance(self, account, reason: str) -> None:
+        """连接失败触发器（gateway 调用）：先探针验证绑定节点，探针通 = 链路
+        瞬态（只留痕，不换节点防漂移）；探针不通 = 节点死 → rebalance 换绑。
+        rebalance 自带 120s 去抖，同账号风暴下最多每 2 分钟换一次。"""
+        from . import logs
+
+        if not account.egress_node:
+            await self.rebalance(account, reason=reason, ban=False)
+            return
+        if await self.health_once(account):
+            logs.info("egress_pool",
+                      f"{account.name} 连接失败后探针通——瞬态抖动，保持绑定 {account.egress_node}")
+            return
+        logs.warn("egress_pool",
+                  f"{account.name} 连接失败且探针不通（{account.egress_node}）→ rebalance")
+        await self.rebalance(account, reason=reason, ban=False)
+
     async def _probe_via(self, account, proxy_url: str, jwt: str):
         """经账号网关代理的真实 Plan 通道探针（零 strike 面：3012 归因口径）。
 
@@ -232,6 +250,33 @@ class TetherPoolEgress:
             account, egress.account_proxy(account), account.jwt_token or "")
         return st != 0 and _edge_kind(raw) == "JSON-APP"
 
+    async def _check_account(self, account) -> None:
+        """单账号健康检查（每轮并发派发）：绑定引导 → 探针 → rebalance。
+
+        异常全部内吞（任务无人 join，逃逸即静默丢失）；强引用由
+        `_inflight` 集合在任务存续期间持有，防 GC 丢任务。"""
+        from . import logs
+        try:
+            if not account.egress_node:
+                # 绑定引导（幂等，TP 粘性）：egress_node 是 ban 目标 +
+                # 互斥 exclude_node 集合的来源，缺了风控约束无从落地
+                if not await self.ensure_binding(account):
+                    logs.warn("egress_pool",
+                              f"[health] {account.name} 绑定引导失败（下轮重试）")
+                    return
+            if not await self.health_once(account):
+                logs.warn("egress_pool",
+                          f"[health] {account.name} 出口探针失败 → rebalance")
+                await self.rebalance(account, reason="health_probe_fail",
+                                     ban=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 单账号故障不夭折整轮
+            logs.warn("egress_pool",
+                      f"[health] {account.name} 探针异常（跳过）: {exc!r}")
+        finally:
+            self._inflight.discard(asyncio.current_task())
+
     async def _loop(self) -> None:
         from . import logs
         from .store import store
@@ -247,22 +292,11 @@ class TetherPoolEgress:
                 if not accounts:
                     continue
                 for account in accounts:
-                    try:
-                        if not account.egress_node:
-                            # 绑定引导（幂等，TP 粘性）：egress_node 是 ban 目标 +
-                            # 互斥 exclude_node 集合的来源，缺了风控约束无从落地
-                            if not await self.ensure_binding(account):
-                                logs.warn("egress_pool",
-                                          f"[health] {account.name} 绑定引导失败（下轮重试）")
-                                continue
-                        if not await self.health_once(account):
-                            logs.warn("egress_pool",
-                                      f"[health] {account.name} 出口探针失败 → rebalance")
-                            await self.rebalance(account, reason="health_probe_fail",
-                                                 ban=False)
-                    except Exception as exc:  # noqa: BLE001 - 单账号故障不夭折整轮
-                        logs.warn("egress_pool",
-                                  f"[health] {account.name} 探针异常（跳过）: {exc!r}")
+                    task = asyncio.create_task(self._check_account(account))
+                    self._inflight.add(task)
+                # 任务自持引用（_inflight + finally discard），本轮立即返回；
+                # 并发探针取代串行——7 账号 × 40s 超时串行最坏 4.6 分钟才见到死节点
+                await asyncio.sleep(0)
             except Exception as exc:  # noqa: BLE001 - 健康循环永不中止
                 logs.warn("egress_pool", f"健康循环异常（下轮重试）: {exc!r}")
                 await asyncio.sleep(30)
@@ -279,6 +313,8 @@ class TetherPoolEgress:
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        if self._inflight:
+            await asyncio.gather(*self._inflight, return_exceptions=True)
 
 
 egress_pool = TetherPoolEgress()

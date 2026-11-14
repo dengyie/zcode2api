@@ -250,3 +250,60 @@ async def test_health_loop_bootstraps_binding_and_probes(tp_mode, monkeypatch):
     assert acc.egress_node == "node-boot"
     assert calls["probe"] >= 1
     assert calls["rebalance"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_verify_then_rebalance_transient_keeps_binding(tp_mode, monkeypatch):
+    """连接失败触发器：探针通 = 瞬态抖动 → 保持绑定（防节点漂移）。"""
+    rebalanced = []
+
+    async def fake_health(account):
+        return True  # 节点活着
+
+    async def fake_rebalance(account, reason, ban=True):
+        rebalanced.append(reason)
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fake_health)
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+
+    acc = _account(acc_id="acc-v1", name="v1")
+    acc.egress_node = "node-alive"
+    await egress_pool.egress_pool.verify_then_rebalance(acc, reason="node_unreachable")
+    assert rebalanced == []  # 瞬态不换节点
+    assert acc.egress_node == "node-alive"
+
+
+@pytest.mark.asyncio
+async def test_verify_then_rebalance_dead_node_swaps(tp_mode, monkeypatch):
+    """连接失败触发器：探针不通 = 节点死 → rebalance 换绑。"""
+    rebalanced = []
+
+    async def fake_health(account):
+        return False  # 节点死了
+
+    async def fake_rebalance(account, reason, ban=True):
+        rebalanced.append((reason, ban))
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fake_health)
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+
+    acc = _account(acc_id="acc-v2", name="v2")
+    acc.egress_node = "node-dead"
+    await egress_pool.egress_pool.verify_then_rebalance(acc, reason="node_unreachable")
+    assert rebalanced == [("node_unreachable", False)]  # 连接失败不 ban 只换
+
+
+@pytest.mark.asyncio
+async def test_verify_then_rebalance_unbound_bootstraps(tp_mode, monkeypatch):
+    """连接失败触发器：未绑定账号直接走 rebalance（内部含 acquire+探针）。"""
+    rebalanced = []
+
+    async def fake_rebalance(account, reason, ban=True):
+        rebalanced.append(reason)
+
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+
+    acc = _account(acc_id="acc-v3", name="v3")
+    assert acc.egress_node is None
+    await egress_pool.egress_pool.verify_then_rebalance(acc, reason="node_unreachable")
+    assert rebalanced == ["node_unreachable"]
