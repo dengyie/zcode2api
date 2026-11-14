@@ -135,6 +135,24 @@ def mihomo_name_from_tp(node_name):
         return None
 
 
+def mihomo_node_alive(node):
+    """mihomo 视角的节点存活（alive 字段 + 历史 delay 非 0）。死节点候选
+    会让换钉无效并引发探针异常——候选必须预检（2026-11-15 HA 演练实证）。"""
+    q = urllib.parse.quote(node, safe="")
+    try:
+        st, data = mihomo_api("GET", "/proxies/" + q)
+        if st != 200 or not isinstance(data, dict):
+            return False
+        if data.get("alive") is False:
+            return False
+        hist = (data.get("extra") or {}).get("http://www.gstatic.com/generate_204", {}).get("history") or []
+        if hist and all((h or {}).get("delay") == 0 for h in hist[-3:]):
+            return False  # 最近 3 次探测全 0 = 实际不可用
+        return True
+    except Exception:
+        return True  # API 异常时不误判，交由后续 PUT/探针把关
+
+
 PER_ACCOUNT_PORT_BASE = 11031  # zcode-acc-01..07 → 11031-11037（2.7.36 per-account 隔离）
 
 
@@ -228,7 +246,7 @@ def detect(watermark):
             "WHERE enabled=1").fetchall()
     finally:
         con.close()
-    hits, latest = [], watermark
+    hits, conn_hits, latest = [], [], watermark
     for acc_id, name, arr in rows:
         try:
             results = json.loads(arr) if arr else []
@@ -237,11 +255,18 @@ def detect(watermark):
         for r in results:
             at = float(r.get("at") or 0)
             latest = max(latest, at)
-            if at > watermark and "边缘封禁" in str(r.get("detail") or ""):
+            detail = str(r.get("detail") or "")
+            if at <= watermark:
+                continue
+            if "边缘封禁" in detail:
                 hits.append({"at": at, "account": name, "account_id": acc_id,
-                             "detail": str(r.get("detail"))[:90]})
+                             "detail": detail[:90]})
+            elif "连接失败" in detail:
+                conn_hits.append({"at": at, "account": name, "account_id": acc_id,
+                                  "detail": detail[:90]})
     hits.sort(key=lambda h: h["at"])
-    return hits, latest
+    conn_hits.sort(key=lambda h: h["at"])
+    return hits, conn_hits, latest
 
 
 def _retry_after_seconds(body):
@@ -259,8 +284,11 @@ def _cidr24(ip):
 
 
 def egress_ip(proxy=PROXY):
-    st, raw = http("http://ip-api.com/json/?fields=query,isp",
-                   via_proxy=True, timeout=12, _opener=_opener(proxy))
+    try:
+        st, raw = http("http://ip-api.com/json/?fields=query,isp",
+                       via_proxy=True, timeout=12, _opener=_opener(proxy))
+    except Exception as exc:  # 死节点/SSL EOF 等——绝不让探测异常逃逸
+        return "?", f"probe-error: {exc}"[:60]
     try:
         d = json.loads(raw)
         return d.get("query", "?"), d.get("isp", "?")
@@ -271,14 +299,19 @@ def egress_ip(proxy=PROXY):
 def direct_probe(jwt, proxy=PROXY):
     """零 strike 直连探针：JSON-APP=边缘放行（3012 属形状预期值），HTML-EDGE=仍封。
 
-    proxy 可指定账号专属 listener（per-account 模式逐账号验证）。"""
-    st, raw = http(PLAN_URL, "POST",
-                   json.dumps({"model": "GLM-5.3-Flash", "max_tokens": 16,
-                               "messages": [{"role": "user", "content": "hi"}]}),
-                   {"Authorization": "Bearer " + jwt,
-                    "Content-Type": "application/json",
-                    "User-Agent": "ZCode/3.17.2"},
-                   timeout=30, via_proxy=True, _opener=_opener(proxy))
+    proxy 可指定账号专属 listener（per-account 模式逐账号验证）。
+    连接级失败（死节点/SSL EOF）返回 PROBE-FAIL——不能与「边缘封禁」混淆
+    （前者该换节点，后者该 TP 隔离）。"""
+    try:
+        st, raw = http(PLAN_URL, "POST",
+                       json.dumps({"model": "GLM-5.3-Flash", "max_tokens": 16,
+                                   "messages": [{"role": "user", "content": "hi"}]}),
+                       {"Authorization": "Bearer " + jwt,
+                        "Content-Type": "application/json",
+                        "User-Agent": "ZCode/3.17.2"},
+                       timeout=30, via_proxy=True, _opener=_opener(proxy))
+    except Exception as exc:
+        return 0, "PROBE-FAIL", f"{type(exc).__name__}: {exc}"[:140]
     low = raw.lstrip().lower()
     kind = "HTML-EDGE" if (low.startswith("<!doctype") or "<html" in low[:200]
                            or "<title>405" in low) else "JSON-APP"
@@ -321,14 +354,17 @@ def swap(state, hit):
     per-account 出口隔离（2.7.36）：命中账号绑定了专属 listener（Account.egress）
     时走按账号换 IP（只动该账号的 zcode-acc-NN 组）；未绑定走共享组全池换 IP
     （兼容模式，行为与 2.7.35 一致）。
+    hit["reason"]：edge_405_html（默认，TP 隔离旧节点）| node_unreachable
+    （节点死亡/不可达——本地换钉即可，TP 自有健康体系会标 dead，不做隔离）。
     """
     egress_url = account_egress_url(hit.get("account_id") or "")
     if egress_url:
-        return _swap_one_account(state, hit, egress_url)
+        return _swap_one_account(state, hit, egress_url,
+                                 ban=hit.get("reason") != "node_unreachable")
     return _swap_shared(state, hit)
 
 
-def _swap_one_account(state, hit, egress_url):
+def _swap_one_account(state, hit, egress_url, ban=True):
     """per-account：只换命中账号绑定 listener 的出口节点（其余账号零影响）。"""
     group, port = group_for_listener(egress_url)
     if not group:
@@ -345,44 +381,51 @@ def _swap_one_account(state, hit, egress_url):
         log("ALERT", f"组 {group} 当前节点 {cur_node} 非 pigeonw 命名——人工介入")
         return False
 
-    # 1) ban 该账号当前节点（TetherPool 隔离：全池不再分配该 IP）
+    # 1) ban 该账号当前节点（TetherPool 隔离：全池不再分配该 IP）。
+    #    node_unreachable（节点死亡）不做 TP 隔离——TP 健康体系会自行标 dead。
     if dry():
-        log("DRY", f"（DRY_RUN 将执行: ban {cur_tp} + 换 {group} 出口节点 + 端口 {port} 探针）")
+        log("DRY", f"（DRY_RUN 将执行: {'ban ' + cur_tp + ' + ' if ban else ''}换 {group} 出口节点 + 端口 {port} 探针）")
         return False
-    st, resp = http(TP_BASE + "/v1/feedback/ban", "POST",
-                    json.dumps({"service": SERVICE, "account": ACCOUNT,
-                                "node_name": cur_tp, "reason": "edge_405_html",
-                                "evidence": {"http_status": 405, "body_kind": "html",
-                                             "observed_at": bj_str(hit["at"]) + "+08:00",
-                                             "hub_detail": hit["detail"],
-                                             "account": hit["account"]}}),
-                    tp_headers(), timeout=15)
-    log("INFO", f"ban({cur_tp}) → HTTP {st} {str(resp)[:150]}")
+    if ban:
+        reason = hit.get("reason", "edge_405_html")
+        st, resp = http(TP_BASE + "/v1/feedback/ban", "POST",
+                        json.dumps({"service": SERVICE, "account": ACCOUNT,
+                                    "node_name": cur_tp, "reason": reason,
+                                    "evidence": {"http_status": 405, "body_kind": "html",
+                                                 "observed_at": bj_str(hit["at"]) + "+08:00",
+                                                 "hub_detail": hit["detail"],
+                                                 "account": hit["account"]}}),
+                        tp_headers(), timeout=15)
+        log("INFO", f"ban({cur_tp}) → HTTP {st} {str(resp)[:150]}")
+    else:
+        log("INFO", f"节点 {cur_tp} 不可达（非上游封禁）：本地换钉，不做 TP 隔离")
 
     # 2) 选新节点：排除其它账号组当前钉的节点（组集动态化）+ TP 在隔离节点
-    #    + 当前节点；并按 /24 段位多样性择优（与 hub 的 avoid_cidr 口径一致）
+    #    + 当前节点。候选先做 mihomo 存活预检，再逐候选「试钉 + 实探出口」——
+    #    pigeonw 出口 IP 按连接漂移（供应商 NAT），/24 段位逻辑在此拓扑下
+    #    必然误判（2026-11-15 实战教训），以「实测可出网」为唯一验收。
     banned = tp_banned_nodes()
     taken = set()
-    used_cidrs: dict[str, str] = {}
-    for gn, gp in sorted(all_account_groups()):
+    for gn, _gp in sorted(all_account_groups()):
         if gn == group:
             continue
         _, og = mihomo_api("GET", "/proxies/" + gn)
         if isinstance(og, dict) and og.get("now"):
             taken.add(og["now"])
-        ip_g, _ = egress_ip(f"http://127.0.0.1:{gp}")
-        c = _cidr24(ip_g)
-        if c:
-            used_cidrs.setdefault(c, gn)
     free = [n for n in (g.get("all") or [])
             if n != cur_node and n not in taken and tp_name_from_mihomo(n) not in banned]
+    alive_free = [n for n in free if mihomo_node_alive(n)]
+    if len(alive_free) < len(free):
+        log("INFO", f"[per-account] 候选存活预检: {len(free)} → {len(alive_free)}（剔除死节点 "
+                    f"{[n for n in free if n not in alive_free]}）")
+    free = alive_free
     if not free:
-        log("ALERT", f"[per-account] {group} 无可用新节点（其余被占用/隔离）——保持现状人工介入")
+        log("ALERT", f"[per-account] {group} 无可用新节点（其余被占用/隔离/死亡）——保持现状人工介入")
         return False
 
-    # 逐候选试钉：出口 /24 与在用段位不冲突即选定；全部冲突则按可用性保留末位
+    # 逐候选试钉：实测出口可出网才验收（连通性是唯一标准；ip-api 拿不到
+    # 出口 IP 视为候选不可用，换下一个，异常安全逐候选）
     target = ip_new = isp_new = None
-    last = None
     for cand in free:
         st, resp = mihomo_api("PUT", "/proxies/" + group, {"name": cand})
         if st not in (200, 204):
@@ -390,19 +433,14 @@ def _swap_one_account(state, hit, egress_url):
             continue
         time.sleep(1.5)
         ip_c, isp_c = egress_ip(f"http://127.0.0.1:{port}")
-        c24 = _cidr24(ip_c)
-        if c24 and c24 in used_cidrs:
-            log("INFO", f"[per-account] 候选 {cand} 出口 {ip_c} 与 {used_cidrs[c24]} 同段（{c24}），跳过")
-            last = (cand, ip_c, isp_c)
+        if ip_c == "?":
+            log("WARN", f"[per-account] 候选 {cand} 出口探测失败（{isp_c}），换下一个")
             continue
         target, ip_new, isp_new = cand, ip_c, isp_c
         break
     if target is None:
-        if last is None:
-            log("ALERT", f"[per-account] {group} 候选节点全部钉失败——保持现状人工介入")
-            return False
-        target, ip_new, isp_new = last
-        log("WARN", f"[per-account] 候选全部与在用出口同段——按可用性保留 {target}")
+        log("ALERT", f"[per-account] {group} 候选节点全部探测失败——保持现状人工介入")
+        return False
     g2 = mihomo_api("GET", "/proxies/" + group)[1]
     if g2.get("now") != target:
         log("ALERT", f"{group} 未按预期选中 {target}（now={g2.get('now')}）")
@@ -431,7 +469,10 @@ def _swap_one_account(state, hit, egress_url):
     attempt = 0
     while time.time() < deadline:
         attempt += 1
-        st, text, gate, body = hub_probe(key)
+        try:
+            st, text, gate, body = hub_probe(key)
+        except Exception as exc:  # hub 重启窗口等：按失败记录，不中断换 IP 流程
+            st, text, gate, body = 0, "", False, f"{type(exc).__name__}: {exc}"[:120]
         log("INFO", "hub端到端(第%d次): HTTP %s reply=%s gate_hold=%s" % (attempt, st, text, gate))
         if st == 200:
             log("INFO", "✅ [per-account] %s 出口已换：%s → %s（%s → %s），流量恢复"
@@ -557,7 +598,10 @@ def _swap_shared(state, hit):
     attempt = 0
     while time.time() < deadline:
         attempt += 1
-        st, text, gate, body = hub_probe(key)
+        try:
+            st, text, gate, body = hub_probe(key)
+        except Exception as exc:  # hub 重启窗口等：按失败记录，不中断换 IP 流程
+            st, text, gate, body = 0, "", False, f"{type(exc).__name__}: {exc}"[:120]
         log("INFO", "hub端到端(第%d次): HTTP %s reply=%s gate_hold=%s" % (attempt, st, text, gate))
         if st == 200:
             log("INFO", "✅ 换 IP 完成：%s → %s（TP 绑定=%s），流量恢复" % (ip_old, ip_new, new_tp))
@@ -575,32 +619,129 @@ def _swap_shared(state, hit):
     return False
 
 
+def bound_accounts():
+    """启用 per-account 出口的绑定账号：(id, name, egress_url)。"""
+    con = sqlite3.connect(DB, uri=True)
+    try:
+        return con.execute(
+            "SELECT id, name, json_extract(data,'$.egress') FROM accounts "
+            "WHERE enabled=1 AND json_extract(data,'$.egress') IS NOT NULL "
+            "AND json_extract(data,'$.egress') != ''").fetchall()
+    finally:
+        con.close()
+
+
+def delay_test(node):
+    """mihomo 原生延迟探测（经该节点真实链路请求 gstatic 204）。"""
+    q = urllib.parse.quote(node, safe="")
+    url = ("http://127.0.0.1:9090/proxies/" + q +
+           "/delay?timeout=3000&url=" +
+           urllib.parse.quote("https://www.gstatic.com/generate_204", safe=""))
+    try:
+        st, data = mihomo_api("GET", url.replace("http://127.0.0.1:9090", ""))
+        return st == 200 and isinstance(data, dict) and "delay" in data
+    except Exception:
+        return False
+
+
+def node_health_cycle(state):
+    """主动健康检查：延迟探测每个绑定账号的钉选节点，连续 2 次失败视为
+    节点死亡 → 先于客户端失败换节点（HA 主动防线）。返回需换节点的列表。"""
+    nh = state.setdefault("node_health", {})
+    unhealthy = []
+    seen = set()
+    for acc_id, name, egress_url in bound_accounts():
+        seen.add(acc_id)
+        group, port = group_for_listener(egress_url)
+        if not group:
+            continue
+        _, g = mihomo_api("GET", "/proxies/" + group)
+        node = g.get("now") if isinstance(g, dict) else None
+        if not node:
+            continue
+        rec = nh.setdefault(acc_id, {"fails": 0, "node": node})
+        if rec.get("node") != node:  # 节点已换过，重新计数
+            rec["fails"], rec["node"] = 0, node
+        if delay_test(node):
+            if rec["fails"]:
+                log("INFO", f"[health] {name} 节点 {node} 恢复（此前连续失败 {rec['fails']}）")
+            rec["fails"] = 0
+            continue
+        rec["fails"] = rec.get("fails", 0) + 1
+        log("WARN", f"[health] {name} 出口节点 {node} 延迟探测失败（连续 {rec['fails']}）")
+        if rec["fails"] >= 2:
+            unhealthy.append({"at": time.time(), "account": name,
+                              "account_id": acc_id, "group": group, "port": port,
+                              "node": node,
+                              "detail": f"健康检查连续 {rec['fails']} 次失败[node_dead]",
+                              "reason": "node_unreachable"})
+    for acc_id in list(nh):
+        if acc_id not in seen:
+            nh.pop(acc_id, None)
+    save_state(state)
+    return unhealthy
+
+
 def cycle(state):
-    hits, latest = detect(state.get("watermark", 0))
+    edge_hits, conn_hits, latest = detect(state.get("watermark", 0))
     if not state.get("watermark"):
         log("INFO", "首次运行：水位初始化为 %.0f（不回溯历史封禁）" % latest)
         state["watermark"] = latest
         save_state(state)
         return
-    if hits:
-        log("INFO", "检测到 %d 条新边缘封禁（最新 %s %s）" % (len(hits), bj_str(hits[-1]["at"]), hits[-1]["detail"]))
+    if edge_hits:
+        log("INFO", "检测到 %d 条新边缘封禁（最新 %s %s）" % (len(edge_hits), bj_str(edge_hits[-1]["at"]), edge_hits[-1]["detail"]))
+    if conn_hits:
+        log("INFO", "检测到 %d 条新连接失败（最新 %s %s）" % (len(conn_hits), bj_str(conn_hits[-1]["at"]), conn_hits[-1]["detail"]))
     state["watermark"] = latest
-    if not hits:
+
+    # ── 主动健康检查（HA 主动防线）：节点死亡先于客户端失败被发现 ──────────
+    unhealthy = node_health_cycle(state)
+
+    def cooldown_and_quota_ok():
+        now = time.time()
+        if now - state.get("last_swap_epoch", 0) < COOLDOWN:
+            log("INFO", "冷却窗内（上次换 IP %s），跳过本次触发" % bj_str(state.get("last_swap_epoch")))
+            return False
+        day = bj_date()
+        if state.get("swap_day") != day:
+            state["swap_day"], state["swap_count"] = day, 0
+        if state.get("swap_count", 0) >= DAILY_LIMIT:
+            log("ALERT", "已达每日换 IP 上限 %d 次——保持现状，人工介入" % DAILY_LIMIT)
+            return False
+        return True
+
+    # 优先级：边缘封禁（真封禁，需 TP 隔离）> 连接失败聚类（节点死亡反应式）
+    # > 主动健康检查（无客户端失败先行，免冷却防抖已内建）
+    target_hit = None
+    if edge_hits and cooldown_and_quota_ok():
+        target_hit = edge_hits[-1]
+    elif conn_hits and cooldown_and_quota_ok():
+        per = {}
+        for h in conn_hits:
+            per[h["account_id"]] = per.get(h["account_id"], 0) + 1
+        worst_id, cnt = max(per.items(), key=lambda kv: kv[1])
+        if cnt >= 3:  # 同账号 600s 内 ≥3 次连接失败 = 节点死亡疑似
+            target_hit = dict(next(h for h in conn_hits if h["account_id"] == worst_id),
+                              reason="node_unreachable",
+                              detail=f"600s 内 {cnt} 次连接失败[node_dead]")
+            log("WARN", f"账号 {target_hit['account']} 连接失败聚类（{cnt} 次）——节点死亡疑似")
+    elif unhealthy:
+        # 主动健康：免冷却（连续 2 次探测失败已内建防抖），每轮最多换 2 个
+        for u in unhealthy[:2]:
+            ok = swap(state, u)
+            state["last_swap_epoch"] = time.time()
+            state["swap_count"] = state.get("swap_count", 0) + 1
+            state["last_result"] = ("ok" if ok else "failed") + "@" + bj_str()
+        if unhealthy:
+            save_state(state)
+        return
+
+    if target_hit is None:
         save_state(state)
         return
     now = time.time()
-    if now - state.get("last_swap_epoch", 0) < COOLDOWN:
-        log("INFO", "冷却窗内（上次换 IP %s），跳过本次触发" % bj_str(state.get("last_swap_epoch")))
-        save_state(state)
-        return
-    day = bj_date()
-    if state.get("swap_day") != day:
-        state["swap_day"], state["swap_count"] = day, 0
-    if state.get("swap_count", 0) >= DAILY_LIMIT:
-        log("ALERT", "已达每日换 IP 上限 %d 次——保持现状，人工介入" % DAILY_LIMIT)
-        save_state(state)
-        return
-    ok = swap(state, hits[-1])
+    ok = swap(state, target_hit)
     state["last_swap_epoch"] = now
     state["swap_count"] = state.get("swap_count", 0) + 1
     state["last_result"] = ("ok" if ok else "failed") + "@" + bj_str()
