@@ -253,11 +253,13 @@ def _parse_retry_after(value: str | None) -> int | None:
     return min(secs, settings.RETRY_429_WAIT_MAX) if secs > 0 else None
 
 
-def _mark(account: Account, status_value: str, error: str | None = None) -> None:
+def _mark(account: Account, status_value: str, error: str | None = None,
+          cooldown: float | None = None) -> None:
     account.status = status_value
     account.last_error = error
     if status_value == Status.COOLING:
-        account.cooling_until = time.time() + settings.COOLING_SECONDS
+        seconds = settings.COOLING_SECONDS if cooldown is None else cooldown
+        account.cooling_until = time.time() + seconds
     store.update_account(account)
 
 
@@ -1302,7 +1304,10 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 if account.status in (Status.INVALID, Status.DISABLED):
                     store.update_account(account)
                 else:
-                    _mark(account, Status.COOLING, f"连接失败: {err}")
+                    # 连接失败 = 出口链路瞬态（非账号故障）：短冷却即可，
+                    # 300s 全额冷却会让高峰期白白少一个号（2026-11-14 实测）
+                    _mark(account, Status.COOLING, f"连接失败: {err}",
+                          cooldown=settings.CONNECT_FAIL_COOLDOWN)
                 logs.warn(req_id, f"账号 {account.name} 连接失败，切换下一个")
                 return _NEXT_ACCOUNT
 

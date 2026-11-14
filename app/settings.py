@@ -122,8 +122,13 @@ PLAN_MODEL_EXHAUST_COOLDOWN = _int("ZCODE_PLAN_MODEL_EXHAUST_COOLDOWN", 1800)
 # 5xx 等一般错误：重试，耗尽后账号冷却 COOLING_SECONDS 并换下一个账号
 RETRY_5XX_TIMES = _int("ZCODE_RETRY_5XX_TIMES", 3)       # 5xx 重试次数
 RETRY_5XX_WAIT = _int("ZCODE_RETRY_5XX_WAIT", 5)         # 5xx 重试等待秒数
-# 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽 / 连接失败使用
+# 限流（cooling）冷却时长（秒）——仅 5xx 重试耗尽使用
 COOLING_SECONDS = _int("ZCODE_COOLING_SECONDS", 300)
+# 连接失败单独冷却（秒，2026-11-14 per-account 优化）：连接失败是**出口链路
+# 瞬态**（mihomo↔家宽线抖动），不是账号故障——300s 的账号级冷却会让高峰期
+# 白白少一个号（实测 20 并发下 30 分钟 5 次 → 任意时刻 1-2 个号在空冷却）。
+# 60s 足够住宅线抖动恢复；5xx（上游过载）仍走 COOLING_SECONDS。
+CONNECT_FAIL_COOLDOWN = _int("ZCODE_CONNECT_FAIL_COOLDOWN", 60)
 # 风控（3012/405「unusual activity」）指数退避冷却：实测为频道级瞬时频控
 #（同号同刻 billing 正常、数小时自愈），冷却自动恢复；累计 RISK_BAN_STRIKES
 # 次才升级为禁用（人工恢复）。冷却期零上游流量（is_cooling 全通道门禁）。
@@ -246,7 +251,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.37"
+APP_VERSION = "2.7.38"
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。
