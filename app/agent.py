@@ -44,6 +44,10 @@ _DROP_HEADERS = {
     "x-client-timezone",
     "x-os-category",
     "x-os-version",
+    # 由 build_request 按通道仿真（144/146/153/155），客户端透传值不得覆盖——
+    # 否则指纹一致性被破坏，恰是本剔除表要防的方向（2026-11-14 review）
+    "content-type",
+    "anthropic-version",
 }
 
 # 前缀剔除：本服务仿真的头族 + 客户端 SDK 特征头族。

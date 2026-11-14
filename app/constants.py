@@ -253,7 +253,9 @@ EXHAUST_KEYWORDS = (
 # 注意：403 不再无条件判 invalid —— 需先排除验证码挑战（captcha/verify 文案或
 # challenge 头），否则一次人机校验续期就把账号错杀成 INVALID（对齐 zapi
 # classifyAccountFailure：403 + captcha 文案 → 非账号失败）。
-CAPTCHA_BODY_MARKERS = ('"code":3007', '"code": 3007')
+# 3007 判定用 business_code 精确解析（2026-11-14 review）：裸子串 '"code":3007'
+# 会被 '"code":300701…' 类长码值前缀误撞——与 3009/1113 的 logid 陷阱同一纪律。
+CAPTCHA_CHALLENGE_CODE = 3007
 
 # ── 风控信号（2026-09-05 3012 事件实证）────────────────────────────────────────
 # 3012「unusual activity」= 上游风控（HTTP 405 承载），不在官方公开错误码表；

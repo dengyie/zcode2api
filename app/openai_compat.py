@@ -43,7 +43,7 @@ def error_sse(message: str, code: str | None = None) -> str:
     return _sse(payload)
 
 
-def _as_int(value: object) -> int | None:
+def as_int(value: object) -> int | None:
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -63,7 +63,7 @@ def _text_from_content(content: object) -> str:
     return ""
 
 
-def _image_block(url: str) -> dict | None:
+def image_block(url: str) -> dict | None:
     """data:image/...;base64,xxx → Anthropic image block；外链 URL 无法回填，跳过。"""
     if not url.startswith("data:"):
         return None
@@ -89,7 +89,7 @@ def _blocks_from_user_content(content: object) -> list[dict]:
             url = (item.get("image_url") or {})
             if isinstance(url, dict):
                 url = url.get("url") or ""
-            block = _image_block(str(url))
+            block = image_block(str(url))
             if block:
                 blocks.append(block)
     return blocks or [{"type": "text", "text": ""}]
@@ -172,7 +172,7 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
     body: dict = {
         "model": model,
         "messages": out_msgs,
-        "max_tokens": _as_int(payload.get("max_tokens") or payload.get("max_completion_tokens")) or 4096,
+        "max_tokens": as_int(payload.get("max_tokens") or payload.get("max_completion_tokens")) or 4096,
     }
     if isinstance(payload.get("metadata"), dict):
         body["metadata"] = dict(payload["metadata"])
@@ -251,8 +251,8 @@ def anthropic_to_openai(data: dict, model: str) -> dict:
                 },
             })
     usage = data.get("usage") or {}
-    in_tok = _as_int(usage.get("input_tokens")) or 0
-    out_tok = _as_int(usage.get("output_tokens")) or 0
+    in_tok = as_int(usage.get("input_tokens")) or 0
+    out_tok = as_int(usage.get("output_tokens")) or 0
     message: dict = {"role": "assistant", "content": "".join(text_parts) or None}
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -320,7 +320,7 @@ class StreamConverter:
             if msg.get("id"):
                 self.chunk_id = str(msg["id"])
             u = msg.get("usage") or {}
-            prompt = _as_int(u.get("input_tokens"))
+            prompt = as_int(u.get("input_tokens"))
             if prompt is not None:
                 self.usage["prompt_tokens"] = prompt
                 self._sync_usage_total()
@@ -350,7 +350,7 @@ class StreamConverter:
         if etype == "message_delta":
             delta = evt.get("delta") or {}
             self.finish_reason = _STOP_REASON_MAP.get(delta.get("stop_reason"), "stop")
-            out = _as_int((evt.get("usage") or {}).get("output_tokens"))
+            out = as_int((evt.get("usage") or {}).get("output_tokens"))
             if out is not None:
                 self.usage["completion_tokens"] = out
                 self._sync_usage_total()

@@ -120,8 +120,9 @@ class Store:
             for row in rows:
                 try:
                     account = Account.from_dict(json.loads(row["data"]))
-                except (json.JSONDecodeError, TypeError):
-                    continue
+                except (json.JSONDecodeError, TypeError) as exc:
+                    # 静默跳过 = 启动期数据丢失无人知晓（2026-11-14 review）
+                    logs.err("store", f"账号行损坏已跳过: {exc}")
                 if account.provider in self._accounts:
                     self._accounts[account.provider].append(account)
 

@@ -25,7 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import constants
+from . import constants, logs
 
 # ── ZCode 官方 client 提示词（3.17.2，逐字节移植自 Magpie packages/zcode/prompt.mjs）──
 # 结构：{cliPrefix, stableSections[2], dynamicBehavior, sessionGuidance,
@@ -35,8 +35,10 @@ from . import constants
 _PROMPT_JSON = Path(__file__).with_name("zcode_system.json")
 try:
     _ZCODE_PROMPT: dict = json.loads(_PROMPT_JSON.read_text("utf-8"))
-except (OSError, ValueError):
+except (OSError, ValueError) as exc:
     _ZCODE_PROMPT = {}
+    # 静默退化 = 「神秘 3012」无证据（2026-11-14 review）：官方形状装配失败必须留痕
+    logs.warn("transform", f"官方提示词加载失败（{exc}）——请求将以非官方形状发出")
 
 
 def _is_plain_dict(v: object) -> bool:
@@ -378,8 +380,8 @@ def transform_body(
             apply_user_id(body, attribution)
         elif user_id:
             apply_user_id(body, user_id)
-    except Exception:  # noqa: BLE001 - 变换永不放大请求失败
-        pass
+    except Exception as exc:  # noqa: BLE001 - 变换永不放大请求失败，但退化必须留痕
+        logs.warn("transform", f"body 变换异常（按原样发出，3012 风险）: {exc!r}")
     return body
 
 

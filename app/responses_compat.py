@@ -17,7 +17,7 @@ import json
 import time
 import uuid
 
-from .openai_compat import _as_int, _image_block
+from .openai_compat import as_int, image_block
 
 _MAX_OUTPUT_DEFAULT = 4096
 
@@ -53,7 +53,7 @@ def _user_blocks(content: object) -> list[dict]:
             url = item.get("image_url")
             if isinstance(url, dict):
                 url = url.get("url")
-            block = _image_block(str(url or ""))
+            block = image_block(str(url or ""))
             if block:
                 blocks.append(block)
     return blocks or [{"type": "text", "text": ""}]
@@ -123,7 +123,7 @@ def responses_to_chat(payload: dict) -> tuple[dict | None, str | None]:
     chat: dict = {
         "model": model,
         "messages": chat_messages,
-        "max_tokens": _as_int(payload.get("max_output_tokens")) or _MAX_OUTPUT_DEFAULT,
+        "max_tokens": as_int(payload.get("max_output_tokens")) or _MAX_OUTPUT_DEFAULT,
     }
     for src, dst in (("temperature", "temperature"), ("top_p", "top_p")):
         if payload.get(src) is not None:
@@ -206,8 +206,8 @@ def chat_to_response(chat: dict, model: str) -> dict:
         })
 
     usage = chat.get("usage") or {}
-    in_tok = _as_int(usage.get("prompt_tokens")) or 0
-    out_tok = _as_int(usage.get("completion_tokens")) or 0
+    in_tok = as_int(usage.get("prompt_tokens")) or 0
+    out_tok = as_int(usage.get("completion_tokens")) or 0
     finish = choice.get("finish_reason")
     return {
         "id": _resp_id(),
@@ -267,8 +267,8 @@ class ResponsesStreamConverter:
         return f"event: {etype}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     def _response_skeleton(self, status: str, output: list[dict]) -> dict:
-        in_tok = _as_int(self.usage.get("prompt_tokens")) or 0
-        out_tok = _as_int(self.usage.get("completion_tokens")) or 0
+        in_tok = as_int(self.usage.get("prompt_tokens")) or 0
+        out_tok = as_int(self.usage.get("completion_tokens")) or 0
         return {
             "id": self.response_id,
             "object": "response",
@@ -349,7 +349,7 @@ class ResponsesStreamConverter:
         for tc in delta.get("tool_calls") or []:
             if not isinstance(tc, dict):
                 continue
-            idx = _as_int(tc.get("index")) or 0
+            idx = as_int(tc.get("index")) or 0
             fn = tc.get("function") or {}
             if idx not in self.tool_items:
                 item = {

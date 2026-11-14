@@ -136,7 +136,9 @@ def test_rejection_signals():
     assert "quota" not in constants.EXHAUST_KEYWORDS
     assert all(len(k) >= 3 for k in constants.EXHAUST_KEYWORDS)
     # 403 不再无条件判 invalid：需先排除验证码挑战（对齐 zapi classifyAccountFailure）
-    assert '"code":3007' in constants.CAPTCHA_BODY_MARKERS
+    # 3007 用精确业务码解析（2026-11-14 review）：裸子串会被长码值前缀误撞
+    assert constants.CAPTCHA_CHALLENGE_CODE == 3007
+    assert not hasattr(constants, "CAPTCHA_BODY_MARKERS")
 
 
 def test_identity_headers():

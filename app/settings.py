@@ -133,6 +133,12 @@ RISK_BAN_STRIKES = _int("ZCODE_RISK_BAN_STRIKES", 4)          # 窗口内累计�
 RISK_STRIKE_DECAY_SECONDS = _int("ZCODE_RISK_STRIKE_DECAY_SECONDS", 7 * 86400)
 # 距上次风控命中超过该窗口则 strikes 重新起算：跨月偶发命中不累积成禁用
 RISK_AUTO_ROTATE = _bool("ZCODE_RISK_AUTO_ROTATE", True)
+# 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
+# ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
+# 上游读空闲超时（秒）：httpx read 超时是「相邻 chunk 之间」的空闲上限。原为
+# read=None——挂死的上游会无限占用账号并发槽 + 闸门槽 + 客户端连接（2026-11-14
+# review）。600s 远大于长思考的实际间隙，足以兜底任何真实 stall。
+UPSTREAM_READ_TIMEOUT = _int("ZCODE_UPSTREAM_READ_TIMEOUT", 600)
 
 # ── 进程级上游闸门（只作用于 zcode-plan 渠道，见 app/gate.py）────────────────
 # 默认关闭速率/在飞两项：多出口/多实例部署下全局速率应由外层网关决定；单出口
@@ -164,8 +170,6 @@ GATE_POOL_HOLD_MAX_SECONDS = _int("ZCODE_GATE_POOL_HOLD_MAX", 3600)
 # 号最多按此间隔重探；balances 一旦列出窗口，一轮实查即闭合证据链
 GATE_POOL_PROBE_MIN_SECONDS = _int("ZCODE_GATE_POOL_PROBE_MIN", 300)
 
-# 风控升级禁用时自动换发设备指纹（新 SKU + 新 device_mid）并后台补跑安装序
-# ——「风控后换设备重生」语义自动化，账号重新启用时即全新身份
 # 单账号并发上限。上游 ZCode 单账号并发写死 3（用户 2026-11-13 口径，此前的
 # 「2」为当时实测保守值）——本地 cap 高于它只会常态化吃 3008 短退避，故取 3：
 # 超限自动切下一账号。不读 ZCODE_ACCOUNT_CONCURRENCY，也不走后台 meta 覆盖
@@ -234,7 +238,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.34"
+APP_VERSION = "2.7.35"
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

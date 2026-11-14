@@ -27,10 +27,3 @@ def business_code(payload: object) -> int | None:
     if isinstance(code, bool) or not isinstance(code, int):
         return None
     return None if code in (0, 200) else code
-
-
-def is_quota_error(code: int | None) -> bool:
-    """业务码是否属于「额度/余额耗尽」一类。"""
-    from . import constants
-
-    return code is not None and code in constants.EXHAUST_BUSINESS_CODES
