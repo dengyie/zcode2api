@@ -39,8 +39,15 @@ async def verify():
 # ── 账号列表 + 概览统计 ──────────────────────────────────────────────────────
 @router.get("/accounts")
 async def list_accounts():
+    from .gateway import key_no_balance_remaining
+
     now = time.time()
     accounts = [a.public_view() for a in store.list_accounts()]
+    # Key 通道 1113 无余额冷却剩余秒数（>0 = 回退渠道对该号不可用；永久态按
+    # KEY_NO_BALANCE_COOLDOWN 有界重探）。全池都在冷却时 Plan 硬故障即无兜底。
+    no_balance = {a.id: key_no_balance_remaining(a.id, now) for a in store.list_accounts()}
+    for a in accounts:
+        a["key_no_balance_remaining_s"] = no_balance.get(a["id"], 0)
     stats = {"total": len(accounts), "active": 0, "exhausted": 0,
              "cooling": 0, "invalid": 0, "disabled": 0,
              "calls": 0, "fail": 0}

@@ -884,6 +884,11 @@ def clear_key_no_balance(account_id: str) -> None:
     _key_no_balance.pop(account_id, None)
 
 
+def key_no_balance_remaining(account_id: str, now: float | None = None) -> int:
+    """该号 Key 通道 1113 无余额冷却剩余秒数（<=0 = 不在冷却）。只读，供 admin 可见。"""
+    return max(0, int(_key_no_balance.get(account_id, 0) - (now or time.time())))
+
+
 def _key_no_balance_cooling(account_id: str, now: float | None = None) -> bool:
     until = _key_no_balance.get(account_id, 0)
     if not until:
