@@ -10,6 +10,8 @@
 import base64
 import json
 
+import pytest
+
 from app.models import jwt_upstream_uid
 from app.store import Store
 
@@ -91,3 +93,34 @@ class TestStartupMergeDuplicates:
         fresh_app.add_account("zai", "k2", "plain-key2")
         fresh_app._merge_duplicate_identities()
         assert len(fresh_app.list_accounts("zai")) == 2
+
+
+class TestEditPathUidGate:
+    @pytest.mark.asyncio
+    async def test_edit_rejects_foreign_uid_token(self, fresh_app, gateway_client):
+        """编辑路径 uid 闸：把 B 号的重登 token 灌进 A 号 → 409 拒绝
+        （add_account 已收口，admin PUT 是最后一个绕过口，2026-11-15）。"""
+        client, _ = gateway_client
+        a = fresh_app.add_account("zai", "acc-a", _jwt("uid-A"))
+        fresh_app.add_account("zai", "acc-b", _jwt("uid-B"))
+
+        res = await client.put(
+            f"/admin/api/accounts/{a.id}", json={"token": _jwt("uid-B") + "y"},
+            headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 409
+        assert "acc-b" in res.json()["detail"]
+        # A 号 token 未被污染
+        assert fresh_app.find_any(a.id).jwt_token == _jwt("uid-A")
+        assert len(fresh_app.list_accounts("zai")) == 2  # 不产生第三行
+
+    @pytest.mark.asyncio
+    async def test_edit_own_uid_token_still_allowed(self, fresh_app, gateway_client):
+        """同号重登 token 原地更新自己的行——正常操作不拦。"""
+        client, _ = gateway_client
+        a = fresh_app.add_account("zai", "acc-a", _jwt("uid-A"))
+        new_token = _jwt("uid-A") + "z"
+        res = await client.put(
+            f"/admin/api/accounts/{a.id}", json={"token": new_token},
+            headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        assert fresh_app.find_any(a.id).jwt_token == new_token

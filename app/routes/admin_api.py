@@ -125,6 +125,22 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
         secret = secret.strip()
         is_jwt = secret.count(".") == 2 and acc.provider == "zai"
         if is_jwt:
+            # uid 级冲突闸（2026-11-15 生产事故根修的编辑路径补口）：
+            # add_account 已按 user_id 去重，但本编辑路径直接写 jwt_token
+            # 绕过检查——把 B 号重登 token 灌进 A 号会再造「同 uid 双行
+            # 双 IP」风控暴露面。同 uid 命中其它账号 → 409 拒绝并指向
+            # 正确操作（编辑那行即可，token 会原地更新）。
+            from ..models import jwt_upstream_uid
+
+            uid = jwt_upstream_uid(secret)
+            if uid:
+                for other in store.list_accounts(acc.provider):
+                    if other.id != acc.id and \
+                            jwt_upstream_uid(other.secret) == uid:
+                        raise HTTPException(
+                            409, f"该 Token 属于上游账号 uid={uid[:8]}…，"
+                                 f"与现有账号 {other.name}（{other.id}）同身份；"
+                                 f"请直接编辑该账号换 token，而非写入本账号")
             acc.mode = "jwt"
             acc.jwt_token = secret
             # 换 JWT 不清已有 API Key：OAuth 兑换出的回退通道要保住
