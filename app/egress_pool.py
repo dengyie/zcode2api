@@ -147,6 +147,7 @@ class TetherPoolEgress:
                                                  # （TOCTOU 收口：同账号串行，
                                                  #   跨账号仍可并发——互斥由
                                                  #   exclude_node 保证）
+        self._probe_fail_streak: dict[str, int] = {}  # account_id → 连续探针失败轮数
 
     def _account_lock(self, account_id: str) -> asyncio.Lock:
         return self._locks.setdefault(account_id, asyncio.Lock())
@@ -315,10 +316,25 @@ class TetherPoolEgress:
                               f"[health] {account.name} 绑定引导失败（下轮重试）")
                     return
             if not await self.health_once(account):
+                # 探针失败不直接换绑（2026-11-15 生产数据：链路秒级抖动曾连坐
+                # 4 账号齐 rebalance = 无谓出口 IP churn）。连续 N 轮失败才判定
+                # 节点真死；单轮失败留痕待下轮复核，探针转好即清零。
+                streak = self._probe_fail_streak.get(account.id, 0) + 1
+                self._probe_fail_streak[account.id] = streak
+                if streak < settings.TP_HEALTH_FAIL_THRESHOLD:
+                    logs.warn("egress_pool",
+                              f"[health] {account.name} 出口探针失败"
+                              f"（{streak}/{settings.TP_HEALTH_FAIL_THRESHOLD}，"
+                              f"待下轮复核）")
+                    return
                 logs.warn("egress_pool",
-                          f"[health] {account.name} 出口探针失败 → rebalance")
+                          f"[health] {account.name} 出口探针连续 {streak} 轮失败"
+                          f" → rebalance")
+                self._probe_fail_streak[account.id] = 0
                 await self.rebalance(account, reason="health_probe_fail",
                                      ban=False)
+            else:
+                self._probe_fail_streak.pop(account.id, None)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 单账号故障不夭折整轮
@@ -349,7 +365,9 @@ class TetherPoolEgress:
                 await asyncio.sleep(0)
             except Exception as exc:  # noqa: BLE001 - 健康循环永不中止
                 logs.warn("egress_pool", f"健康循环异常（下轮重试）: {exc!r}")
-                await asyncio.sleep(30)
+                # 退避对齐正常节拍（2026-11-15 生产数据：30s 重试与 300s 节拍
+                # 脱节，异常期 10 分钟内空转 4 轮打爆日志且打乱检查间隔）
+                await asyncio.sleep(settings.TP_HEALTH_INTERVAL)
 
     def start(self) -> None:
         if self._loop_task is None or self._loop_task.done():

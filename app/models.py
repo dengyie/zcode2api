@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
@@ -93,6 +94,28 @@ def _plan_bonus_active(plan: dict, now: float) -> bool:
         if eff and eff <= now and (ends is None or now <= ends):
             return True
     return False
+
+
+def jwt_upstream_uid(token: str | None) -> str | None:
+    """从 JWT 解析上游身份（**user_id claim**）——同一上游账号跨次登录签发的
+    token 不同，但 user_id 恒定。账号去重按 uid 而非 token 全文（2026-11-15
+    生产事故：trial/briar 各 2 行同 uid 双节点并行，一号双 IP 风控暴露面）。
+
+    只认 user_id：sub/id 是通用 JWT 语义（任意签发方都可能有），拿它当
+    上游身份会把不同账号的测试桩/同 sub 异源 token 误合并。"""
+    if not token or token.count(".") != 2:
+        return None
+    import base64
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        val = claims.get("user_id")
+        if val:
+            return str(val)
+    except Exception:  # noqa: BLE001 - 非 JWT/畸形载荷 → 无身份，去重退回 token 相等
+        return None
+    return None
 
 
 def _account_id(name: str) -> str:

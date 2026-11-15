@@ -17,7 +17,7 @@ import uuid
 from contextlib import closing
 
 from . import egress, logs, settings
-from .models import PROVIDERS, Account, Status
+from .models import PROVIDERS, Account, Status, jwt_upstream_uid
 
 _TBL = "accounts"
 _META = "meta"
@@ -132,8 +132,48 @@ class Store:
                     continue
                 if account.provider in self._accounts:
                     self._accounts[account.provider].append(account)
+        self._merge_duplicate_identities()
         # 启动补分配 per-account 出口（2.7.36；listener 池未配置时为 no-op）
         self.ensure_egress_assignments()
+
+    def _merge_duplicate_identities(self) -> None:
+        """启动合并同 uid 重复行（2026-11-15 生产事故修复）：同一上游账号
+        重登产生新 JWT 时曾各建一行 → 一号绑 2 节点、双 IP 并行（风控暴露面）。
+        合并规则：保留**新签**（created_at 最新且 enabled）那行；旧行删除且
+        其 TP 节点释放（不再占用互斥集合）。uid 取不到（apiKey/畸形 JWT）
+        的行不参与合并。"""
+        from . import logs
+
+        for provider in PROVIDERS:
+            items = self._accounts[provider]
+            by_uid: dict[str, Account] = {}
+            drop: list[Account] = []
+            for a in items:
+                uid = jwt_upstream_uid(a.secret)
+                if not uid:
+                    continue
+                keep = by_uid.get(uid)
+                if keep is None:
+                    by_uid[uid] = a
+                    continue
+                # 新签且 enabled 优先；并列时取 created_at 新者
+                swap = (a.enabled, a.created_at) > (keep.enabled, keep.created_at)
+                victim, winner = (keep, a) if swap else (a, keep)
+                if swap:
+                    by_uid[uid] = a
+                # 历史合并回旧 winner：把计数并集进保留行（轻量保真）
+                winner.use_count += victim.use_count
+                winner.fail_count += victim.fail_count
+                drop.append(victim)
+            if not drop:
+                continue
+            for v in drop:
+                logs.warn("store",
+                          f"合并同上游身份重复账号行：{v.name}（{v.id}，节点"
+                          f" {v.egress_node or '无'}）→ 保留 {by_uid[jwt_upstream_uid(v.secret)].id}")
+            self._accounts[provider] = [a for a in items if a not in drop]
+            for v in drop:
+                self._delete_account(v.id)
 
     def _persist_account(self, account: Account) -> None:
         with closing(self._connect()) as conn:
@@ -256,6 +296,19 @@ class Store:
             for a in self._accounts[provider]:
                 if a.secret and a.secret == account.secret:
                     return a  # 跳过重复 token
+            # uid 级去重（2026-11-15 生产教训：同号重登 JWT 变化绕过 token 相等
+            # 去重 → 同一上游身份 2 行双节点并行，一号双 IP 风控暴露面）：
+            # 同 uid 已存在 → 视为换签回写该行（保 id/绑定/指纹/计数），不建新行
+            uid = jwt_upstream_uid(account.secret)
+            for a in self._accounts[provider]:
+                if a.mode == "jwt" and jwt_upstream_uid(a.secret) == uid and uid:
+                    a.jwt_token = account.jwt_token
+                    a.mode = "jwt"
+                    a.api_key = None if not a.has_apikey_fallback() else a.api_key
+                    a.status = Status.ACTIVE
+                    a.last_error = None
+                    self._persist_account(a)
+                    return a
             self._assign_fingerprint(account)  # 入池即分配独立设备指纹
             account.install_id = str(uuid.uuid4())  # 安装身份：稳定安装令牌
             if egress.tetherpool_enabled_for(account):

@@ -254,6 +254,42 @@ async def test_health_loop_bootstraps_binding_and_probes(tp_mode, monkeypatch, t
 
 
 @pytest.mark.asyncio
+async def test_health_probe_single_fail_does_not_rebalance(tp_mode, monkeypatch, tmp_path):
+    """探针失败防抖（2026-11-15 生产数据：链路秒级抖动连坐 4 账号齐换绑）：
+    单轮失败只留痕，连续 TP_HEALTH_FAIL_THRESHOLD 轮失败才 rebalance；
+    中途探针转好 → streak 清零不再累计。"""
+    from app import store as store_mod
+
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    monkeypatch.setattr(settings, "TP_HEALTH_FAIL_THRESHOLD", 3)
+
+    acc = store.add_account("zai", "h1", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress_node = "node-a"  # 已绑定，跳过引导分支
+
+    calls = {"rebalance": 0, "probe": 0}
+
+    async def fake_health_once(account):
+        calls["probe"] += 1
+        # 失败×2 → 成功×1（清零）→ 失败×3（第 3 轮才 rebalance）
+        return calls["probe"] == 3
+
+    async def fake_rebalance(account, reason, ban=True):
+        calls["rebalance"] += 1
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fake_health_once)
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", fake_rebalance)
+
+    for _ in range(6):
+        await egress_pool.egress_pool._check_account(acc)
+    # 轮次 1-2 失败不换；轮 3 成功清零；轮 4-5 失败不换；轮 6 第 3 连败才换
+    assert calls["rebalance"] == 1
+    assert egress_pool.egress_pool._probe_fail_streak.get(acc.id, 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_verify_then_rebalance_transient_keeps_binding(tp_mode, monkeypatch):
     """连接失败触发器：探针通 = 瞬态抖动 → 保持绑定（防节点漂移）。"""
     rebalanced = []
