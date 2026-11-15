@@ -410,3 +410,123 @@ def tmp_db_factory(monkeypatch):
     d = pathlib.Path(tempfile.mkdtemp(prefix="egress-test-"))
     monkeypatch.setattr(settings, "DB_PATH", d / "test-accounts.db")
     return d / "test-accounts.db"
+
+
+# ── 2026-11-16 trial-mvxmwyrg 事故回归（假换绑 + 探针盲区）──────────────────
+
+@pytest.mark.asyncio
+async def test_rebalance_excludes_own_old_node(tp_mode, monkeypatch):
+    """假换绑修复（2026-11-16 生产实证 070→070）：ban=False 路径的
+    exclude_node 必须携带本账号要离开的旧节点，force_rebalance 不得把
+    绑定换回原节点。"""
+    seen_exclude = []
+
+    async def _spy_acquire(account, force_rebalance=False, extra_exclude=None):
+        seen_exclude.append(list(extra_exclude or []))
+        return {"node_name": "cand-new", "exit_ip": "1.2.3.4"}
+
+    acc = _account(acc_id="acc-old")
+    acc.egress_node = "my-dead-node"
+    monkeypatch.setattr(egress_pool, "tp_acquire", _spy_acquire)
+    monkeypatch.setattr(egress_pool, "_other_nodes",
+                        lambda account: ["other-account-node"])
+    monkeypatch.setattr(egress_pool, "tp_ban", lambda *a, **k: None)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+
+    pool = egress_pool.TetherPoolEgress()
+    ok = await pool.rebalance(acc, reason="node_unreachable", ban=False)
+
+    assert ok is True
+    assert "my-dead-node" in seen_exclude[0], \
+        "旧节点必须进 exclude_node（否则 TP 会粘性返回原节点 = 假换绑）"
+    assert "other-account-node" in seen_exclude[0]  # 互斥集合不受影响
+
+
+@pytest.mark.asyncio
+async def test_rebalance_round_rejected_candidates_stay_excluded(tp_mode, monkeypatch):
+    """轮内探针否决的候选不得在后续轮次被再次 acquire（防 3 轮打转）。"""
+    seen_exclude = []
+
+    async def _spy_acquire(account, force_rebalance=False, extra_exclude=None):
+        seen_exclude.append(list(extra_exclude or []))
+        return {"node_name": f"cand-{len(seen_exclude)}", "exit_ip": "1.2.3.4"}
+
+    async def _async_ban(node, reason, evidence, account_name):
+        pass
+
+    acc = _account(acc_id="acc-cyc")
+    acc.egress_node = "old-node"
+    monkeypatch.setattr(egress_pool, "tp_acquire", _spy_acquire)
+    monkeypatch.setattr(egress_pool, "_other_nodes", lambda account: [])
+    monkeypatch.setattr(egress_pool, "tp_ban", _async_ban)
+
+    async def _probe_html(self, account, proxy_url, jwt):
+        return 405, "<!doctype html>405"  # 每个候选都被边缘封禁否决
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_html)
+
+    pool = egress_pool.TetherPoolEgress()
+    await pool.rebalance(acc, reason="edge_405_html", ban=False)
+
+    # cand-1 被第 1 轮否决后，第 2 轮 exclude 必须含它
+    assert "cand-1" in seen_exclude[1]
+
+
+@pytest.mark.asyncio
+async def test_conn_fail_cluster_forces_rebalance_despite_probe_ok(tp_mode, monkeypatch, tmp_path):
+    """探针盲区收口（2026-11-16 trial-mvxmwyrg 18 连断事故）：半死节点能答
+    小探针却断真实流式请求——聚类达阈值后无论探针结果强制 rebalance。"""
+    from app import store as store_mod
+
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+
+    acc = store.add_account("zai", "h1", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress_node = "half-dead-node"
+
+    rebalanced = {"n": 0, "reasons": []}
+
+    async def fake_rebalance_locked(account, reason, ban=True):
+        # verify_then_rebalance 已持 _account_lock（不可重入），
+        # 故 stub 到 _rebalance_locked 层
+        rebalanced["n"] += 1
+        rebalanced["reasons"].append(reason)
+
+    async def fake_health_once(account):
+        return True  # 探针一直通（半死节点指纹）
+
+    monkeypatch.setattr(egress_pool.egress_pool, "_rebalance_locked",
+                        fake_rebalance_locked)
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fake_health_once)
+
+    tag = egress.messages_egress_tag(acc)
+    egress.clear_conn_fails(tag)
+    try:
+        # 聚类未达阈值：探针通 → 保持绑定（瞬态语义不变）
+        await egress_pool.egress_pool.verify_then_rebalance(acc, reason="node_unreachable")
+        assert rebalanced["n"] == 0
+
+        # 达到聚类阈值：探针通也不得保持绑定
+        for _ in range(egress.CONN_FAIL_THRESHOLD):
+            egress.note_conn_fail(tag)
+        await egress_pool.egress_pool.verify_then_rebalance(acc, reason="node_unreachable")
+        assert rebalanced["n"] == 1
+        # 聚类窗口已清（换绑后新节点干净开局）
+        assert not egress.conn_fail_clustered(tag)
+    finally:
+        egress.clear_conn_fails(tag)
+
+
+def test_messages_egress_tag_matches_gateway_helper(tp_mode):
+    """单一真相源：egress.messages_egress_tag 与 gateway._messages_egress
+    必须同构（2026-11-16 收口——两处独立实现曾致聚类 key 漂移）。"""
+    from app.routes import gateway as gw
+
+    acc = _account(acc_id="acc-t")
+    assert gw._messages_egress(acc) == egress.messages_egress_tag(acc)

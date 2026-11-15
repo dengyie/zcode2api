@@ -65,6 +65,8 @@ _EXHAUST_KEYWORDS = constants.EXHAUST_KEYWORDS
 def _messages_egress(account: Account | None = None) -> str:
     """messages 通道有效出口 tag（同时驱动 captcha 签发出口，见 app/egress.py）。
 
+    逻辑单一真相源 = egress.messages_egress_tag（2026-11-16 收口：连接失败
+    聚类 key 必须与 egress_pool 侧一致，两处独立实现曾漂移）。
     per-account 出口隔离（2.7.36）：账号绑定了专属代理时 tag = 该代理 URL
     （闸门断路器 / 验证码池 / config 缓存都按它分键，token 出口 = 请求出口）；
     否则维持全局 2 值 tag（proxy/direct）。
@@ -74,12 +76,11 @@ def _messages_egress(account: Account | None = None) -> str:
     统一全链路出口，消除「CN billing + US messages」双 IP 异常信号；
     置 false 恢复历史行为（走 env 代理）。
     """
-    proxy = egress.account_proxy(account) if account is not None else None
-    if proxy:
-        return proxy
-    if settings.MESSAGES_FORCE_DIRECT:
-        return egress.DIRECT
-    return egress.egress_for(settings.UPSTREAM["zai"])
+    if account is None:
+        if settings.MESSAGES_FORCE_DIRECT:
+            return egress.DIRECT
+        return egress.egress_for(settings.UPSTREAM["zai"])
+    return egress.messages_egress_tag(account)
 
 
 def _detect_provider(body: dict, headers) -> str:
@@ -1327,10 +1328,13 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 # per-account 出口隔离（2.7.39+）：TP 供给下连接失败先探针验证
                 # 绑定节点——住宅链路瞬态抖动是常态，直接 force_rebalance 会
                 # 无意义漂移；探针通 = 瞬态（只冷却），探针不通 = 节点死 →
-                # rebalance（自带换节点验证）。聚类触发器在低流量时段永不达
-                # （60s 冷却稀释采样），已证失效，退役。
+                # rebalance（自带换节点验证）。探针盲区（半死节点能答小探针
+                # 却断真实流式，2026-11-16 trial-mvxmwyrg 实证 18 连断被
+                # 「探针通=瞬态」吞掉）由聚类兜底：verify_then_rebalance 内
+                # 检查 conn_fail_clustered，达阈值无论探针结果强制换绑。
                 if settings.EGRESS_SUPPLY == "tetherpool" and \
                         settings.PER_ACCOUNT_EGRESS:
+                    egress.note_conn_fail(_messages_egress(account))
                     _spawn_bg(egress_pool.verify_then_rebalance(
                         account, reason="node_unreachable"))
                 else:

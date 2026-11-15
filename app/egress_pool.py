@@ -193,7 +193,12 @@ class TetherPoolEgress:
 
         old_node = account.egress_node
         jwt = account.jwt_token or ""
-        exclude = _other_nodes(account)
+        # exclude 必须含本账号要离开的旧节点（2026-11-16 生产实证：exclude 只有
+        # 其它账号的节点时，force_rebalance 会把绑定换回原节点 = 假换绑——
+        # trial-mvxmwyrg 05:04 日志「070 → 070」探针放行后坏节点原地保留）
+        exclude = list(_other_nodes(account))
+        if old_node and old_node not in exclude:
+            exclude.append(old_node)
         probe_url = egress.tetherpool_gateway_url(account)
 
         for attempt in range(1, 4):
@@ -208,6 +213,8 @@ class TetherPoolEgress:
                 return False
             self._rebalance_at[account.id] = now  # 真正开始换了才计数去抖
             node = d.get("node_name")
+            if node and node not in exclude:
+                exclude.append(node)  # 轮内已否决的候选不再回收（防 3 轮打转）
             exit_ip = d.get("exit_ip")
             logs.info("egress_pool",
                       f"{account.name} rebalance#{attempt} → {node} exit={exit_ip}")
@@ -244,7 +251,7 @@ class TetherPoolEgress:
         # 提交（旧节点无法显式回绑：TP 不可指定节点；有 exclude + 探针兜底，
         # 至少保证 hub 记录 = TP 实际绑定 = 探针可用，互斥集合不再被污染）
         d = await tp_acquire(account, force_rebalance=True,
-                             extra_exclude=_other_nodes(account))
+                             extra_exclude=exclude)
         if d and d.get("node_name"):
             node = d.get("node_name")
             st, raw = await self._probe_via(account, probe_url, jwt)
@@ -269,20 +276,35 @@ class TetherPoolEgress:
         """连接失败触发器（gateway 调用）：先探针验证绑定节点，探针通 = 链路
         瞬态（只留痕，不换节点防漂移）；探针不通 = 节点死 → rebalance 换绑。
         rebalance 自带 120s 去抖；同账号探针走 _account_lock 串行——N 个在飞
-        请求同时失败只扇出 1 次探针（review 2026-11-15：无去重 = N 并发探针）。"""
+        请求同时失败只扇出 1 次探针（review 2026-11-15：无去重 = N 并发探针）。
+
+        探针盲区收口（2026-11-16 trial-mvxmwyrg 事故）：半死节点能答 16-token
+        小探针却让真实流式请求中途断连（RemoteProtocolError）——探针通但连接
+        失败持续聚类（CONN_FAIL_WINDOW 内 ≥ 阈值）= 指纹判死 → 强制换绑，
+        不再无限期「保持绑定」。"""
         from . import logs
 
+        tag = egress.messages_egress_tag(account)
+        clustered = egress.conn_fail_clustered(tag)
+        if clustered:
+            logs.warn("egress_pool",
+                      f"{account.name} 连接失败 {egress.CONN_FAIL_THRESHOLD} 次/"
+                      f"{egress.CONN_FAIL_WINDOW:.0f}s 达聚类阈值——探针仅作佐证，"
+                      f"无论结果强制 rebalance")
         async with self._account_lock(account.id):
             if not account.egress_node:
                 await self._rebalance_locked(account, reason=reason, ban=False)
+                egress.clear_conn_fails(tag)
                 return
-            if await self.health_once(account):
+            if not clustered and await self.health_once(account):
                 logs.info("egress_pool",
                           f"{account.name} 连接失败后探针通——瞬态抖动，保持绑定 {account.egress_node}")
                 return
             logs.warn("egress_pool",
-                      f"{account.name} 连接失败且探针不通（{account.egress_node}）→ rebalance")
+                      f"{account.name} 连接失败且{'失败聚类达阈值' if clustered else '探针不通'}"
+                      f"（{account.egress_node}）→ rebalance")
             await self._rebalance_locked(account, reason=reason, ban=False)
+            egress.clear_conn_fails(tag)
 
     async def _probe_via(self, account, proxy_url: str, jwt: str):
         """经账号网关代理的真实 Plan 通道探针（零 strike 面：3012 归因口径）。

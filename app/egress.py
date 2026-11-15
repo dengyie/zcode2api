@@ -220,6 +220,21 @@ def egress_tag_for(account, fallback_tag: str) -> str:
     return account_proxy(account) or fallback_tag
 
 
+def messages_egress_tag(account) -> str:
+    """messages 通道有效出口 tag（连接失败聚类 key 的单一真相源）。
+
+    必须与 routes/gateway.py `_messages_egress` 同构（2026-11-16 事故教训：
+    egress_pool 侧曾用 account_proxy() 独立拼 key，两处漂移 = 聚类计数落在
+    不同 tag 上永不达阈值）。per-account 模式 = 账号代理 URL；未绑定/开关关
+    回退全局口径（FORCE_DIRECT → direct / env 代理判定）。"""
+    proxy = account_proxy(account)
+    if proxy:
+        return proxy
+    if settings.MESSAGES_FORCE_DIRECT:
+        return DIRECT
+    return egress_for(settings.UPSTREAM["zai"])
+
+
 # ── 连接失败聚类（2.7.39：节点不可达 → TetherPool rebalance 的触发器）────────
 # 键 = 出口 tag（per-account 模式 = 网关 URL），值 = 失败时间戳（monotonic）。
 _CONN_FAIL_TIMES: dict[str, list[float]] = {}
