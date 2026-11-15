@@ -1610,7 +1610,14 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         wait = _parse_retry_after(resp.headers.get("retry-after"))
                         if wait is None:
                             if concurrency_hit:
-                                wait = settings.RETRY_429_CONCURRENCY_WAIT + random.randint(0, 2)
+                                # 指数退避（review 2026-11-15 生产数据：恒定 3s
+                                # 下 1/5→5/5 重试线性分布，约半数是白等——前两次
+                                # 快路径不变，后三次给槽位真正释放的时间）
+                                wait = min(
+                                    settings.RETRY_429_CONCURRENCY_WAIT
+                                    * (2 ** (retries_429 - 1)),
+                                    settings.RETRY_429_CONCURRENCY_WAIT_MAX,
+                                ) + random.randint(0, 2)
                             else:
                                 wait = settings.RETRY_429_WAIT
                         if concurrency_hit:

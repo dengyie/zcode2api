@@ -108,6 +108,10 @@ RETRY_429_WAIT_MAX = _int("ZCODE_RETRY_429_WAIT_MAX", 120)  # Retry-After 采信
 # 429/code 3009「model concurrency limit exceeded」是并发争用而非频控：上游没有
 # Retry-After，等 60s 纯属浪费（槽位早空了）。这类回短退避，配 jitter 打散重试。
 RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
+# 并发族重试指数退避：第 n 次重试等 base * 2^(n-1)，封顶此值（2026-11-15 生产
+# 数据：935 次重试 1/5→5/5 线性分布说明恒定 3s 有一半在白等——前两次快路径
+# 不变，后三次给槽位真正释放的时间，减少空转到耗尽换号）。
+RETRY_429_CONCURRENCY_WAIT_MAX = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT_MAX", 30)
 # 429/code 1302/1303「真限流」（Z.ai 频控，magpie 同源实证）：与并发争用相反，
 # 原地重试只会加重——账号休息该时长（秒），请求下沉下一渠道/换号
 RATE_LIMIT_COOLDOWN = _int("ZCODE_RATE_LIMIT_COOLDOWN", 60)
@@ -276,7 +280,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.43"
+APP_VERSION = "2.7.44"
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

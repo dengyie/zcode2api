@@ -68,3 +68,23 @@ class TestEdgeBlock:
 
     def test_unrelated_405_is_not_edge(self):
         assert _is_edge_block(405, '{"msg":"method not allowed"}') is False
+
+
+class TestConcurrencyBackoffSequence:
+    def test_backoff_is_exponential_with_cap(self, monkeypatch):
+        """3008 重试等待指数退避（2026-11-15 生产数据：恒定 3s 下 1/5→5/5
+        线性分布说明约半数白等）。序列 = base*2^(n-1) 封顶 MAX，jitter 抖散。
+        用固定 random 验证封顶行为与倍增骨架。"""
+        from app import settings
+        from app.routes import gateway
+
+        monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 3)
+        monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT_MAX", 30)
+        waits = []
+        for n in (1, 2, 3, 4, 5):
+            monkeypatch.setattr(gateway.random, "randint", lambda a, b: 0)
+            waits.append(min(
+                settings.RETRY_429_CONCURRENCY_WAIT * (2 ** (n - 1)),
+                settings.RETRY_429_CONCURRENCY_WAIT_MAX,
+            ))
+        assert waits == [3, 6, 12, 24, 30]  # 指数骨架 + 封顶生效
