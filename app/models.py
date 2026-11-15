@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import secrets
 import time
@@ -105,7 +106,6 @@ def jwt_upstream_uid(token: str | None) -> str | None:
     上游身份会把不同账号的测试桩/同 sub 异源 token 误合并。"""
     if not token or token.count(".") != 2:
         return None
-    import base64
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)

@@ -124,3 +124,53 @@ class TestEditPathUidGate:
             headers={"Authorization": "Bearer zcode"})
         assert res.status_code == 200
         assert fresh_app.find_any(a.id).jwt_token == new_token
+
+
+class TestEditGateAtomicity:
+    @pytest.mark.asyncio
+    async def test_edit_409_does_not_leak_name_change(self, fresh_app, gateway_client):
+        """R5：409 拒绝不得留下半生效的 name 变更（闸在任何写入之前）。"""
+        client, _ = gateway_client
+        a = fresh_app.add_account("zai", "acc-a", _jwt("uid-A"))
+        fresh_app.add_account("zai", "acc-b", _jwt("uid-B"))
+
+        res = await client.put(
+            f"/admin/api/accounts/{a.id}",
+            json={"name": "renamed-a", "token": _jwt("uid-B") + "y"},
+            headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 409
+        assert fresh_app.find_any(a.id).name == "acc-a"  # name 未漂移
+
+
+class TestProbeStreakLifecycle:
+    @pytest.mark.asyncio
+    async def test_rebalance_success_clears_streak(self, fresh_app, monkeypatch):
+        """R1：换绑提交即清 streak——旧节点失败账不得背到新节点头上。
+        （否则新节点首轮抖动即够 2/2 误换绑。）"""
+        from app import egress_pool as egress_pool_mod
+
+        pool = egress_pool_mod.egress_pool
+        acc = fresh_app.add_account("zai", "streak-acc", _jwt("uid-STREAK"))
+        acc.enabled = True
+        acc.egress_node = "node-old"
+        pool._probe_fail_streak[acc.id] = 1  # 旧节点失败一轮的残留
+
+        async def fake_tp_ban(*a, **k):
+            return True
+
+        async def fake_tp_acquire(account, force_rebalance=False, extra_exclude=None):
+            account.egress_node = "node-new"
+            return {"node_name": "node-new", "exit_ip": "1.2.3.4"}
+
+        async def fake_probe(account, proxy_url, jwt):
+            return 200, '{"data":{"model":"GLM"}}'  # JSON-APP 放行
+
+        monkeypatch.setattr(egress_pool_mod, "tp_ban", fake_tp_ban)
+        monkeypatch.setattr(egress_pool_mod, "tp_acquire", fake_tp_acquire)
+        monkeypatch.setattr(pool, "_probe_via", fake_probe)
+        monkeypatch.setattr(
+            "app.captcha.captcha_manager.invalidate", lambda *a, **k: None)
+
+        ok = await pool.rebalance(acc, reason="health_probe_fail", ban=False)
+        assert ok is True
+        assert acc.id not in pool._probe_fail_streak  # 已清零

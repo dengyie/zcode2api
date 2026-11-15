@@ -118,8 +118,6 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
     acc = store.find_any(account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    if "name" in payload and payload["name"]:
-        acc.name = payload["name"].strip()
     secret = payload.get("token") or payload.get("secret")
     if secret:
         secret = secret.strip()
@@ -130,6 +128,9 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
             # 绕过检查——把 B 号重登 token 灌进 A 号会再造「同 uid 双行
             # 双 IP」风控暴露面。同 uid 命中其它账号 → 409 拒绝并指向
             # 正确操作（编辑那行即可，token 会原地更新）。
+            # 闸必须在任何字段写入之前：409 不得留下半生效的 name 漂移
+            # （review 2026-11-15 R5——异常逃逸后 name 变更会随后续
+            # update_account 落库）。
             from ..models import jwt_upstream_uid
 
             uid = jwt_upstream_uid(secret)
@@ -141,6 +142,11 @@ async def edit_account(account_id: str, payload: dict = Body(...)):
                             409, f"该 Token 属于上游账号 uid={uid[:8]}…，"
                                  f"与现有账号 {other.name}（{other.id}）同身份；"
                                  f"请直接编辑该账号换 token，而非写入本账号")
+    if "name" in payload and payload["name"]:
+        acc.name = payload["name"].strip()
+    if secret:
+        is_jwt = secret.count(".") == 2 and acc.provider == "zai"
+        if is_jwt:
             acc.mode = "jwt"
             acc.jwt_token = secret
             # 换 JWT 不清已有 API Key：OAuth 兑换出的回退通道要保住

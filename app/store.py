@@ -304,7 +304,8 @@ class Store:
                 if a.mode == "jwt" and jwt_upstream_uid(a.secret) == uid and uid:
                     a.jwt_token = account.jwt_token
                     a.mode = "jwt"
-                    a.api_key = None if not a.has_apikey_fallback() else a.api_key
+                    # 保留 a.api_key：OAuth 兑换的回退通道跨重登仍有效（同号），
+                    # 与 admin PUT 换 token 口径一致（review 2026-11-15 R3）
                     a.status = Status.ACTIVE
                     a.last_error = None
                     self._persist_account(a)
@@ -423,6 +424,11 @@ class Store:
             account.enabled = enabled
             if not enabled:
                 account.status = Status.DISABLED
+                # 禁用即清探针失败计数：健康循环不跑禁用账号，残留 streak
+                # 会在重新启用后以旧账起算（review 2026-11-15 R2）
+                from . import egress_pool
+
+                egress_pool.egress_pool.clear_probe_streak(account.id)
             elif account.status in (Status.DISABLED, Status.COOLING):
                 # 人工启用 = 确认恢复：禁用洗回 active；冷却中启用视为跳过等待
                 #（风控退避本就是自动恢复语义，人工提前放行同样成立）

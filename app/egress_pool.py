@@ -152,6 +152,11 @@ class TetherPoolEgress:
     def _account_lock(self, account_id: str) -> asyncio.Lock:
         return self._locks.setdefault(account_id, asyncio.Lock())
 
+    def clear_probe_streak(self, account_id: str) -> None:
+        """清该账号的探针失败计数（换绑提交 / 账号禁用时调用——旧账不得
+        背到新节点或重新启用后的账上）。"""
+        self._probe_fail_streak.pop(account_id, None)
+
     # ── 绑定/换节点编排 ────────────────────────────────────────────────────
     async def ensure_binding(self, account) -> bool:
         """懒引导：egress_node 为空的绑定账号 acquire 一次（幂等，TP 粘性）。
@@ -218,6 +223,9 @@ class TetherPoolEgress:
             if kind == "JSON-APP":
                 account.egress_node = node
                 store.update_account(account)
+                # 换绑成功即清探针失败计数：旧节点累积的 streak 不能背到
+                # 新节点头上，否则新节点首轮抖动就够到 2/2 误换绑（review 2026-11-15 R1）
+                self.clear_probe_streak(account.id)
                 # 换节点 = 出口 IP 变化：验证码 token 绑定签发出口 IP（tag 恒定
                 # 但底层 IP 变了），旧 token 继续用必然 3012——清池重签
                 from .captcha import captcha_manager
