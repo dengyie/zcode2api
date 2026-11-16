@@ -57,6 +57,11 @@ class TestLoadBalancingAndAffinity:
         client, mock = gateway_client
         a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "acc-a")
         b = _seed(fresh_app, "hB.eyJzdWIiOiJiIn0.sig", "acc-b")
+        # 2.7.46 起同负载平局按剩余额度打破（大余额优先）：mock 默认 balance
+        # 返回 2M，首个成功请求的后台刷新会让先命中号「富起来」独占后续请求。
+        # 本测试验证纯轮询语义，须让两号额度快照恒空（billing_empty）退化为轮询。
+        mock.state.sequences[a.jwt_token[:16]] = ["billing_empty"]
+        mock.state.sequences[b.jwt_token[:16]] = ["billing_empty"]
 
         # 4 个独立的单轮新请求
         for i in range(4):

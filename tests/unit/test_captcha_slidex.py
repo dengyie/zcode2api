@@ -13,8 +13,6 @@ env → 都没有则响亮失败（静默求解 = token 出口错配 = 3012）�
 
 from __future__ import annotations
 
-import asyncio
-import os
 import sys
 
 import pytest

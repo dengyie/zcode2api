@@ -453,7 +453,11 @@ class Store:
         2. 负载均衡分配（新请求 或 亲和号满载/不可用时溢出）：
            - 过滤掉 is_selectable 为 False、在 skip_ids 中、或已达并发上限（inflight >= max_inflight）的账号；
            - 主排序：当前在飞数 inflight 升序（最小负载优先）；
-           - 次排序：距离当前轮询指针的偏移量（保证在负载相同时均匀轮流分配到不同账号）；
+           - 次排序：最大剩余额度降序（同负载下优先大余额号。凌晨全池 inflight=0
+             全平局时，纯轮询会把「只剩 5M」与「剩 3.05 亿」同权重随机分——
+             2026-11-17 线上实证 use_count 长期失衡 4034 vs 68；额度快照未知
+             记 0，不饿死新号，全池未知时退化为纯轮询）；
+           - 末排序：距离当前轮询指针的偏移量（额度同档时均匀轮换）；
            - 更新轮询指针为选中账号的下一位。
         """
         skip_ids = skip_ids or set()
@@ -482,11 +486,32 @@ class Store:
             cur_rot = self._rotation.get(provider, 0)
             n = len(pool)
 
-            # 负载优先（最小在飞请求数），相同负载下按轮询偏移平局
+            def _max_remaining(a: Account) -> int:
+                """该号所有额度窗口中最大的 remaining（未知快照 = 0）。
+
+                只做「同负载平局打破」用，非精确配额——max 而非 sum 是因为
+                多模型窗口不可互抵（Flash 池与 Coding 池各自独立账本）。
+                """
+                vals = [
+                    w.get("remaining") or 0
+                    for w in (a.quota or {}).values()
+                    if isinstance(w, dict)
+                ]
+                return max(vals) if vals else 0
+
+            # 负载优先（最小在飞），同负载下大余额优先，再按轮询偏移平局
             best_idx = 0
-            best_tuple = (inflight_map.get(pool[0].id, 0), (0 - cur_rot) % n)
+            best_tuple = (
+                inflight_map.get(pool[0].id, 0),
+                -_max_remaining(pool[0]),
+                (0 - cur_rot) % n,
+            )
             for i in range(1, n):
-                cur_tuple = (inflight_map.get(pool[i].id, 0), (i - cur_rot) % n)
+                cur_tuple = (
+                    inflight_map.get(pool[i].id, 0),
+                    -_max_remaining(pool[i]),
+                    (i - cur_rot) % n,
+                )
                 if cur_tuple < best_tuple:
                     best_tuple = cur_tuple
                     best_idx = i
