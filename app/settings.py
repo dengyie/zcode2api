@@ -72,12 +72,18 @@ CAPTCHA_POOL_MAX = _int("CAPTCHA_POOL_MAX", 2)        # 池上限
 CAPTCHA_TOKEN_TTL = _int("CAPTCHA_TOKEN_TTL", 95_000) # 单枚 token 最大可用时长（ms；上游实际 ~2min）
 CAPTCHA_CONFIG_CACHE_TTL = _int("CAPTCHA_CONFIG_CACHE_TTL", 600_000)  # ms
 
-# 验证码求解（真浏览器：puppeteer-core + 系统 Chromium 跑阿里云官方无痕 SDK，
-# 对齐 zcode-switch captcha.js。happy-dom 路线 2026-09 起被风控「unusual
-# activity」全拒，solver.js 仅留作回滚：ZCODE_CAPTCHA_SOLVER=legacy）
+# 验证码求解（真浏览器跑阿里云官方无痕 SDK，对齐 zcode-switch captcha.js。
+# happy-dom 路线 2026-09 起被风控「unusual activity」全拒，solver.js 仅留作
+# 回滚：ZCODE_CAPTCHA_SOLVER=legacy）
+# slidex（2026-11-16 起，缺省）：playwright + slidex aliyun-captcha-js provider
+# （z.ai 站点实测内化的求解内核）。根修 Chrome --proxy-server 不支持带凭证代理
+# URL（ERR_NO_SUPPORTED_PROXIES）导致的求解盲区——playwright context 级 proxy
+# 原生支持 user:pass@host:port，token 出口 = 请求出口铁律不变。
+# pw = 旧 puppeteer 路线（ZCODE_CAPTCHA_SOLVER=pw 回滚用）。
 NODE_PATH = os.getenv("ZCODE_NODE_PATH", "node")
 CAPTCHA_SOLVER_DIR = ROOT_DIR / "captcha_node"
-CAPTCHA_SOLVER_MODE = (os.getenv("ZCODE_CAPTCHA_SOLVER", "pw").strip().lower() or "pw")
+CAPTCHA_SOLVER_MODE = (os.getenv("ZCODE_CAPTCHA_SOLVER", "slidex").strip().lower() or "slidex")
+CAPTCHA_SOLVER_PY = CAPTCHA_SOLVER_DIR / "slidex_runner.py"
 CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / (
     "solver.js" if CAPTCHA_SOLVER_MODE == "legacy" else "solver_pw.js"
 )
@@ -284,7 +290,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.48"  # 2.7.47 流中断记账/egress 根修；2.7.48 reqlog 持久化 + solver 代理凭据修复
+APP_VERSION = "2.7.49"  # 2.7.48 reqlog 持久化 + solver 代理凭据修复；2.7.49 slidex 求解链（claim 带凭证代理根修）
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

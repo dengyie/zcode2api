@@ -1,9 +1,15 @@
 """验证码求解 + 预解 token 池。
 
-主求解器 solver_pw.js：真浏览器（puppeteer-core + 系统 Chromium）运行阿里云
-官方无痕 SDK 求 verifyParam（X-Aliyun-Captcha-Verify-Param）——阿里云无痕
-验证信任真实浏览器环境，happy-dom 伪造路线 2026-09 起被风控「unusual
-activity」全拒（solver.js 仅作 ZCODE_CAPTCHA_SOLVER=legacy 回滚）。
+主求解器 slidex_runner.py（缺省，2026-11-16）：playwright + slidex
+`aliyun-captcha-js` provider（z.ai 站点实测内化的求解内核：二次几何反解 /
+拟人拖拽 / F 码归因）运行阿里云官方无痕 SDK 求 verifyParam。根修 Chrome
+`--proxy-server` 不支持带凭证代理 URL（ERR_NO_SUPPORTED_PROXIES）的求解
+盲区——playwright context 级 proxy 原生支持 user:pass@，token 出口 =
+请求出口铁律不变。
+
+solver_pw.js（puppeteer 路线）保留作回滚：ZCODE_CAPTCHA_SOLVER=pw。
+阿里云无痕验证信任真实浏览器环境，happy-dom 伪造路线 2026-09 起被风控
+「unusual activity」全拒（solver.js 仅作 ZCODE_CAPTCHA_SOLVER=legacy 回滚）。
 
 架构对齐 zapi captcha.ts 的预解池设计：
 - 热路径永不等待：请求到来时直接从池里取一枚已解好的 token（亚毫秒），
@@ -19,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import sys
 import time
 
 import httpx
@@ -426,6 +433,62 @@ class CaptchaManager:
         self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT,
         proxy: str | None = None,
     ) -> str | None:
+        if settings.CAPTCHA_SOLVER_MODE == "slidex":
+            return await self._run_solver_slidex(scene, region, prefix, tag, proxy)
+        return await self._run_solver_pw(scene, region, prefix, tag, proxy)
+
+    async def _run_solver_slidex(
+        self, scene: str, region: str, prefix: str, tag: str,
+        proxy: str | None,
+    ) -> str | None:
+        """slidex 路线：python runner + playwright context 级 credentialed proxy。
+
+        出口对齐口径与 _run_solver_pw 完全一致：proxy 参数优先，其次按 tag 取
+        env 代理；tag=proxy 但无代理可用必须响亮失败（静默求解 = 出口错配 =
+        3012）。进程清场（killpg/孤儿/陈旧 profile）复用 pw 路径同款 finally 链。
+        """
+        if not settings.CAPTCHA_SOLVER_PY.exists():
+            raise RuntimeError(f"未找到求解器 {settings.CAPTCHA_SOLVER_PY}")
+        solver_env = {
+            **os.environ,
+            "ZCODE_CHROMIUM_PATH": str(settings.CHROMIUM_PATH),
+            "ZCODE_SOLVE_DEADLINE_MS": str(max(30, settings.CAPTCHA_SOLVE_TIMEOUT - 20) * 1000),
+        }
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                    "ALL_PROXY", "all_proxy"):
+            solver_env.pop(key, None)
+        solver_proxy = proxy if proxy is not None else (
+            egress.proxy_url() if tag == egress.PROXY else None)
+        if solver_proxy:
+            solver_env["HTTP_PROXY"] = solver_proxy
+            solver_env["HTTPS_PROXY"] = solver_proxy
+        elif tag == egress.PROXY:
+            raise RuntimeError("请求走代理但 env 未配置代理地址，无法对齐验证码出口")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-B", str(settings.CAPTCHA_SOLVER_PY), scene, region, prefix,
+            cwd=str(settings.CAPTCHA_SOLVER_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=solver_env,
+            start_new_session=True,
+        )
+        try:
+            stdout, _ = await self._communicate_solver(proc)
+        except TimeoutError:
+            return None
+        finally:
+            await self._cleanup_solver(proc)
+
+        param = None
+        for line in stdout.decode("utf-8", "ignore").splitlines():
+            if line.startswith("VERIFY_PARAM="):
+                param = line[len("VERIFY_PARAM="):].strip()
+        return param
+
+    async def _run_solver_pw(
+        self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT,
+        proxy: str | None = None,
+    ) -> str | None:
         solver = settings.CAPTCHA_SOLVER_JS
         if not solver.exists():
             raise RuntimeError(
@@ -463,47 +526,56 @@ class CaptchaManager:
             start_new_session=True,  # 独立进程组：收尾时整组清场（见下方 finally）
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
+            stdout, _ = await self._communicate_solver(proc)
         except TimeoutError:
             return None
         except FileNotFoundError as err:
             raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
         finally:
-            # 整组 SIGKILL 兜底：node 挂死（实测 NAS 上可挂 25 分钟以上）、launch 失败
-            # 残留、browser.close 异常被吞等路径都会留下 Chromium 孤儿（单个 ~360MB，
-            # 此前实测 10 分钟泄漏数 GB），必须由调用侧无条件清场。
-            # setsid 后 pgid == proc.pid；node 已正常退出且浏览器已关闭时组为空，
-            # 抛 ProcessLookupError 属正常情况，无副作用。
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (AttributeError, ProcessLookupError, PermissionError):
-                # Windows 无 killpg/SIGKILL（AttributeError）：退化为杀 node 本体，
-                # 否则超时路径会留下常驻 node 进程
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except Exception:  # noqa: BLE001 - 含等待超时；CancelledError 不在此列，正常传播
-                pass
-            # 二道防线：Chromium 逃逸了 node 进程组（setsid），killpg 打不到，按孤儿
-            # 特征（PPID==1）兜底清扫。必须放在 node 确认死亡之后：SIGKILL 投递是异步的，
-            # 早扫会因孤儿 PPID 尚未 reparent 到 1 而漏过（实测场景复现）
-            orphans = _kill_orphan_chromium()
-            if orphans:
-                logs.warn("captcha", f"清理孤儿 Chromium 进程 {orphans} 个")
-            # 被 SIGKILL 的浏览器留下的临时 profile 目录没人删：每次求解顺手清
-            # 一遍陈旧目录（>1h），避免 /tmp 长期膨胀（2.7.33）
-            stale = _cleanup_stale_profiles()
-            if stale:
-                logs.info("captcha", f"清理陈旧浏览器 profile 目录 {stale} 个")
+            await self._cleanup_solver(proc)
 
         param = None
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
                 param = line[len("VERIFY_PARAM="):].strip()
         return param
+
+    async def _communicate_solver(self, proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+        return await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
+
+    async def _cleanup_solver(self, proc: asyncio.subprocess.Process) -> None:
+        """求解进程无条件清场（slidex/pw 两路线共用）。
+
+        整组 SIGKILL 兜底：求解器挂死（实测 NAS 上可挂 25 分钟以上）、launch 失败
+        残留、browser.close 异常被吞等路径都会留下 Chromium 孤儿（单个 ~360MB，
+        此前实测 10 分钟泄漏数 GB），必须由调用侧无条件清场。
+        setsid 后 pgid == proc.pid；求解器已正常退出且浏览器已关闭时组为空，
+        抛 ProcessLookupError 属正常情况，无副作用。
+        """
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            # Windows 无 killpg/SIGKILL（AttributeError）：退化为杀主进程本体，
+            # 否则超时路径会留下常驻求解进程
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except Exception:  # noqa: BLE001 - 含等待超时；CancelledError 不在此列，正常传播
+            pass
+        # 二道防线：Chromium 逃逸了解决器进程组（setsid），killpg 打不到，按孤儿
+        # 特征（PPID==1）兜底清扫。必须放在求解器确认死亡之后：SIGKILL 投递是异步的，
+        # 早扫会因孤儿 PPID 尚未 reparent 到 1 而漏过（实测场景复现）
+        orphans = _kill_orphan_chromium()
+        if orphans:
+            logs.warn("captcha", f"清理孤儿 Chromium 进程 {orphans} 个")
+        # 被 SIGKILL 的浏览器留下的临时 profile 目录没人删：每次求解顺手清
+        # 一遍陈旧目录（>1h），避免 /tmp 长期膨胀（2.7.33）
+        stale = _cleanup_stale_profiles()
+        if stale:
+            logs.info("captcha", f"清理陈旧浏览器 profile 目录 {stale} 个")
 
     # ── 失效 ─────────────────────────────────────────────────────────────────
     def invalidate(self, tag: str | None = None) -> None:
