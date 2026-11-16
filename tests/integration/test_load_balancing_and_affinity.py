@@ -79,6 +79,59 @@ class TestLoadBalancingAndAffinity:
         assert auths[2] == a.jwt_token[:16]
         assert auths[3] == b.jwt_token[:16]
 
+    async def test_affinity_overrides_balance_awareness(self, gateway_client, fresh_app):
+        """粘性优先于余额感知（2.7.5x 语义回归钉）：会话已绑定到穷号后，
+        即使另一个号显著更富（带外 >5%），该会话续传仍粘穷号；
+        只有新会话的首轮分配才走大余额优先。"""
+        client, mock = gateway_client
+        a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "acc-a")
+        b = _seed(fresh_app, "hB.eyJzdWIiOiJiIn0.sig", "acc-b")
+        # b 显著更富（带外）：无粘性时新请求必选 b
+        b.quota = {"GLM-5.2": {"total": 300_000_000, "used": 0, "remaining": 300_000_000}}
+        a.quota = {"GLM-5.2": {"total": 10_000_000, "used": 0, "remaining": 10_000_000}}
+
+        # S1 首轮：无绑定 + 无 assistant 轮 → 新请求。注意：此时 b 更富会先被选——
+        # 先用只有 a 可用的窗口把 S1 绑到 a，再恢复 b 的余额验证粘性压过余额。
+        b.status = Status.COOLING
+        fresh_app.update_account(b)
+        r1 = await client.post(
+            "/v1/messages",
+            headers={"x-session-id": "session-sticky"},
+            json={"model": "GLM-5.2", "messages": [{"role": "user", "content": "bind to a"}]},
+        )
+        assert r1.status_code == 200
+        b.status = Status.ACTIVE
+        fresh_app.update_account(b)
+        assert affinity_manager.get("zai:hdr:session-sticky") == a.id
+
+        # S1 续传：a 只有 10M、b 有 300M（带外 30 倍）——仍必须粘 a
+        r2 = await client.post(
+            "/v1/messages",
+            headers={"x-session-id": "session-sticky"},
+            json={
+                "model": "GLM-5.2",
+                "messages": [
+                    {"role": "user", "content": "bind to a"},
+                    {"role": "assistant", "content": "ok"},
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+        )
+        assert r2.status_code == 200
+
+        # 新会话 S2 首轮：才是余额感知的分配对象（选富号 b）
+        r3 = await client.post(
+            "/v1/messages",
+            headers={"x-session-id": "session-new"},
+            json={"model": "GLM-5.2", "messages": [{"role": "user", "content": "fresh session"}]},
+        )
+        assert r3.status_code == 200
+
+        auths = _get_call_auths(mock)
+        assert auths[0] == a.jwt_token[:16]  # S1-1 → a（唯一可选）
+        assert auths[1] == a.jwt_token[:16]  # S1-2 粘 a（余额排序被粘性压制）
+        assert auths[2] == b.jwt_token[:16]  # S2 新会话 → b（大余额优先）
+
     async def test_session_affinity_with_explicit_header(self, gateway_client, fresh_app):
         """显式 Header（x-session-id）维持会话粘性：同 session 请求始终路由到同一账号。"""
         client, mock = gateway_client
