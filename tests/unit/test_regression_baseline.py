@@ -33,6 +33,13 @@ class TestNormalizeBody:
         body = {"model": "bigmodel/GLM-5.2"}
         assert _normalize_body(body)["model"] == "GLM-5.3"
 
+    def test_provider_prefix_stripped_without_alias(self):
+        # 2026-11-15：现役型号带前缀 → 无别名命中也必须回写剥离结果；
+        # 此前 body["model"] 保留带前缀原名透传上游 → 400 code 3006
+        # model not allowed（线上实证：bare GLM-5.3-Flash 200，zai/GLM-5.3-Flash 3006）
+        body = {"model": "zai/GLM-5.3-Flash"}
+        assert _normalize_body(body)["model"] == "GLM-5.3-Flash"
+
     def test_unknown_model_passed_through(self):
         body = {"model": "glm-unknown"}
         assert _normalize_body(body)["model"] == "glm-unknown"
