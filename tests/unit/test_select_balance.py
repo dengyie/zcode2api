@@ -161,3 +161,60 @@ class TestWindowUsableAlignment:
         _acc(store, "new-unk", remaining=None)
         got = store.select("zai", inflight={}, max_inflight=3)
         assert got.name in ("all-expired", "new-unk")
+
+
+class TestTieToleranceBand:
+    """2.7.53 余额平局带（5% 容差）：tebi 实证 9 号全在 2.83~2.96 亿档（差距
+    <5%），精确整数比较下轮换偏移永远被第二级压过——连选 8 次恒中同一号。
+    容差带内视为同档交还轮换偏移；带外显著差距仍大余额优先。"""
+
+    def test_within_band_rotates(self, store: Store):
+        """容差带内（29564万 vs 29471万，差 0.3%）视为同档 → 轮换生效。"""
+        _acc(store, "a-rich", remaining=295_637_706)   # tebi 实测 zcodereg5
+        _acc(store, "b-rich", remaining=294_710_000)   # tebi 实测 zcodereg2
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"a-rich", "b-rich"}, picks
+
+    def test_outside_band_still_richer_first(self, store: Store):
+        """带外真实差距（3亿 vs 1亿）大余额仍优先，不受容差影响。"""
+        _acc(store, "rich", remaining=300_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        for _ in range(4):
+            assert store.select("zai", inflight={}, max_inflight=3).name == "rich"
+
+    def test_band_edge_exactly_5pct_is_inside(self, store: Store):
+        """边界语义钉死：rj > rk*(1+5%) 才算带外。恰好 +5%（1.05亿 vs 1亿）
+        = 带内 → 轮换。单一判定式（abs 差值式曾与比例式在边界打架）。"""
+        _acc(store, "rich", remaining=105_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"rich", "mid"}, picks
+
+    def test_just_outside_band_richer_first(self, store: Store):
+        """刚出带（1.06亿 vs 1亿，+6%）= 显著更富 → 恒选富号。"""
+        _acc(store, "rich", remaining=106_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        for _ in range(3):
+            assert store.select("zai", inflight={}, max_inflight=3).name == "rich"
+
+    def test_inflight_dominates_despite_band(self, store: Store):
+        """容差不越过主排序：1 路在飞的带内富号 < 空载小余额号。"""
+        live_a = _acc(store, "busy-rich", remaining=300_000_000)
+        _acc(store, "idle-small", remaining=290_000_000)
+        got = store.select("zai", inflight={live_a.id: 1}, max_inflight=3)
+        assert got.name == "idle-small"
+
+    def test_band_ignores_expired_window(self, store: Store):
+        """容差带按有效余量比较：过期大窗不计入（口径与 2.7.51 一致）。"""
+        _acc(store, "a", remaining=5_000_000)
+        live = next(x for x in store.list_accounts("zai") if x.name == "a")
+        live.quota = {
+            "GLM-5.3-Flash": {
+                "total": 305_000_000, "remaining": 305_000_000,
+                "expires_at": _iso(time.time() - 3600),
+            },
+            "GLM-5.3-Coding": {"total": 5_000_000, "remaining": 5_000_000},
+        }
+        _acc(store, "b", remaining=4_900_000)  # 差 2%，带内
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"a", "b"}, picks

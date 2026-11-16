@@ -518,22 +518,46 @@ class Store:
                     vals.append(rem or 0)
                 return max(vals) if vals else 0
 
-            # 负载优先（最小在飞），同负载下大余额优先，再按轮询偏移平局
+            # 负载优先（最小在飞），同负载下大余额优先，再按轮询偏移平局。
+            # 余额平局带：额度只在相对容差内才算「同档」——精确整数比较下
+            # 快照间必然有微小漂移（used 逐请求累加），轮换偏移将永远被第二级
+            # 压过、形同虚设（2026-11-17 tebi 实证：9 号全在 2.83~2.96 亿档，
+            # 差距 <5%，连选 8 次恒中同一号）。容差带内视为同档交还轮换偏移；
+            # 带外（rj > rk*(1+tol)）大余额才优先。单一判定式避免双口径打架
+            # （abs 差值 vs 比例式在边界互相矛盾——1.05亿 vs 1亿曾被判带内）。
+            _TIE_TOLERANCE = 0.05  # 5%：快照漂移远小于此，真实差距远大于此
+
+            # 预计算各候选的有效余量（避免 O(n²) 窗口扫描）
+            rems = [_max_remaining(a) for a in pool]
+
+            def _richer(j: int, k: int) -> bool:
+                """pool[j] 的有效余量是否显著高于 pool[k]（带外）。"""
+                return rems[j] > rems[k] * (1 + _TIE_TOLERANCE)
+
             best_idx = 0
             best_tuple = (
                 inflight_map.get(pool[0].id, 0),
-                -_max_remaining(pool[0]),
+                -rems[0],
                 (0 - cur_rot) % n,
             )
             for i in range(1, n):
-                cur_tuple = (
-                    inflight_map.get(pool[i].id, 0),
-                    -_max_remaining(pool[i]),
-                    (i - cur_rot) % n,
-                )
-                if cur_tuple < best_tuple:
-                    best_tuple = cur_tuple
+                cur_inflight = inflight_map.get(pool[i].id, 0)
+                if cur_inflight < best_tuple[0]:
+                    # 主排序：负载更低者直接胜出（余额只在同负载时参与）
+                    best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
                     best_idx = i
+                elif cur_inflight > best_tuple[0]:
+                    continue
+                # 同负载：带外显著更富者胜；容差带内按轮换偏移
+                elif _richer(i, best_idx):
+                    best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
+                    best_idx = i
+                elif not _richer(best_idx, i):
+                    # 带内（含相等）→ 轮换偏移决定
+                    if (i - cur_rot) % n < best_tuple[2]:
+                        best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
+                        best_idx = i
+                # else：best 显著更富（带外），保持 best
 
             account = pool[best_idx]
             self._rotation[provider] = (best_idx + 1) % n
