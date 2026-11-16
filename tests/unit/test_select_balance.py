@@ -197,6 +197,17 @@ class TestTieToleranceBand:
         for _ in range(3):
             assert store.select("zai", inflight={}, max_inflight=3).name == "rich"
 
+    def test_tolerance_env_overridable(self, store: Store, monkeypatch):
+        """容差走 settings.SELECT_TIE_TOLERANCE（ZCODE_SELECT_TIE_TOLERANCE），
+        运维可调：放宽到 0.10 后 1.06亿 vs 1亿（+6%）也进带内 → 轮换。"""
+        from app import settings as _settings
+
+        _acc(store, "rich", remaining=106_000_000)
+        _acc(store, "mid", remaining=100_000_000)
+        monkeypatch.setattr(_settings, "SELECT_TIE_TOLERANCE", 0.10)
+        picks = [store.select("zai", inflight={}, max_inflight=3).name for _ in range(4)]
+        assert set(picks) == {"rich", "mid"}, picks
+
     def test_inflight_dominates_despite_band(self, store: Store):
         """容差不越过主排序：1 路在飞的带内富号 < 空载小余额号。"""
         live_a = _acc(store, "busy-rich", remaining=300_000_000)

@@ -525,14 +525,10 @@ class Store:
             # 差距 <5%，连选 8 次恒中同一号）。容差带内视为同档交还轮换偏移；
             # 带外（rj > rk*(1+tol)）大余额才优先。单一判定式避免双口径打架
             # （abs 差值 vs 比例式在边界互相矛盾——1.05亿 vs 1亿曾被判带内）。
-            _TIE_TOLERANCE = 0.05  # 5%：快照漂移远小于此，真实差距远大于此
+            tol = settings.SELECT_TIE_TOLERANCE
 
             # 预计算各候选的有效余量（避免 O(n²) 窗口扫描）
             rems = [_max_remaining(a) for a in pool]
-
-            def _richer(j: int, k: int) -> bool:
-                """pool[j] 的有效余量是否显著高于 pool[k]（带外）。"""
-                return rems[j] > rems[k] * (1 + _TIE_TOLERANCE)
 
             best_idx = 0
             best_tuple = (
@@ -549,10 +545,10 @@ class Store:
                 elif cur_inflight > best_tuple[0]:
                     continue
                 # 同负载：带外显著更富者胜；容差带内按轮换偏移
-                elif _richer(i, best_idx):
+                elif rems[i] > rems[best_idx] * (1 + tol):
                     best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
                     best_idx = i
-                elif not _richer(best_idx, i):
+                elif not rems[best_idx] > rems[i] * (1 + tol):
                     # 带内（含相等）→ 轮换偏移决定
                     if (i - cur_rot) % n < best_tuple[2]:
                         best_tuple = (cur_inflight, -rems[i], (i - cur_rot) % n)
