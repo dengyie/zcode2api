@@ -394,6 +394,22 @@ class TestGatewayHTTP:
         assert res.status_code == 503
         assert res.json()["error"]["type"] == "no_available_account"
 
+    async def test_count_tokens_uses_normalized_model(self, gateway_client):
+        # 2026-11-17 review：count_tokens 端点先取 model 再 _normalize_body，
+        # 带前缀请求曾把旧值（`zai/GLM-5.3-Flash`）传给估算器做 poweredBy 注入；
+        # 修复后必须以归一后的裸名估算（结果与裸名请求逐字节一致）
+        client, _ = gateway_client
+        prefixed = await client.post("/v1/messages/count_tokens", json={
+            "model": "zai/GLM-5.3-Flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        bare = await client.post("/v1/messages/count_tokens", json={
+            "model": "GLM-5.3-Flash",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert prefixed.status_code == bare.status_code == 200
+        assert prefixed.json() == bare.json()
+
 
 def fresh_account(secret: str) -> Account:
     """向当前 store 注入账号（gateway_client 用 fresh_app 的 store 单例）。"""

@@ -496,7 +496,11 @@ async def count_tokens(request: Request):
     model = body.get("model")
     if not isinstance(model, str) or not model.strip():
         return JSONResponse({"error": {"message": "必须提供 model 参数", "type": "invalid_request_error"}}, status_code=400)
-    return {"input_tokens": estimate_input_tokens_after_transform(_normalize_body(body), model)}
+    _normalize_body(body)
+    # 2026-11-17 review：_normalize_body 会原地剥离 provider 前缀/改写别名，
+    # 必须改写后再取——否则 poweredBy 注入的是带前缀旧值（差一个模型名的估算偏差）
+    model = str(body.get("model") or model)
+    return {"input_tokens": estimate_input_tokens_after_transform(body, model)}
 
 
 def _note_stream_abort(up: _Upstream, err: Exception, req_id: str) -> None:
