@@ -764,8 +764,8 @@ async def import_accounts(payload: dict = Body(...)):
 # ── 请求监控 ─────────────────────────────────────────────────────────────────
 @router.get("/monitoring")
 async def monitoring():
-    """网关请求环形日志（内存态，重启清零）。前端自行聚合统计。"""
-    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP}
+    """网关请求环形日志（内存态；2.7.38 起可选持久化，重启恢复）。前端自行聚合统计。"""
+    return {"entries": reqlog.snapshot(), "keep": reqlog.KEEP, "stats": reqlog.stats()}
 
 
 @router.post("/monitoring/clear")

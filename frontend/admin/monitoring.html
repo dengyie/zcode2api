@@ -14,7 +14,7 @@
   <div class="page-hd">
     <div>
       <div class="page-title">请求监控</div>
-      <div class="page-sub">网关请求实时观测 · 内存环形日志（保留最近 500 条，重启清零）</div>
+      <div class="page-sub">网关请求实时观测 · 内存环形日志（保留最近 500 条 · 开启持久化后重启恢复）</div>
     </div>
     <div class="page-actions">
       <span class="live-dot" id="live-dot">实时监控中</span>
@@ -129,7 +129,11 @@ function renderStats(list){
   const ttfb=ttfbs.length?ttfbs.reduce((a,b)=>a+b,0)/ttfbs.length:null;
 
   $('s-calls').textContent=total;
-  $('s-calls-sub').textContent=`进行中 ${inflight} · 内存保留 ${state.keep} 条`;
+  const st=state.stats;
+  const persistTag=st&&st.persist
+    ? ` · <span title="持久化 ${esc(st.file)} · 启动恢复 ${st.restored||0} 条">💾 已持久化${st.restored?`（恢复 ${st.restored}）`:''}</span>`
+    : ' · 重启清零';
+  $('s-calls-sub').textContent=`进行中 ${inflight} · 内存保留 ${state.keep} 条${persistTag}`;
   $('s-rate').textContent=total?(ok/(ok+fail||1)*100).toFixed(1)+'%':'—';
   $('s-rate-sub').textContent=`成功 ${ok}`;
   $('s-fail').textContent=fail;
@@ -200,8 +204,10 @@ function renderAgg(key){
 }
 
 function renderLive(){
+  const list=filtered();
+  if(!list.length){$('list').innerHTML='<div class="empty-state">所选时间范围内没有请求</div>';return;}
   const head=`<div class="mon-head mon-grid-live"><span>时间</span><span>账号</span><span>模型</span><span>状态</span><span>首字</span><span>总耗时</span><span>输入</span><span>输出</span><span>内容 / 错误</span></div>`;
-  const body=filtered().slice(0,200).map(e=>`
+  const body=list.slice(0,200).map(e=>`
     <div class="mon-row mon-grid-live">
       <span class="mon-time">${fmtTs(e.ts)}</span>
       <span class="mon-name" title="${esc(e.account||'')}">${esc(e.account||'—')}${e.mode?` <span class="tier-b ${e.mode==='jwt'?'jwt':'other'}">${e.mode==='jwt'?'JWT':'KEY'}</span>`:''}</span>
@@ -238,6 +244,7 @@ async function load(){
   const res=await api('GET','/monitoring');
   entries=res.entries||[];
   state.keep=res.keep||500;
+  if(res.stats)state.stats=res.stats;
   render();
 }
 function doRefresh(){load().catch(()=>showToast('加载失败','error'));}

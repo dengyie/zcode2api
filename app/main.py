@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import logs, settings
+from . import logs, reqlog, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
@@ -105,6 +105,10 @@ def _run_install_sequence_on_start() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.REQLOG_PERSIST:
+        restored = reqlog.restore()
+        if restored:
+            logs.ok("reqlog", f"请求监控日志恢复 ×{restored}（持久化开启）")
     replaced = _backfill_fingerprints()
     if replaced:
         logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{len(replaced)}")
@@ -129,6 +133,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        flushed = reqlog.shutdown_flush()
+        if flushed:
+            logs.info("reqlog", f"停机收口在途请求 ×{flushed}")
         await monitor.stop()
         await claim_round.stop()
         await version_tracker.stop()
