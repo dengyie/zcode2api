@@ -34,6 +34,13 @@ def _int(env_name: str, default: int) -> int:
         return default
 
 
+def _float(env_name: str, default: float) -> float:
+    try:
+        return float(os.getenv(env_name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _bool(env_name: str, default: bool) -> bool:
     raw = (os.getenv(env_name) or "").strip().lower()
     if not raw:
@@ -227,6 +234,11 @@ TP_HEALTH_INTERVAL = max(_int("ZCODE_TP_HEALTH_INTERVAL", 300), 30)  # 下限防
 # 链路秒级抖动各连坐 4/3 个账号齐换绑 = 无谓出口 IP churn）。单轮失败只
 # 留痕，连续 N 轮（跨 ≥N 个间隔）仍失败才判定节点真死。
 TP_HEALTH_FAIL_THRESHOLD = max(_int("ZCODE_TP_HEALTH_FAIL_THRESHOLD", 2), 1)
+# claim IP 信誉驱动重试（2026-11-17 深度迭代收编）：信誉型失败（403 风控文案/
+# 3007/验证码求解失败）换绑重试上限与间隔。间隔给 TP ban/新 allocation 生效
+# 留缓冲；求解单次可达分钟级，上限过大会让 claim 轮拖长（见 2.7.50 review）。
+CLAIM_EGRESS_RETRIES = max(_int("ZCODE_CLAIM_EGRESS_RETRIES", 2), 0)
+CLAIM_EGRESS_RETRY_DELAY = _float("ZCODE_CLAIM_EGRESS_RETRY_DELAY", 20.0)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -290,7 +302,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.50"  # 2.7.49 slidex 求解链；2.7.50 选号余额感知——同负载平局大余额优先（根治 use_count 失衡）
+APP_VERSION = "2.7.51"  # 2.7.50 选号余额感知；2.7.51 review 收口——过期窗不排富 + total-used 回填（对齐 window_usable 口径）
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

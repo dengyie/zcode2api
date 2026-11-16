@@ -17,7 +17,7 @@ import uuid
 from contextlib import closing
 
 from . import egress, logs, settings
-from .models import PROVIDERS, Account, Status, jwt_upstream_uid
+from .models import PROVIDERS, Account, Status, jwt_upstream_uid, window_usable
 
 _TBL = "accounts"
 _META = "meta"
@@ -455,8 +455,13 @@ class Store:
            - 主排序：当前在飞数 inflight 升序（最小负载优先）；
            - 次排序：最大剩余额度降序（同负载下优先大余额号。凌晨全池 inflight=0
              全平局时，纯轮询会把「只剩 5M」与「剩 3.05 亿」同权重随机分——
-             2026-11-17 线上实证 use_count 长期失衡 4034 vs 68；额度快照未知
-             记 0，不饿死新号，全池未知时退化为纯轮询）；
+             2026-11-17 线上实证 use_count 长期失衡 4034 vs 68）。口径与
+             window_usable 对齐：只数「remaining>0 且未过期」的窗口——已过期
+             大窗不排富（快照陈旧期不得把流量导向真实无量的号）；窗口缺
+             remaining 时按 total-used 回填（上游有的窗口只给 total/used）。
+             全部不可用时记 0：未知快照（新号）**劣于**已知正余额号（其流量
+             保障来自 inflight 主排序与全池未知时的轮询退化），全池未知退化为
+             纯轮询；
            - 末排序：距离当前轮询指针的偏移量（额度同档时均匀轮换）；
            - 更新轮询指针为选中账号的下一位。
         """
@@ -487,16 +492,30 @@ class Store:
             n = len(pool)
 
             def _max_remaining(a: Account) -> int:
-                """该号所有额度窗口中最大的 remaining（未知快照 = 0）。
+                """该号额度快照中最大的有效余量（全部不可用 = 0）。
 
                 只做「同负载平局打破」用，非精确配额——max 而非 sum 是因为
                 多模型窗口不可互抵（Flash 池与 Coding 池各自独立账本）。
+                口径与 window_usable 对齐（2.7.51）：
+                  - 已过期窗口不计入：快照陈旧期不得让过期大窗排富，把流量
+                    导向真实无量的号（各处额度判定同一哲学）；
+                  - remaining 缺失按 total-used 回填（上游有的窗口只给
+                    total/used，window_usable 的「未知但有量」同源）；
+                  - 全部窗口不可用/快照未知 → 0（劣于已知正余额号）。
                 """
-                vals = [
-                    w.get("remaining") or 0
-                    for w in (a.quota or {}).values()
-                    if isinstance(w, dict)
-                ]
+                vals: list[int] = []
+                for w in (a.quota or {}).values():
+                    if not isinstance(w, dict):
+                        continue
+                    if not window_usable(w, now):
+                        continue
+                    rem = w.get("remaining")
+                    if rem is None:
+                        rem = max(
+                            0,
+                            (w.get("total") or 0) - (w.get("used") or 0),
+                        )
+                    vals.append(rem or 0)
                 return max(vals) if vals else 0
 
             # 负载优先（最小在飞），同负载下大余额优先，再按轮询偏移平局
