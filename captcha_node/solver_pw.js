@@ -109,8 +109,24 @@ function chromeArgs(proxy) {
     "--memory-pressure-off", "--disable-background-timer-throttling",
     "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
   ];
-  if (proxy) args.push("--proxy-server=" + proxy);
+  if (proxy) args.push("--proxy-server=" + proxy); // proxy 必须已是去凭据形态
   return args;
+}
+
+// 带 basic-auth 的代理 URL：chromium 的 --proxy-server 不做凭据应答（curl 会自动，
+// chromium 不会）→ 407 挂死 → SDK 拉取超时（2026-11-16 活动套餐领取全灭根因）。
+// 必须拆出 user:pass 走 page.authenticate。
+function splitProxyAuth(proxy) {
+  try {
+    const u = new URL(proxy);
+    if (u.username || u.password) {
+      return {
+        server: u.protocol + '//' + u.hostname + (u.port ? ':' + u.port : ''),
+        auth: { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) },
+      };
+    }
+  } catch { /* 非 URL 形态（无凭据 host:port）原样返回 */ }
+  return { server: proxy, auth: null };
 }
 
 // oom_score_adj 归零（尽力而为；失败不影响求解）
@@ -137,7 +153,9 @@ function oomWatchdog(pid) {
     process.stderr.write("[pw] 未找到可执行 Chromium（设 ZCODE_CHROMIUM_PATH）\n");
     process.exit(3);
   }
-  const proxy = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || "";
+  const rawProxy = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || "";
+  const proxyCfg = splitProxyAuth(rawProxy); // {server: 去凭据, auth: {username,password}|null}
+  const proxy = proxyCfg.server;
 
   // --single-process 在共享小内存盒上约有一半概率闪退/启动失败（好坏窗口交替，
   // 与代理无关；dmesg 实证是 OOM killer 按 chrome 自设的 adj=800 优先杀它）。
@@ -149,7 +167,7 @@ function oomWatchdog(pid) {
       continue;
     }
     try {
-      const param = await solveOnce(executablePath, proxy, scene, region, prefix);
+      const param = await solveOnce(executablePath, proxy, scene, region, prefix, proxyCfg.auth);
       if (param && param.trim()) {
         console.log("VERIFY_PARAM=" + param.trim());
         process.exit(0);
@@ -166,7 +184,7 @@ function oomWatchdog(pid) {
   process.exit(5);
 });
 
-async function solveOnce(executablePath, proxy, scene, region, prefix) {
+async function solveOnce(executablePath, proxy, scene, region, prefix, proxyAuth) {
   dbg(`launch ${executablePath}`);
   const browser = await puppeteer.launch({
     executablePath,
@@ -182,6 +200,10 @@ async function solveOnce(executablePath, proxy, scene, region, prefix) {
     // 复用 launch 自带的 about:blank 目标：Target.createTarget 在小内存 LXC
     // + CDP 下实测 ~50% 概率 Target closed，复用缺省页规避该操作（2026-11-11 排查）
     const page = (await browser.pages())[0];
+    if (proxyAuth) {
+      dbg('proxy auth: ' + proxyAuth.username.slice(0, 24) + '…');
+      await page.authenticate(proxyAuth);
+    }
     await page.setUserAgent(UA);
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
