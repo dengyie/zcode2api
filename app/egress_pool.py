@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -117,6 +118,9 @@ async def tp_acquire(account, force_rebalance: bool = False,
 async def tp_ban(node_name: str, reason: str, evidence: dict,
                  account_name: str) -> None:
     from . import logs
+    # TP 服务端 reason 字段有字符集校验（非 ASCII/冒号 → HTTP 422 Invalid
+    # ban reason），中文诊断文案须归一为 slug 再上报（2.7.50 实弹实证）
+    reason = re.sub(r"[^A-Za-z0-9._-]+", "-", str(reason)).strip("-")[:80] or "unspecified"
     body = {"service": settings.TP_SERVICE, "account": account_name,
             "node_name": node_name, "reason": reason,
             "evidence": {k: str(v)[:120] for k, v in (evidence or {}).items()}}

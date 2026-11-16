@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 
 import httpx
@@ -366,7 +367,7 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
             skipped += 1
             continue
         try:
-            result = await claim(account, plan["plan_id"])
+            result = await claim_with_egress_retry(account, plan["plan_id"])
             outcomes.append({"account_id": account.id, "account_name": account.name,
                              "ok": True, **result})
             logs.ok("claim", f"账号 {account.name} 自动领取成功: "
@@ -567,6 +568,93 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     if code == 3007:
         captcha_manager.invalidate(claim_egress)  # 被拒的码出池，避免下轮复用
     raise _fail_error(code, body)
+
+
+# IP 信誉驱动重试（2026-11-16 活动套餐实弹定案）：claim 成败强跟随出口节点——
+# 同一坏节点上重试 4 次验证码也是同一个 IP，白烧求解与 claim 写流量。三类
+# 失败归因 IP 信誉：①HTTP 403 风控（unusual activity 文案）；②验证码求解
+# 失败（solver 是最灵敏的 IP 探针——F001 全拒=节点在阿里云侧已烂）；③3007
+# 换码仍拒。命中即 rebalance 换绑（ban 旧节点带 billing 证据），换绑后用
+# 「验证码现解成功」作真实验收（rebalance 自带的 Plan 探针只验 messages 通
+# 道，不验 billing/阿里云维度），验收过才重打 claim。
+CLAIM_EGRESS_RETRIES = max(0, int(os.getenv("ZCODE_CLAIM_EGRESS_RETRIES", "2")))
+_EGRESS_RETRY_DELAY_S = float(os.getenv("ZCODE_CLAIM_EGRESS_RETRY_DELAY", "20"))
+
+
+def _is_egress_reputation_failure(err: Exception) -> bool:
+    """判定是否 IP 信誉型失败（值得换绑重试，而非套餐/参数/凭证问题）。"""
+    if isinstance(err, ClaimError):
+        # 403 风控（unusual activity）+ 3007 换码仍拒；1001-1005/3001/3002 是
+        # 套餐/名额/参数维度，换 IP 无用
+        return err.code in (403, 3007)
+    # captcha_manager.get_verify_param 抛的求解失败：出口不通/节点被阿里云拒
+    return type(err).__name__ == "CaptchaSolveError"
+
+
+async def _rebalance_for_claim(account: Account, reason: str) -> bool:
+    """为 claim 换绑出口节点；换绑后用验证码现解做真实验收。
+
+    Returns True = 已换到新节点且验证码求解通过（IP 信誉已恢复）；
+    False = 无 per-account 出口可换 / rebalance 失败 / 验收仍不过。
+    """
+    from .captcha import CaptchaSolveError
+    from .egress_pool import egress_pool
+
+    claim_proxy = egress.account_proxy(account)
+    if not claim_proxy:
+        return False  # 直连/共享出口：无节点可换
+    old_tag = egress.egress_tag_for(account, settings.BILLING_EGRESS)
+    old_node = account.egress_node
+    captcha_manager.invalidate(old_tag)  # 旧 IP 池内的码全部作废
+
+    # TP ban reason 是闭合枚举（edge_405_html | unusual_activity_3012 |
+    # rate_limited_429_burst，见 TetherPool API 需求 §ban），自由文本 422。
+    # claim 场景即风控拒（403 unusual activity / 求解 F001 / 3007），归
+    # unusual_activity_3012；细粒度归因放 evidence（rebalance 自带）。
+    ok = await egress_pool.rebalance(
+        account, "unusual_activity_3012", ban=True
+    )
+    if not ok or account.egress_node == old_node:
+        logs.warn("claim", f"账号 {account.name} 换绑未生效（{old_node or '?'}），放弃本轮重试")
+        return False
+
+    # 验收：新节点上现解一枚验证码。这一步同时完成①IP 连通性②阿里云对该
+    # 新 IP 的信誉评分③为新 claim 预热 token。失败 = 新节点同样烂，不重打。
+    new_tag = egress.egress_tag_for(account, settings.BILLING_EGRESS)
+    try:
+        await captcha_manager.get_verify_param(egress_tag=new_tag,
+                                               proxy=egress.account_proxy(account))
+        logs.ok("claim", f"账号 {account.name} 新出口 {account.egress_node} 验证码验收通过")
+        return True
+    except CaptchaSolveError as err:
+        logs.warn("claim", f"账号 {account.name} 新出口 {account.egress_node} "
+                           f"验证码验收失败: {err}——节点信誉不足，不再重打")
+        return False
+
+
+async def claim_with_egress_retry(account: Account, plan_id: str | None = None) -> dict:
+    """claim 的 IP 信誉驱动包装：信誉型失败 → 换绑 → 验收 → 重打。
+
+    非 IP 信誉型失败（1001-1005/3001/3002/凭证失效）原样上抛，行为与裸
+    claim() 完全一致；换绑重试上限 ZCODE_CLAIM_EGRESS_RETRIES（缺省 2），
+    每次重试间隔 ZCODE_CLAIM_EGRESS_RETRY_DELAY（缺省 20s，给 TP ban/新
+    allocation 生效留缓冲）。"""
+    attempts = CLAIM_EGRESS_RETRIES + 1
+    last_err: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await claim(account, plan_id)
+        except Exception as err:  # noqa: BLE001 - 统一归因判定后分类处理
+            last_err = err
+            if attempt >= attempts or not _is_egress_reputation_failure(err):
+                raise
+            logs.warn("claim",
+                      f"账号 {account.name} 第 {attempt}/{attempts} 次 claim 遇 IP 信誉型失败"
+                      f"（{type(err).__name__}: {str(err)[:120]}）→ 换绑出口重试")
+            if not await _rebalance_for_claim(account, str(err)[:80]):
+                raise
+            await asyncio.sleep(_EGRESS_RETRY_DELAY_S)
+    raise last_err  # pragma: no cover - 循环必经 return/raise
 
 
 class ClaimRoundManager:
