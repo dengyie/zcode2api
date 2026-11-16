@@ -302,7 +302,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.51"  # 2.7.50 选号余额感知；2.7.51 review 收口——过期窗不排富 + total-used 回填（对齐 window_usable 口径）
+APP_VERSION = "2.7.52"  # 2.7.51 选号余额感知+review 收口；2.7.52 claim 重试链 review 深度迭代——403 风控文案实锤/换绑异常兜底/SLIDEX_FAIL 归因/套餐循环止损
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

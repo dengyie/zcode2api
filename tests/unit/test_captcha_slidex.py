@@ -13,6 +13,7 @@ env → 都没有则响亮失败（静默求解 = token 出口错配 = 3012）�
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 import pytest
@@ -134,3 +135,40 @@ def test_runner_parses_credentialed_proxy(monkeypatch):
     monkeypatch.delenv("http_proxy", raising=False)
     monkeypatch.delenv("https_proxy", raising=False)
     assert mod._playwright_proxy() is None
+
+
+def test_slidex_fail_line_feeds_last_error(monkeypatch):
+    """SLIDEX_FAIL=<code> 解析入 _last_error（2.7.50 review P3）：正常退出
+    无 param 的路径失败文案不再是笼统「多次重试无结果」，可归因 F001 等。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+
+    class _Proc:
+        pid = 12345
+
+        async def communicate(self):
+            return b"SLIDEX_FAIL=F001", b""
+
+        def kill(self):
+            pass
+
+    async def fake_comm(self, proc):
+        return await proc.communicate()
+
+    async def fake_cleanup(self, proc):
+        pass
+
+    async def fake_exec(*a, **kw):
+        return _Proc()
+
+    monkeypatch.setattr(CaptchaManager, "_communicate_solver", fake_comm)
+    monkeypatch.setattr(CaptchaManager, "_cleanup_solver", fake_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def main():
+        param = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
+        assert param is None
+        assert mgr._last_error == "slidex 求解未果（F001）"
+
+    _aio.run(main())

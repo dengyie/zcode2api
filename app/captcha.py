@@ -480,9 +480,18 @@ class CaptchaManager:
             await self._cleanup_solver(proc)
 
         param = None
+        fail_code = None
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
                 param = line[len("VERIFY_PARAM="):].strip()
+            elif line.startswith("SLIDEX_FAIL="):
+                # 诊断归因行（F001=阿里云行为风控全拒/ARM_SHAPE/DRAG/…）：
+                # 正常退出但无 param 的路径 _solve_one 靠它拿到 last_err，
+                # 否则失败文案只有笼统的「多次重试无结果」（2.7.50 review P3
+                # ——实弹 briarlow17 四轮全盲归因的教训）
+                fail_code = line[len("SLIDEX_FAIL="):].strip() or None
+        if param is None and fail_code:
+            self._last_error = f"slidex 求解未果（{fail_code}）"
         return param
 
     async def _run_solver_pw(

@@ -49,8 +49,17 @@ class _FakeEgressPool:
 
 # ── 归因判定 ────────────────────────────────────────────────────────────────
 def test_reputation_failures_include_403_3007_and_solve_error():
-    assert claim._is_egress_reputation_failure(ClaimError("风控", code=403))
+    # 403 必须风控文案实锤（2.7.50 review P1：文案盲信会白烧换绑循环）
+    assert claim._is_egress_reputation_failure(
+        ClaimError("上游风控拒绝 HTTP 403（非凭证失效）: unusual activity", code=403))
+    assert claim._is_egress_reputation_failure(
+        ClaimError('"code":3012 ...', code=403))
     assert claim._is_egress_reputation_failure(ClaimError("验证码拒", code=3007))
+
+
+def test_403_without_risk_marker_not_retried():
+    # 文案漂移/未知 403 语义：换 IP 无解，盲目换绑白烧求解与写流量
+    assert not claim._is_egress_reputation_failure(ClaimError("未知 403", code=403))
 
 
 def test_non_reputation_claim_errors_not_retried():
@@ -187,7 +196,7 @@ def test_retry_budget_exhausted_raises_last_error(monkeypatch, tp_mode):
 
     async def fake_claim(account, plan_id=None):
         attempts.append(1)
-        raise ClaimError("风控", code=403)
+        raise ClaimError("风控 unusual activity", code=403)
 
     async def fake_rebalance(account, reason):
         account.egress_node = "n2"
@@ -241,3 +250,68 @@ def test_tp_ban_reason_slugged_to_ascii(monkeypatch, tp_mode):
     reason = captured["body"]["reason"]
     assert reason == "claim-egress"  # 非法字符全折叠为 -，首尾 - 剥离
     assert reason.isascii()
+
+
+# ── 2.7.50 深度迭代（review P2/P4）───────────────────────────────────────────
+def test_rebalance_internal_error_swallowed_original_reraised(monkeypatch, tp_mode):
+    """换绑环节自身异常（store/probe 等）被吞，原始 claim 错误照常上抛。"""
+    acc = _account()
+    original = ClaimError("上游风控拒绝 HTTP 403: unusual activity", code=403)
+
+    async def fake_claim(account, plan_id=None):
+        raise original
+
+    async def boom_rebalance(account, reason):
+        raise RuntimeError("sqlite disk I/O error")
+
+    monkeypatch.setattr(claim, "claim", fake_claim)
+    monkeypatch.setattr(claim, "_rebalance_for_claim", boom_rebalance)
+
+    with pytest.raises(ClaimError) as ei:
+        asyncio.run(claim_with_egress_retry(acc, "plan-x"))
+    assert ei.value is original  # 不是 RuntimeError 穿透
+
+
+def test_rebalance_for_claim_internal_error_returns_false(monkeypatch, tp_mode):
+    """_rebalance_for_claim 内部任何异常 → False（不外泄），归因留日志。"""
+    acc = _account()
+
+    from app import egress_pool as ep_mod
+
+    class _BoomPool:
+        async def rebalance(self, account, reason, ban=True):
+            raise RuntimeError("tp http boom")
+
+    monkeypatch.setattr(ep_mod, "egress_pool", _BoomPool())
+    assert asyncio.run(claim._rebalance_for_claim(acc, "403")) is False
+
+
+def test_captcha_solve_error_isinstance_not_string_match():
+    """isinstance 化（P4）：改名不再静默失效。"""
+    err = CaptchaSolveError("x")
+    assert type(err).__name__ == "CaptchaSolveError"
+    assert claim._is_egress_reputation_failure(err)
+
+
+def test_acceptance_failure_breaks_plan_loop(monkeypatch, tp_mode):
+    """验收失败（CaptchaSolveError 上抛）后本账号不再打第二个套餐（P4 止损）。"""
+    from app.claim import auto_claim_all_plans
+
+    acc = _account()
+    attempts: list[str] = []
+
+    async def fake_claim(account, plan_id=None):
+        attempts.append(plan_id)
+        raise CaptchaSolveError("验证码求解失败: slidex 求解未果（F001）")
+
+    monkeypatch.setattr(claim, "claim", fake_claim)
+
+    async def fake_preview(account):
+        return [{"plan_id": "p1", "name": "P1", "priority": 2, "grants": []},
+                {"plan_id": "p2", "name": "P2", "priority": 1, "grants": []}]
+
+    monkeypatch.setattr(claim, "preview_plans", fake_preview)
+
+    outcomes = asyncio.run(auto_claim_all_plans(acc))
+    assert attempts == ["p1"]  # p2 不再烧码
+    assert all(not o["ok"] for o in outcomes)
