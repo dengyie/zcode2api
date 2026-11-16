@@ -129,6 +129,12 @@ RETRY_429_CONCURRENCY_WAIT = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT", 3)
 # 数据：935 次重试 1/5→5/5 线性分布说明恒定 3s 有一半在白等——前两次快路径
 # 不变，后三次给槽位真正释放的时间，减少空转到耗尽换号）。
 RETRY_429_CONCURRENCY_WAIT_MAX = _int("ZCODE_RETRY_429_CONCURRENCY_WAIT_MAX", 30)
+# 并发族连败提前止损（2.7.54）：同号连续 N 次并发族 429（重试中途无自愈）=
+# 上游排队队列已满，继续耗完 RETRY_429_TIMES 退避序列（3+6+12+24+30 ≈ 75s）
+# 是让客户端干等——立即止损换号（store.select 零等待）或切 Key 回退。
+# 2 = 第 3 次连败即止损（前两轮保留快路径：单次抖动自愈成本低于换号重连）。
+# 0/负 = 关闭（回 2.7.53 旧行为）。
+CONCURRENCY_GIVEUP_AFTER = _int("ZCODE_CONCURRENCY_GIVEUP_AFTER", 2)
 # 429/code 1302/1303「真限流」（Z.ai 频控，magpie 同源实证）：与并发争用相反，
 # 原地重试只会加重——账号休息该时长（秒），请求下沉下一渠道/换号
 RATE_LIMIT_COOLDOWN = _int("ZCODE_RATE_LIMIT_COOLDOWN", 60)
@@ -310,7 +316,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.52"  # 2.7.51 选号余额感知+review 收口；2.7.52 claim 重试链 review 深度迭代——403 风控文案实锤/换绑异常兜底/SLIDEX_FAIL 归因/套餐循环止损
+APP_VERSION = "2.7.55"  # 2.7.54 网关饱和连败提前止损 + quota 合并日志降级；2.7.55 plan_guard 冷却 SQLite 持久化（夜间 9 次重启洗掉冷却→全池撞 1005 根修）+ select 模型感知排富
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

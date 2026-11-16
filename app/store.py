@@ -445,6 +445,7 @@ class Store:
         inflight: dict[str, int] | None = None,
         pinned_id: str | None = None,
         max_inflight: int = settings.ACCOUNT_CONCURRENCY,
+        model: str | None = None,
     ) -> Account | None:
         """选择下一个可用账号。
 
@@ -462,6 +463,12 @@ class Store:
              全部不可用时记 0：未知快照（新号）**劣于**已知正余额号（其流量
              保障来自 inflight 主排序与全池未知时的轮询退化），全池未知退化为
              纯轮询；
+           - 模型感知（2.7.55）：指定 model 时只看**该模型**的窗口排富——
+             「GLM-5.3 rem=0 但 Flash 有 2.9 亿」的号在 GLM-5.3 请求眼里记 0，
+             不再凭无关窗口的富余额被优先选中（2026-11-17 线上实证：plan_guard
+             冷却被夜间重启洗掉后，这种号被排富前排、每请求撞一次必然失败的
+             1005）。快照不含该模型窗口 = 额度未知 = 记 0（不歧视新号，行为
+             与全池未知退化轮询一致）；model=None 保持原 max 口径。
            - 末排序：距离当前轮询指针的偏移量（额度同档时均匀轮换）；
            - 更新轮询指针为选中账号的下一位。
         """
@@ -502,9 +509,18 @@ class Store:
                   - remaining 缺失按 total-used 回填（上游有的窗口只给
                     total/used，window_usable 的「未知但有量」同源）；
                   - 全部窗口不可用/快照未知 → 0（劣于已知正余额号）。
+                模型感知（2.7.55）：model 指定时只数该模型窗口；快照不含该
+                窗口 = 额度未知 = 记 0（等价于「无此模型余量」，冷却丢失时
+                也不被无关窗口排富选中）。
                 """
+                windows = (a.quota or {}).values()
+                if model:
+                    # 窗口名精确匹配（billing 快照窗口名 = entitlement show_name，
+                    # 与请求 model 串同一形态，如 "GLM-5.3" / "GLM-5.3-Flash"）
+                    w = (a.quota or {}).get(model)
+                    windows = [w] if isinstance(w, dict) else []
                 vals: list[int] = []
-                for w in (a.quota or {}).values():
+                for w in windows:
                     if not isinstance(w, dict):
                         continue
                     if not window_usable(w, now):

@@ -24,6 +24,10 @@ from app.models import Status
 _JWT_C8 = "hZ8a1.eyJzdWIiOiJ4In0.sig"
 _JWT_C10 = "hZ8b2.eyJzdWIiOiJ4In0.sig"
 _JWT_CFB = "hZ8c3.eyJzdWIiOiJ4In0.sig"
+_JWT_CGV = "hZ8d4.eyJzdWIiOiJ4In0.sig"  # 2.7.54 giveup 止损用例
+_JWT_COK = "hZ8e5.eyJzdWIiOiJ4In0.sig"  # giveup 换号后一发命中的号
+_JWT_CGV_OFF = "hZ8f6.eyJzdWIiOiJ4In0.sig"  # giveup 关闭（旧行为）用例
+_JWT_COK2 = "hZ8g7.eyJzdWIiOiJ4In0.sig"  # giveup 关闭用例的接盘号
 _JWT_1302 = "hL1a.eyJzdWIiOiJ4In0.sig"
 _JWT_1302B = "hL2b.eyJzdWIiOiJ4In0.sig"
 _JWT_1302FB = "hL3c.eyJzdWIiOiJ4In0.sig"
@@ -120,6 +124,78 @@ class TestConcurrencyFamily:
         assert paths.count(_KEY_PATH) == 1
         after = fresh_app.find("zai", acc.id)
         assert after.status == Status.ACTIVE
+
+    async def test_concurrency_giveup_early_falls_down_ladder(
+        self, gateway_client, fresh_app, monkeypatch, no_retry_sleep
+    ):
+        """2.7.54 连败提前止损：第 3 次并发族 429（retries_429≥GIVEUP_AFTER=2）
+        立即切 Key 回退，不再按退避序列耗完 5 轮（≈75s 白等）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 0)
+        monkeypatch.setattr(settings, "CONCURRENCY_GIVEUP_AFTER", 2)
+        key = "sk-fallback-giveup-cccc"
+        acc = seed_account(fresh_app, _JWT_CGV, name="a-giveup-fb")
+        acc.api_key = key
+        fresh_app.update_account(acc)
+        mock.state.sequences[_JWT_CGV[:16]] = ["concurrency_3008"]
+
+        before = len(mock.state.calls)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200
+        paths = _paths(mock, before)
+        assert paths.count(_PLAN_PATH) == 3  # 首次 + 2 次连败（giveup 阈值前）
+        assert paths.count(_KEY_PATH) == 1  # 提前止损直达 Key 回退
+        after = fresh_app.find("zai", acc.id)
+        assert after.status == Status.ACTIVE  # 止损不是账号故障
+        assert after.cooling_until is None
+
+    async def test_concurrency_giveup_next_account(
+        self, gateway_client, fresh_app, monkeypatch, no_retry_sleep
+    ):
+        """无 Key 回退时提前止损换下一个号（而非原地耗完退避序列）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 0)
+        monkeypatch.setattr(settings, "CONCURRENCY_GIVEUP_AFTER", 2)
+        acc1 = seed_account(fresh_app, _JWT_CGV, name="a-giveup")
+        acc2 = seed_account(fresh_app, _JWT_COK, name="a-giveup-next")
+        # 号1 恒 3008；号2 首次即成功
+        mock.state.sequences[_JWT_CGV[:16]] = ["concurrency_3008"]
+        mock.state.sequences[_JWT_COK[:16]] = ["ok"]
+
+        before_cgv = _count(mock, _JWT_CGV)  # mock session 级，用增量断言
+        before_cok = _count(mock, _JWT_COK)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200
+        assert _count(mock, _JWT_CGV) - before_cgv == 3   # 首次 + 2 连败即止损（不耗 5 轮）
+        assert _count(mock, _JWT_COK) - before_cok == 1   # 换号后一发命中
+        after = fresh_app.find("zai", acc1.id)
+        assert after.status == Status.ACTIVE  # 饱和不是账号故障
+
+    async def test_concurrency_giveup_disabled_keeps_old_behavior(
+        self, gateway_client, fresh_app, monkeypatch, no_retry_sleep
+    ):
+        """GIVEUP_AFTER=0/负关闭止损：耗完 RETRY_429_TIMES 预算才换号（2.7.53 行为）。"""
+        client, mock = gateway_client
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 0)
+        monkeypatch.setattr(settings, "RETRY_429_TIMES", 3)
+        monkeypatch.setattr(settings, "CONCURRENCY_GIVEUP_AFTER", 0)
+        acc1 = seed_account(fresh_app, _JWT_CGV_OFF, name="a-giveup-off")
+        acc2 = seed_account(fresh_app, _JWT_COK2, name="a-giveup-off-next")
+        mock.state.sequences[_JWT_CGV_OFF[:16]] = ["concurrency_3008"]
+        mock.state.sequences[_JWT_COK2[:16]] = ["ok"]
+
+        before_off = _count(mock, _JWT_CGV_OFF)  # mock session 级，用增量断言
+        before_ok2 = _count(mock, _JWT_COK2)
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 200
+        assert _count(mock, _JWT_CGV_OFF) - before_off == 4   # 1 + RETRY_429_TIMES=3 全耗完
+        assert _count(mock, _JWT_COK2) - before_ok2 == 1
 
 
 @pytest.mark.integration
@@ -1138,6 +1214,39 @@ class TestPlanModelExhaust:
 
         plan_guard.note("acct-y", "GLM-5.3", time.time() - 1)  # 已过期
         assert not plan_guard.cooling("acct-y", "GLM-5.3")
+
+    async def test_cooldown_survives_restart(
+        self, gateway_client, fresh_app, monkeypatch, tmp_path
+    ):
+        """冷却持久化（2.7.55 核心语义）：服务重启（Store 重建 + plan_guard
+        内存态清零）后（账号，模型）冷却仍生效——不再重演「夜间 9 次重启，
+        每次重启后第一个 GLM-5.3 请求把全池 rem=0 的号挨个撞 1005」。"""
+        client, mock = gateway_client
+        from app import plan_guard
+        from tests.conftest import seed_account
+
+        await self._no_refresh(monkeypatch)
+        acc = seed_account(fresh_app, self._JWT_ME1, name="a-me1")
+        mock.state.sequences[self._JWT_ME1[:16]] = ["quota_exhausted_200"]
+
+        res = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res.status_code == 503
+        assert plan_guard.cooling(acc.id, "GLM-5.3")
+
+        # 重启模拟：内存态清零（新进程形态）——盘上条目应救回冷却记忆
+        plan_guard._plan_model_exhausted.clear()
+        plan_guard._loaded = False
+
+        # 账号被 billing 救活（冷却丢失时它会被重新选中再撞 1005）
+        acc.status = Status.ACTIVE
+        acc.quota = {"GLM-5.3-Flash": {"remaining": 100, "expires_at": time.time() + 3600}}
+        acc.quota_verified_at = time.time()
+        fresh_app.update_account(acc)
+
+        before = len(mock.state.calls)
+        res2 = await client.post("/v1/messages", json=_MSG_BODY)
+        assert res2.status_code == 503
+        assert len(_paths(mock, before)) == 0  # 零上游流量：冷却记忆跨重启生效
 
 
 class TestEdgeBlockPerAccountIsolation:

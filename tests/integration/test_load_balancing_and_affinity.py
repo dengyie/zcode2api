@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app import settings
@@ -86,9 +88,17 @@ class TestLoadBalancingAndAffinity:
         client, mock = gateway_client
         a = _seed(fresh_app, "hA.eyJzdWIiOiJhIn0.sig", "acc-a")
         b = _seed(fresh_app, "hB.eyJzdWIiOiJiIn0.sig", "acc-b")
-        # b 显著更富（带外）：无粘性时新请求必选 b
-        b.quota = {"GLM-5.2": {"total": 300_000_000, "used": 0, "remaining": 300_000_000}}
-        a.quota = {"GLM-5.2": {"total": 10_000_000, "used": 0, "remaining": 10_000_000}}
+        # b 显著更富（带外）：无粘性时新请求必选 b。窗口名用 GLM-5.3（请求
+        # model "GLM-5.2" 会被 _normalize_body 的退役别名改写成 GLM-5.3，
+        # 2.7.55 起模型感知排富按改写后的名对齐窗口）。
+        b.quota = {"GLM-5.3": {"total": 300_000_000, "used": 0, "remaining": 300_000_000}}
+        a.quota = {"GLM-5.3": {"total": 10_000_000, "used": 0, "remaining": 10_000_000}}
+        a.quota_verified_at = time.time()
+        b.quota_verified_at = time.time()
+        # a 成功后后台 _safe_refresh 会用 mock 默认余额（GLM-5.3 rem=2M）覆盖
+        # a 的快照——置 billing_empty 让刷新不写数字，保持测试设定的 10M/300M 档差。
+        mock.state.sequences[a.jwt_token[:16]] = ["billing_empty"]
+        mock.state.sequences[b.jwt_token[:16]] = ["billing_empty"]
 
         # S1 首轮：无绑定 + 无 assistant 轮 → 新请求。注意：此时 b 更富会先被选——
         # 先用只有 a 可用的窗口把 S1 绑到 a，再恢复 b 的余额验证粘性压过余额。

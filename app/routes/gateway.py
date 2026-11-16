@@ -690,6 +690,7 @@ async def _dispatch(req_id, body, incoming_headers, provider):
                 inflight=_inflight if limit > 0 else None,
                 pinned_id=pinned_id,
                 max_inflight=limit if limit > 0 else 2,
+                model=str(body.get("model") or "") or None,
             )
             if account is None:
                 break  # 本 provider 池已无可选账号 → 下沉下一 provider
@@ -1652,6 +1653,31 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     concurrency_hit = _is_concurrency_hit(text)
 
                     if retries_429 < settings.RETRY_429_TIMES:
+                        # 并发饱和连败提前止损（2.7.54）：同号已连败 N 次并发族
+                        # （重试中途无自愈）= 槽位排队队列已满，继续按退避序列耗完
+                        # RETRY_429_TIMES 轮（3+6+12+24+30 ≈ 75s）是让客户端干等
+                        # ——换号走 store.select 零等待。预算未耗尽也放弃，账号
+                        # 保持可用（retries_429 不重置仅在同一 _try_account 作用域，
+                        # 下次请求各自从 0 计，无跨请求影响）。
+                        if concurrency_hit and 0 < settings.CONCURRENCY_GIVEUP_AFTER <= retries_429:
+                            if _jump_to_fallback():
+                                account.record_result(False, "并发族连败提前止损，切 API Key 回退")
+                                logs.warn(
+                                    req_id,
+                                    f"账号 {account.name} 并发已满连败 {retries_429} 次"
+                                    f"（≥{settings.CONCURRENCY_GIVEUP_AFTER}），提前止损切 API Key 回退",
+                                )
+                                needs_captcha = False
+                                continue
+                            gate.note_busy(_messages_egress(account))
+                            account.record_result(False, "并发族连败提前止损")
+                            store.update_account(account)
+                            logs.warn(
+                                req_id,
+                                f"账号 {account.name} 并发已满连败 {retries_429} 次"
+                                f"（≥{settings.CONCURRENCY_GIVEUP_AFTER}），提前止损切换下一个",
+                            )
+                            return _NEXT_ACCOUNT
                         retries_429 += 1
                         # 3008/3009/3010「并发已满」族 = 并发争用，不是频控：上游不给
                         # Retry-After，槽位通常几秒内释放。等默认 60s 会把客户端白白

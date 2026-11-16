@@ -221,7 +221,10 @@ async def fetch_quota(account: Account) -> dict:
                     new_end = expires_epoch(window.get("expires_at"))
                     if new_end is not None and (prev_end is None or new_end > prev_end):
                         prev["expires_at"] = window.get("expires_at")
-                    logs.warn("quota", f"balance 同名窗口 {name} 已合并")
+                    # 预期路径的常规合并（同名模型日窗+一次性并存是上游常态，
+                    # 每次刷新都会走到）：info 级留痕即可，warn 会刷屏——线上
+                    # 实测 30 分钟窗口 6+ 次，淹没真告警（2.7.54 巡检）。
+                    logs.info("quota", f"balance 同名窗口 {name} 已合并")
                 else:
                     quota_map[name] = window
         except (ValueError, KeyError):

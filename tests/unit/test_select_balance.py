@@ -105,6 +105,73 @@ def _iso(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+class TestModelAwareRanking:
+    """2.7.55 模型感知排富：指定 model 时只看该模型窗口。
+
+    线上实证（2026-11-17）：zcodereg2 GLM-5.3 rem=0 但 Flash 有 2.9 亿，
+    GLM-5.3 请求照样把它当富号优先选中——plan_guard 冷却被夜间重启洗掉后，
+    每个请求都先撞一次必然失败的 1005。无关窗口的富余额不得给该模型排富。
+    """
+
+    def test_exhausted_model_not_rich_despite_other_window(self, store: Store):
+        """GLM-5.3 rem=0 的号在 GLM-5.3 请求里记 0，输给有 GLM-5.3 余量的号。"""
+        live = _acc(store, "flash-rich", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "flash-rich")
+        live.quota = {
+            "GLM-5.3": {"total": 3_000_000, "used": 3_000_000, "remaining": 0},
+            "GLM-5.3-Flash": {"total": 300_000_000, "remaining": 300_000_000},
+        }
+        _acc(store, "g53-has", remaining=1_000_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3")
+        assert got.name == "g53-has"
+
+    def test_model_none_keeps_max_semantics(self, store: Store):
+        """model=None 保持原口径：Flash 富余额照常排富（向后兼容）。"""
+        live = _acc(store, "flash-rich", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "flash-rich")
+        live.quota = {
+            "GLM-5.3": {"total": 3_000_000, "used": 3_000_000, "remaining": 0},
+            "GLM-5.3-Flash": {"total": 300_000_000, "remaining": 300_000_000},
+        }
+        _acc(store, "g53-only", remaining=1_000_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3)
+        assert got.name == "flash-rich"
+
+    def test_missing_model_window_counts_zero(self, store: Store):
+        """快照不含该模型窗口（如 trial 号只有 Flash entitlement）= 未知记 0，
+        不被误当富号。"""
+        live = _acc(store, "trial", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "trial")
+        live.quota = {"GLM-5.3-Flash": {"total": 300_000_000, "remaining": 300_000_000}}
+        _acc(store, "g53-has", remaining=500_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3")
+        assert got.name == "g53-has"
+
+    def test_expired_model_window_counts_zero(self, store: Store):
+        """该模型窗口已过期不排富（与 2.7.51 口径同源）。"""
+        live = _acc(store, "expired", remaining=None)
+        live = next(x for x in store.list_accounts("zai") if x.name == "expired")
+        live.quota = {
+            "GLM-5.3": {
+                "total": 300_000_000, "remaining": 300_000_000,
+                "expires_at": _iso(time.time() - 3600),
+            },
+        }
+        _acc(store, "g53-has", remaining=500_000, model="GLM-5.3")
+        got = store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3")
+        assert got.name == "g53-has"
+
+    def test_model_aware_all_zero_degrades_to_rotation(self, store: Store):
+        """全池该模型均无量（记 0）→ 轮换偏移平局，仍可选（不误伤可用性）。"""
+        _acc(store, "a", remaining=None)
+        _acc(store, "b", remaining=None)
+        picks = {
+            store.select("zai", inflight={}, max_inflight=3, model="GLM-5.3").name
+            for _ in range(2)
+        }
+        assert picks == {"a", "b"}
+
+
 class TestWindowUsableAlignment:
     """2.7.51 口径对齐：_max_remaining 只数 window_usable 的窗口。"""
 
