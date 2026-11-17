@@ -9,6 +9,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+
+class RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles with `Cache-Control: no-cache` — etag revalidation on every
+    request so deploys are visible immediately (CF/browser never serve stale)."""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
 from . import logs, plan_guard, reqlog, settings
 from .captcha import captcha_manager
 from .claim import claim_round
@@ -167,10 +177,12 @@ def create_app() -> FastAPI:
     app.include_router(pages.router)
     app.include_router(admin_api.router)
     app.include_router(gateway.router)
-    app.mount("/static", StaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
+    app.mount("/static", RevalidatingStaticFiles(directory=str(settings.FRONTEND_DIR)), name="static")
     # 前端相对资产路径（js/... css/...）在 /admin/* 页面形态下的服务点；路由
     # （/admin/api/*、/admin/login 等）注册在前，优先级高于本挂载。
-    app.mount("/admin", StaticFiles(directory=str(settings.FRONTEND_DIR / "admin"), html=True),
+    # JS/CSS 等静态资产必须 no-cache（发版后 CF/浏览器立即 revalidate 新内容）：
+    # StaticFiles 默认无 Cache-Control 头，CF heuristic 缓存会把旧 JS 边缘缓存数小时。
+    app.mount("/admin", RevalidatingStaticFiles(directory=str(settings.FRONTEND_DIR / "admin"), html=True),
               name="admin-static")
     return app
 
