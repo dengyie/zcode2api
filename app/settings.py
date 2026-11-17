@@ -325,7 +325,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.62"  # 2.7.61 DEGRADED 快速止损；2.7.62 出口验收/健康探针新增 alicdn 路由维度（烂路由节点不再被分配）+ claim 信誉 ban 改 edge_405_html 真隔离 + solver SDK 预算 45s
+APP_VERSION = "2.7.63"  # 2.7.62 alicdn 路由维度；2.7.63 全面 review 根修批次——TP 实时对账冲突拒收（假换绑/ban 台账/互斥破约收货前三查）+ 删除即释放 TP 分配 + 求解归因局部化（单槽竞态根除）+ 超时归因 + 孤儿清扫补 playwright 特征 + alicdn 验收整文件档
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

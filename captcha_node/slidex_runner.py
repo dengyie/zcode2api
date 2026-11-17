@@ -109,7 +109,7 @@ async def _attempt_in_browser(
     # F001/F015 归因重试（slidex 手册规范）：行为风控拒绝后换全新 context
     # （新指纹/新控件会话）再试，直至预算耗尽。
     last_fail = None
-    attempt = 0
+    attempt = 0  # 预算 ≤0 时循环不进，末尾 debug 引用不得 NameError
     while _time.monotonic() - start < deadline_ms / 1000.0:
         attempt += 1
         context = await browser.new_context(
@@ -220,7 +220,8 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # noqa: BLE001 — 顶层兜底：失败原因必须可见
-        print("SLIDEX_FAIL=EXC", flush=True)
+        # 契约行带异常类型（2026-11-18 review P3）：裸 "EXC" 对外层归因零价值
+        print(f"SLIDEX_FAIL=EXC:{type(exc).__name__}", flush=True)
         _debug(f"fatal: {type(exc).__name__}: {exc}")
         return 1
 

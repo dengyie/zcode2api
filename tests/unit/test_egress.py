@@ -149,7 +149,7 @@ class TestCaptchaEgressSeparation:
 
         async def _solve(config, tag=egress.DIRECT, proxy=None):
             solved.append(tag)
-            return _Token(f"tok-{tag}", "cn", tag)
+            return _Token(f"tok-{tag}", "cn", tag), None
 
         monkeypatch.setattr(mgr, "fetch_config", _config)
         monkeypatch.setattr(mgr, "_solve_one", _solve)

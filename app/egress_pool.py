@@ -71,23 +71,27 @@ def _opener(proxy: str | None):
 ALICDN_PROBE_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"
 
 
-def _alicdn_fetch(proxy_url: str, timeout: float) -> tuple[int, str]:
-    """同步抓取（asyncio.to_thread 调用）：经代理取 AliyunCaptcha.js 前 64KB。
+def _alicdn_fetch(proxy_url: str, timeout: float,
+                  full: bool = False) -> tuple[int, str]:
+    """同步抓取（asyncio.to_thread 调用）：经代理取 AliyunCaptcha.js。
 
-    只读 64KB：探测的是 TLS+路由 TTFB 与吞吐头部，不必整文件（JS ~1MB，
-    健康循环每轮 × 全账号全量拉会白吃出口流量）。"""
+    full=False 读前 64KB（健康循环轻探针：TLS+路由 TTFB 与吞吐头部，每轮 ×
+    全账号全量拉会白吃出口流量）；full=True 读整文件（换绑验收强探针——
+    SDK 实际拉 1MB+ 多资源串行，头部快 ≠ 整文件快，2026-11-18 review P2#9：
+    trial 的 6154 全文件 10.2s 却通过 64KB 采样）。"""
     try:
         req = urllib.request.Request(
             ALICDN_PROBE_URL, method="GET",
             headers={"User-Agent": "ZCode/3.17.2"})
         with _opener(proxy_url).open(req, timeout=timeout) as r:
-            r.read(65536)
+            r.read() if full else r.read(65536)
             return r.status, "ok"
     except Exception as exc:  # noqa: BLE001 - 路由质量探针：任何异常 = 不合格
         return 0, f"{type(exc).__name__}: {exc}"[:120]
 
 
 async def probe_alicdn(proxy_url: str | None, *,
+                       full: bool = False,
                        fetch_impl=None) -> tuple[bool, float, str]:
     """经代理 URL 探阿里云验证码 CDN 路由质量。返回 (ok, elapsed_s, detail)。
 
@@ -95,8 +99,9 @@ async def probe_alicdn(proxy_url: str | None, *,
     形态）恒过——直连实测 0.15s 量级，不占探针预算。路由差 ≠ 信誉烂：
     调用方拒收候选即可，绝不能拿它 tp_ban（烧池子）。
 
-    fetch_impl 为 DI 缝（测试注入假 fetch），签名 (proxy_url, timeout) ->
-    (status, detail)。"""
+    full=True 用整文件强探针（换绑验收，决策关键、低频）；缺省 64KB 轻探针
+    （健康循环，高频）。fetch_impl 为 DI 缝（测试注入假 fetch），签名
+    (proxy_url, timeout, full) -> (status, detail)。"""
     if not proxy_url:
         return True, 0.0, "direct-no-probe"
     fetch = fetch_impl or _alicdn_fetch
@@ -104,7 +109,7 @@ async def probe_alicdn(proxy_url: str | None, *,
 
     def _run():
         t0 = time.monotonic()
-        st, detail = fetch(proxy_url, timeout)
+        st, detail = fetch(proxy_url, timeout, full)
         return st, time.monotonic() - t0, detail
 
     st, elapsed, detail = await asyncio.to_thread(_run)
@@ -185,6 +190,70 @@ async def tp_ban(node_name: str, reason: str, evidence: dict,
         logs.warn("egress_pool", f"ban({node_name}) 失败 HTTP {st}: {raw.strip()[:120]}")
 
 
+async def tp_release_account(account_id: str) -> bool:
+    """释放账号的 TP 分配（账号删除路径调用，2026-11-18 review P2 根修）。
+
+    zh-<id> 分配在账号删除后孤儿化：TP 端无 TTL，删除账号的分配永久占节点
+    （2026-11-17 实查 27 个分配里 16 个陈旧——`-b782a0d5` 族即历史删除账号），
+    池压下把现役账号挤向软排除兜底（ban 节点/共享节点）。删除即释放，从源头
+    杜绝陈旧分配再生。"""
+    from . import logs
+    q = urllib.parse.urlencode({"service": settings.TP_SERVICE,
+                                "account_id": f"zh-{account_id}"})
+    st, raw = await asyncio.to_thread(
+        _tp_http, "POST", f"{settings.TP_API}/v1/allocation/release?{q}",
+        None, _tp_headers(), 15)
+    if st == 200:
+        logs.info("egress_pool", f"TP 分配已释放: zh-{account_id}")
+        return True
+    logs.warn("egress_pool",
+              f"TP 分配释放失败 zh-{account_id}: HTTP {st} {raw.strip()[:100]}")
+    return False
+
+
+async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
+    """TP 实时对账快照：(本 service 分配 {tp_account_id: node}, 在期隔离节点集)。
+
+    2026-11-18 review P1 根修：exclude_node / avoid_banned 均为 TP 软语义
+    （池压下会兜底返回 ban 台账在期节点、其它账号现占节点——实锤 zcodereg3
+    绑上在期 ban 的 542、zcodereg4/5 同占 6157），收货前必须反查地面真相。
+    拉取失败返回空快照（fail-open：冲突检查跳过，保持既有行为），调用方打
+    warn 一次。"""
+    import datetime as _dt
+
+    allocs: dict[str, str] = {}
+    banned: set[str] = set()
+    st, raw = await asyncio.to_thread(
+        _tp_http, "GET",
+        f"{settings.TP_API}/v1/allocation/accounts?service={settings.TP_SERVICE}",
+        None, _tp_headers(), 15)
+    if st == 200:
+        try:
+            for a in json.loads(raw):
+                allocs[a.get("account_id")] = a.get("node_name") or ""
+        except ValueError:
+            pass
+    st, raw = await asyncio.to_thread(
+        _tp_http, "GET",
+        f"{settings.TP_API}/v1/feedback/bans?service={settings.TP_SERVICE}&limit=300",
+        None, _tp_headers(), 15)
+    if st == 200:
+        try:
+            now = _dt.datetime.now()
+            for b in json.loads(raw):
+                until = b.get("quarantined_until")
+                if not until:
+                    continue
+                try:
+                    if _dt.datetime.fromisoformat(str(until)) > now:
+                        banned.add(b.get("node_name") or "")
+                except ValueError:
+                    continue
+        except ValueError:
+            pass
+    return allocs, banned
+
+
 def _edge_kind(raw: str) -> str:
     low = raw.lstrip().lower()
     if low.startswith("<!doctype") or "<html" in low[:200] or "<title>405" in low:
@@ -257,6 +326,18 @@ class TetherPoolEgress:
             exclude.append(old_node)
         probe_url = egress.tetherpool_gateway_url(account)
 
+        # TP 实时对账快照（2026-11-18 review P1 根修，每轮一次）：exclude/
+        # avoid_banned 是软语义，池压下 TP 会返回 ban 台账在期节点、本 service
+        # 其它分配现占节点、甚至原节点本身（假换绑 6154→6154 实锤）——收货前
+        # 必须反查地面真相。快照拉取失败 → 跳过冲突检查（fail-open，打 warn）。
+        live_allocs, live_banned = await _tp_live_snapshot()
+        own_aid = "zh-" + str(account.id)
+        snapshot_ok = bool(live_allocs) or bool(live_banned)
+        if not snapshot_ok:
+            from . import logs
+            logs.warn("egress_pool",
+                      f"{account.name} TP 实时对账快照拉取失败——本轮冲突检查跳过")
+
         for attempt in range(1, 4):
             if attempt == 1 and ban and old_node:
                 await tp_ban(old_node, reason, {
@@ -274,6 +355,28 @@ class TetherPoolEgress:
             exit_ip = d.get("exit_ip")
             logs.info("egress_pool",
                       f"{account.name} rebalance#{attempt} → {node} exit={exit_ip}")
+            # 收货前三重冲突检查（顺序：假换绑 → 在期隔离 → 互斥占用；任一命中
+            # 即换下一个候选，不 ban——这是 TP 分配器的锅，不是节点的锅）。
+            # 假换绑检查无条件执行（old_node 是本地状态，不依赖快照）；隔离/
+            # 互斥两项需要 TP 实时快照，快照坏则跳过（fail-open）。
+            if node and node == old_node:
+                logs.warn("egress_pool",
+                          f"{account.name} 候选 {node} == 旧节点（TP 无视 "
+                          f"exclude_node 粘性返回 = 假换绑）——换下一个候选")
+                continue
+            if snapshot_ok and node:
+                if node in live_banned:
+                    logs.warn("egress_pool",
+                              f"{account.name} 候选 {node} 在 TP 在期隔离台账"
+                              f"（avoid_banned 兜底破约）——换下一个候选")
+                    continue
+                holders = [aid for aid, n in live_allocs.items()
+                           if n == node and aid != own_aid]
+                if holders:
+                    logs.warn("egress_pool",
+                              f"{account.name} 候选 {node} 已被本 service 其它分配"
+                              f"占用（{holders[0]}，互斥破约）——换下一个候选")
+                    continue
             # 即时探针：经新绑定（网关 URL）真实打一针 Plan 通道
             st, raw = await self._probe_via(account, probe_url, jwt)
             if st == 0:
@@ -287,7 +390,9 @@ class TetherPoolEgress:
                 # alicdn 维度验收（2026-11-18 1117 全灭复盘）：zcode 探针放行
                 # ≠ 验证码 SDK 路由可用——alicdn 不合格的候选直接换下一个，
                 # 不 ban（路由差≠信誉烂）。exclude 已含本候选（防 3 轮打转）。
-                ok_cd, elapsed, detail = await probe_alicdn(probe_url)
+                # 整文件强探针（full=True）：SDK 实际拉 1MB+ 多资源串行，
+                # 64KB 头部采样会放行「头部快、整文件慢」的节点（P2#9）。
+                ok_cd, elapsed, detail = await probe_alicdn(probe_url, full=True)
                 if not ok_cd:
                     logs.warn("egress_pool",
                               f"{account.name} 新节点 {node} zcode 探针放行但 alicdn "
@@ -319,12 +424,23 @@ class TetherPoolEgress:
                              extra_exclude=exclude)
         if d and d.get("node_name"):
             node = d.get("node_name")
+            conflict = ""
+            if snapshot_ok:
+                if node == old_node:
+                    conflict = "假换绑（==旧节点）"
+                elif node in live_banned:
+                    conflict = "在期隔离节点"
+                else:
+                    holders = [aid for aid, n in live_allocs.items()
+                               if n == node and aid != own_aid]
+                    if holders:
+                        conflict = f"其它分配占用（{holders[0]}）"
             st, raw = await self._probe_via(account, probe_url, jwt)
-            ok_cd, _elapsed, cd_detail = await probe_alicdn(probe_url)
-            if st == 0 or _edge_kind(raw) != "JSON-APP" or not ok_cd:
+            ok_cd, _elapsed, cd_detail = await probe_alicdn(probe_url, full=True)
+            if conflict or st == 0 or _edge_kind(raw) != "JSON-APP" or not ok_cd:
                 logs.warn("egress_pool",
-                          f"{account.name} 3 轮均败，回绑候选 {node} 探针仍不过"
-                          f"（zcode={_edge_kind(raw)} alicdn={cd_detail}；"
+                          f"{account.name} 3 轮均败，回绑候选 {node} 仍不过"
+                          f"（{conflict or f'zcode={_edge_kind(raw)} alicdn={cd_detail}'}；"
                           f"TP 绑定停留在此，人工介入）")
                 account.egress_node = node  # hub 记录对齐 TP 实际绑定
                 store.update_account(account)

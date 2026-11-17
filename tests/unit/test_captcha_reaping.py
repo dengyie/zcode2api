@@ -83,9 +83,10 @@ async def test_timeout_kills_whole_process_group(monkeypatch, _no_real_processes
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
     monkeypatch.setattr(settings, "CAPTCHA_SOLVE_TIMEOUT", 0.01)
 
-    param = await CaptchaManager()._run_solver("s", "cn", "p", egress.DIRECT)
+    param, fail = await CaptchaManager()._run_solver("s", "cn", "p", egress.DIRECT)
 
     assert param is None
+    assert "超时" in (fail or "")
     assert _no_real_processes == [4321]
 
 
