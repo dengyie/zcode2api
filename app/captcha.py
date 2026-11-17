@@ -126,6 +126,24 @@ class _Token:
         return (time.monotonic() - self.born_at) * 1000 >= TOKEN_TTL_MS
 
 
+def _normalize_captcha_region(config: dict, tag: str) -> None:
+    """sgp 归一（2.7.59，配置边界单点）。
+
+    上游按出口 IP 下发 region（US TP 出口实测 sgp、直连 cn），但 sgp 端点
+    headless 无痕稳定必败（2026-11-17 对照实验：同出口同窗口 cn 一跳成功、
+    sgp 6/6 TIMEOUT/F001）——两代求解器均已把 sgp 归一为 SDK 缺省 cn 端点
+    出参（solver_pw.js 2026-11-11、slidex_runner 2.7.58）。参数签发端点是
+    cn，`X-Aliyun-Captcha-Verify-Region` 头也必须是 cn：头与签发端点错位
+    = 上游验签必败 3007（2.7.58 当天实弹 4 号连败「求解成功→claim 3007」
+    的全链根因——_Token.region 存的是「传给 solver 的值」而非「solver
+    实际签发用的值」，语义缺环）。在配置边界归一，签发/校验头/手动领取
+    （admin captcha-config 前端 SDK）三个消费者看到同一个 region。
+    """
+    if (config.get("region") or "").strip().lower() == "sgp":
+        config["region"] = "cn"
+        logs.info("captcha", f"出口 {tag} 配置 region=sgp 归一为 cn（sgp 端点 headless 必败，签发与校验头同走 cn）")
+
+
 class CaptchaManager:
     def __init__(self) -> None:
         # 按出口分池：token 只能用在签发它的那个出口上，混池会让请求与
@@ -221,6 +239,7 @@ class CaptchaManager:
                 if captcha:
                     logs.info("captcha", f"出口 {tag} 拉取失败，已用 {alt} 兜底")
             if captcha:
+                _normalize_captcha_region(captcha, tag)
                 self._config_cache[tag] = captcha
                 self._config_cache_at[tag] = _now_ms()
                 return captcha

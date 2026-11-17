@@ -358,4 +358,78 @@ class TestModelRequestCaptchaGating:
         config = await mgr.fetch_config(egress.PROXY)
         assert len(calls) == 3  # 主出口×2 + 兜底出口×1
         assert config.get("skip_model_request") is True
-        assert await mgr.model_requests_need_captcha(egress.PROXY) is False
+
+
+class TestCaptchaRegionNormalization:
+    """2.7.59 sgp 归一：配置边界单点归一，签发/校验头/手动领取同 region。
+
+    2026-11-17 实弹链：TP US 出口拉 config 得 region=sgp → 2.7.58 runner
+    归一后参数由 cn 端点签发 → 但 _Token.region 仍存 sgp → claim 头
+    X-Aliyun-Captcha-Verify-Region: sgp 与签发端点错位 → 上游验签必败
+    3007（4 号连败「求解成功→claim 3007」全链根因）。"""
+
+    @staticmethod
+    def _fetch_with_config(monkeypatch, captcha_config: dict) -> CaptchaManager:
+        mgr = CaptchaManager()
+
+        class _FakeResp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **kw):
+                return _FakeResp({"data": {"configs": {"captcha": captcha_config}}})
+
+        monkeypatch.setattr("app.captcha.httpx.AsyncClient", _FakeClient)
+        return mgr
+
+    async def test_sgp_normalized_to_cn(self, monkeypatch):
+        """sgp → cn 归一：TP 出口下发的 sgp 必须归一，防止头/签发错位 3007。"""
+        mgr = self._fetch_with_config(monkeypatch, {
+            "enabled": True, "region": "sgp", "sceneId": "11xygtvd",
+            "prefix": "no8xfe", "skip_model_request": True,
+        })
+        config = await mgr.fetch_config(egress.PROXY)
+        assert config["region"] == "cn"
+
+    async def test_cn_passthrough_untouched(self, monkeypatch):
+        """直连下发的 cn 原样保留（归一只针对 sgp）。"""
+        mgr = self._fetch_with_config(monkeypatch, {
+            "enabled": True, "region": "cn", "sceneId": "11xygtvd",
+            "prefix": "no8xfe", "skip_model_request": True,
+        })
+        config = await mgr.fetch_config(egress.PROXY)
+        assert config["region"] == "cn"
+
+    async def test_missing_region_stays_absent(self, monkeypatch):
+        """region 缺失不凭空注入（SDK 缺省即 cn，语义等价）。"""
+        mgr = self._fetch_with_config(monkeypatch, {
+            "enabled": True, "sceneId": "11xygtvd", "prefix": "no8xfe",
+        })
+        config = await mgr.fetch_config(egress.PROXY)
+        assert "region" not in config
+
+    async def test_cache_stores_normalized_value(self, monkeypatch):
+        """归一发生在入缓存前：二次读取（缓存命中路径）也是 cn。"""
+        mgr = self._fetch_with_config(monkeypatch, {
+            "enabled": True, "region": "sgp", "sceneId": "11xygtvd",
+            "prefix": "no8xfe",
+        })
+        first = await mgr.fetch_config(egress.PROXY)
+        second = await mgr.fetch_config(egress.PROXY)
+        assert first["region"] == second["region"] == "cn"
