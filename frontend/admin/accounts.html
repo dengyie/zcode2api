@@ -294,8 +294,8 @@ function renderList(){
   el.innerHTML=`<div class="acct-scroll"><div class="acct-table">
     <div class="acct-head"><span>凭证 / 账号</span><span>可用状态</span><span>最近请求</span><span>历史用量</span><span>额度信息</span><span class="th-actions">操作</span></div>
     ${items.map(rowHtml).join('')}
-    el.querySelectorAll('.acct-row').forEach((r,idx)=>r.style.setProperty('--ri',idx));
   </div></div>`;
+  el.querySelectorAll('.acct-row').forEach((r,idx)=>r.style.setProperty('--ri',idx));
 }
 
 /* ── CPA-Manager-Plus 风格 6 列表格行 ── */
