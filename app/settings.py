@@ -316,7 +316,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.59"  # 2.7.58 captcha slidex stderr 透传 + runner sgp 归一；2.7.59 captcha 配置边界 sgp→cn 归一（claim 3007 全链根修：校验头与签发端点对齐）
+APP_VERSION = "2.7.60"  # 2.7.59 配置边界 sgp→cn 归一；2.7.60 求解器严格 param 校验（len-76 降级产物=claim 3007 另一半根因，绝不当成功放行）
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

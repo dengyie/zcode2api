@@ -33,6 +33,27 @@ from pathlib import Path
 _PAGE = Path(__file__).resolve().parent / "page.html"
 
 
+def _verify_param_ok(param: str | None) -> bool:
+    """严格校验（对齐老 solver.js extractVerifyParam / zapi 口径）。
+
+    真实 verifyParam ~280 字符 base64-JSON，内含 securityToken（≥50 字符）。
+    len-76 的降级结果（无 securityToken）上游必然 3007——2026-11-17 实弹
+    链「求解成功→claim 3007」的另一半根因：降级产物被当成功输出，重试
+    白烧后 claim 必败。降级结果绝不当成功放行，交由外层换 context 重试。
+    """
+    if not param or len(param) < 200:
+        return False
+    try:
+        import base64
+        import json as _json
+        pad = param + "=" * (-len(param) % 4)
+        decoded = _json.loads(base64.b64decode(pad))
+        sec = decoded.get("securityToken") or decoded.get("SecurityToken")
+        return bool(sec) and len(str(sec)) >= 50
+    except Exception:  # noqa: BLE001 — 形态不对即降级
+        return False
+
+
 def _debug(msg: str) -> None:
     if os.environ.get("CAPTCHA_DEBUG", "").lower() in ("1", "true", "yes"):
         print(f"[slidex] {msg}", file=sys.stderr, flush=True)
@@ -149,11 +170,14 @@ async def _attempt_in_browser(
             _debug(f"attempt {attempt}: traceless={traceless!r}")
             if not traceless:
                 param = await page.evaluate("() => window.__slidexCaptchaParam || null")
-                if param:
+                if _verify_param_ok(param):
                     print(f"VERIFY_PARAM={param}", flush=True)
                     _debug(f"ok via traceless (attempt {attempt})")
                     return 0
-                last_fail = f"TRACELESS:{await page.evaluate('() => window.__slidexCaptchaFail')}"
+                if param:
+                    _debug(f"traceless param degraded (len={len(param)}, "
+                           f"no securityToken) — reject and retry")
+                last_fail = f"TRACELESS:{await page.evaluate('() => window.__slidexCaptchaFail') or ('DEGRADED' if param else 'NO_PARAM')}"
                 _debug(f"traceless no param, fail={last_fail}")
                 # 无痕被拒后 SDK 已弹 popup 兜底 → 落第二跳拟人拖拽
                 provider = provider_cls()
@@ -165,11 +189,13 @@ async def _attempt_in_browser(
                     verdict_timeout_ms=8000,
                     deadline_s=max(10, int(deadline_ms / 1000 - (_time.monotonic() - start))),
                 )
-                if result.get("param"):
+                if _verify_param_ok(result.get("param")):
                     print(f"VERIFY_PARAM={result['param']}", flush=True)
                     _debug(f"ok via drag (attempt {attempt})")
                     return 0
-                last_fail = f"DRAG:{result.get('fail_code')}"
+                if result.get("param"):
+                    _debug(f"drag param degraded (len={len(result['param'])}) — reject")
+                last_fail = f"DRAG:{result.get('fail_code') or ('DEGRADED' if result.get('param') else 'NO_PARAM')}"
             else:
                 last_fail = f"TRACELESS:{traceless}"
             _debug(f"attempt {attempt} failed: {last_fail}; retrying with fresh context")
@@ -192,7 +218,7 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # noqa: BLE001 — 顶层兜底：失败原因必须可见
-        print(f"SLIDEX_FAIL=EXC", flush=True)
+        print("SLIDEX_FAIL=EXC", flush=True)
         _debug(f"fatal: {type(exc).__name__}: {exc}")
         return 1
 

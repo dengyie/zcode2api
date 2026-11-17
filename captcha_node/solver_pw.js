@@ -221,7 +221,7 @@ async function solveOnce(executablePath, proxy, scene, region, prefix, proxyAuth
       // --single-process 下 Chrome 的 FATAL:check.cc NOTREACHED 崩溃（整个
       // 浏览器死，2026-11-11 dumpio 实证）。不设配置走降级无痕路径稳定出参。
       // sgp（代理出口）需显式配置切新加坡端点。
-      if (region && region !== "cn") window.AliyunCaptchaConfig = { region, prefix };
+      if (region && region !== "cn" && region !== "sgp") window.AliyunCaptchaConfig = { region, prefix };
       return await new Promise((resolve) => {
         let done = false;
         const finish = (v) => { if (!done) { done = true; resolve(v || null); } };
@@ -239,7 +239,16 @@ async function solveOnce(executablePath, proxy, scene, region, prefix, proxyAuth
             },
             success: (p) => {
               const v = typeof p === "string" ? p : p && p.captchaVerifyParam;
-              finish(v);
+              // 严格校验（2.7.59，对齐老 solver.js extractVerifyParam）：真实
+              // param ~280 字符含 securityToken(≥50)；len-76 降级产物上游必
+              // 3007（2026-11-17 实弹链「求解成功→claim 3007」根因之二）。
+              let ok = false;
+              try {
+                const dec = JSON.parse(Buffer.from(v || "", "base64").toString("utf8"));
+                const sec = dec.securityToken || dec.SecurityToken;
+                ok = (v || "").length >= 200 && sec && String(sec).length >= 50;
+              } catch { ok = false; }
+              finish(ok ? v : null);
             },
             fail: () => finish(null),
             onError: () => finish(null),
