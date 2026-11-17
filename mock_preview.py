@@ -63,7 +63,25 @@ class Handler(BaseHTTPRequestHandler):
                     a["use_count"] = 842; a["fail_count"] = 6
                 return self._send(json.dumps({"accounts": ACCOUNTS, "stats": stats}))
             if name == "monitoring":
-                return self._send(json.dumps({"stats": {"persist": False}, "entries": REQUESTS}))
+                now_ms = 1764000000000
+                entries = []
+                models = ["claude-sonnet-4-5", "gpt-5.2", "glm-5.3-flash"]
+                for i in range(40):
+                    ok = i % 7 != 0
+                    entries.append({
+                        "ts": now_ms - i * 61000,
+                        "account": ["briarlow17", "trial-mvxmwyyg", "sable.ashby60"][i % 3],
+                        "model": models[i % 3],
+                        "ok": True if ok else False,
+                        "status": 200 if ok else (429 if i % 5 == 0 else 503),
+                        "input_tokens": 1200 + i * 37, "output_tokens": 3400 + i * 91,
+                        "ms_ttft": 420 + i * 13, "ms_total": 900 + i * 51,
+                        "stream": i % 3 == 0,
+                        "endpoint": "/v1/messages" if i % 2 == 0 else "/v1/chat/completions",
+                        "preview": "Sample completion text for preview…",
+                        "error": None if ok else "upstream 429 rate limited",
+                    })
+                return self._send(json.dumps({"stats": {"persist": False, "keep": 500}, "entries": entries, "inflight": 2}))
             if name == "settings":
                 return self._send(json.dumps({"gateway_key_masked": "gw-…7f2", "admin_password_set": True, "refresh_interval": 300}))
             return self._send(json.dumps({}))

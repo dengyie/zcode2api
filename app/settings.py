@@ -56,6 +56,12 @@ DB_PATH = DATA_DIR / "accounts.db"
 # 开启后追加写 DATA_DIR/reqlog.jsonl，启动时回读尾部 ≤KEEP 条，重启不清零。
 REQLOG_PERSIST = _bool("ZCODE_REQLOG_PERSIST", False)
 REQLOG_PATH = DATA_DIR / "reqlog.jsonl"
+# 运维事件日志落盘（2.7.64）：logs.py 全部事件行（ok/info/warn/err/req*）同步
+# 追加写 DATA_DIR/opslog.jsonl，结构化字段（_ts 含年/level/tag/msg），日切 +
+# .1 轮转保留一代。默认开——排障不再受 out.log 10MB 轮转截断与 ANSI 脏文本
+# 干扰（2.7.58-61 领取失败潮跨日排查实战提炼）；关闭 = ZCODE_OPSLOG_PERSIST=0。
+OPSLOG_PERSIST = _bool("ZCODE_OPSLOG_PERSIST", True)
+OPSLOG_PATH = DATA_DIR / "opslog.jsonl"
 # 前端目录（前后端分离）：默认仓库根 frontend/，可用 ZCODE_FRONTEND_DIR 指向
 # 独立部署目录（线上 /data/zcode-hub/frontend）；包内 statics 仅作兜底
 FRONTEND_DIR = _resolve_path(
