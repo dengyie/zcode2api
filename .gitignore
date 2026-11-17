@@ -24,3 +24,6 @@ node_modules/
 # 秘钥 / 凭证导出
 *accounts*.json
 zcode-accounts*.json
+
+# 本地临时产物
+.tmp-*

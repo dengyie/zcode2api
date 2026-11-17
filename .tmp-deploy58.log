@@ -1,7 +1,0 @@
-→ 打包同步 app/ → tebi:/data/zcode-hub/app/app（备份=/data/zcode-hub/backups/20261117_210941/）
-→ 重启 zcode-hub（优雅停机，在途流最长等 300s）
-zcode-hub: stopped
-zcode-hub: started
-→ 冒烟 /meta
-{"version":"2.7.58"}
-✓ backend → tebi:/data/zcode-hub/app/app + 已重启（回滚: /data/zcode-hub/app/app.old → app + restart；备份 /data/zcode-hub/backups/20261117_210941/）
