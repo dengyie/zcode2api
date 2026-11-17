@@ -9,6 +9,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from . import logs, plan_guard, reqlog, settings
+from .captcha import captcha_manager
+from .claim import claim_round
+from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
+from .quota import monitor
+from .routes import admin_api, gateway, pages
+from .version_tracker import version_tracker
+
 
 class RevalidatingStaticFiles(StaticFiles):
     """StaticFiles with `Cache-Control: no-cache` — etag revalidation on every
@@ -19,13 +27,6 @@ class RevalidatingStaticFiles(StaticFiles):
         resp.headers["Cache-Control"] = "no-cache"
         return resp
 
-from . import logs, plan_guard, reqlog, settings
-from .captcha import captcha_manager
-from .claim import claim_round
-from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
-from .quota import monitor
-from .routes import admin_api, gateway, pages
-from .version_tracker import version_tracker
 
 # 修正 Windows 中文控制台可能出现的乱码
 for _stream in (sys.stdout, sys.stderr):
