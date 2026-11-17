@@ -281,6 +281,53 @@ async def test_plan_without_end_date_not_killed(gateway_client, fresh_app):
     assert after.quota_verified_at is None
 
 
+_JWT_PLAN_COOLING = "plancool.payload.signature"
+_JWT_PLAN_DISABLED = "plandis0.payload.signature"
+
+
+async def test_expired_plan_keeps_active_cooling(gateway_client, fresh_app):
+    """冷却期内命中确认链 → 保留 COOLING（EXHAUSTED 的 is_selectable 恒 False，
+    降级等于把仍在指数退避的号永久踢出池子）。"""
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_PLAN_COOLING, name="a-plan-cooling")
+    now = time.time()
+    acc.plans = [{"plan_id": "old-plan", "ends_at": now - 7200}]
+    acc.plan = acc.plans[0]
+    acc.quota = {"GLM-5.3": {"remaining": 100, "expires_at": now - 7200}}
+    acc.status = Status.COOLING
+    acc.cooling_until = now + 600
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_PLAN_COOLING, "billing_empty")
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.COOLING
+    assert after.is_cooling() is True
+    assert "套餐已到期" in (after.last_error or "")
+
+
+async def test_expired_plan_keeps_disabled(gateway_client, fresh_app):
+    """风控/人工禁用：确认链只留痕，绝不改状态（否则禁用号会被额度数字绕过）。"""
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_PLAN_DISABLED, name="a-plan-disabled")
+    now = time.time()
+    acc.plans = [{"plan_id": "old-plan", "ends_at": now - 7200}]
+    acc.plan = acc.plans[0]
+    acc.quota = {"GLM-5.3": {"remaining": 100, "expires_at": now - 7200}}
+    acc.status = Status.DISABLED
+    acc.last_error = "风控禁用"
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_PLAN_DISABLED, "billing_empty")
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.DISABLED
+    assert after.last_error == "风控禁用"  # 不被确认链的文案覆盖
+    assert after.is_selectable() is False
+
+
 _JWT_TRIAL = "trial001.payload.signature"
 
 async def test_new_account_trial_served_end_to_end(gateway_client, fresh_app):

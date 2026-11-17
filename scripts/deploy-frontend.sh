@@ -17,9 +17,17 @@ HOST=tebi
 SRC="$(cd "$(dirname "$0")/.." && pwd)/frontend"
 DST=/data/zcode-hub/frontend
 TS=$(date +%Y%m%d_%H%M%S)
-TMP="/tmp/zcode-hub-fe-$TS.tgz"
+TMP="/tmp/zcode-hub-fe-$TS-$$.tgz"  # $$ 只在本机展开并内插进两条 ssh——并发发版不撞名
 
 [ -d "$SRC" ] || { echo "✗ 找不到 $SRC"; exit 1; }
+
+# 预检：HTML 里的 ?v= 必须与 frontend/version 一致。否则 CF/浏览器继续用旧
+# CSS/JS，线上会复现「HTML 新 + JS 旧」（staggerCards is not defined 那类故障）。
+VER="$(cat "$SRC/version" 2>/dev/null || true)"
+if [ -n "$VER" ] && ! grep -q "?v=$VER" "$SRC/admin/login.html"; then
+  echo "✗ frontend/version=$VER 但 HTML 的 ?v= 未刷新——先跑 deploy_frontend.py（自动 bump+刷新）"
+  exit 1
+fi
 
 echo "→ 打包同步 frontend/ → $HOST:${DST}（回滚: ${DST}.old 换回）"
 tar czf - --exclude='.DS_Store' -C "$(dirname "$SRC")" frontend \
@@ -32,11 +40,11 @@ ssh "$JUMP" "ssh $HOST \"
   tar xzf $TMP -C $DST.new --strip-components=1
   rm -rf $DST.old
   mv $DST $DST.old
-  mv $DST.new $DST
+  mv $DST.new $DST || { mv $DST.old $DST; echo '✗ 换目录失败，已按 .old 回滚' >&2; exit 1; }
   rm -f $TMP
 \""
 
-echo "→ 冒烟（源站直连 127.0.0.1 绕开 tebi 的 http_proxy 劫持）"
-ssh "$JUMP" "ssh $HOST 'echo 版本=\$(cat $DST/version); curl -s --noproxy 127.0.0.1 -o /dev/null -w \"accounts.html HTTP %{http_code}\\n\" http://127.0.0.1:8790/admin/accounts.html'"
+echo "→ 冒烟（源站直连 127.0.0.1 绕开 tebi 的 http_proxy 劫持；-f 让非 2xx 直接判失败）"
+ssh "$JUMP" "ssh $HOST 'echo 版本=\$(cat $DST/version); curl -sf --noproxy 127.0.0.1 -o /dev/null -w \"accounts.html HTTP %{http_code}\\n\" http://127.0.0.1:8790/admin/accounts.html'"
 
 echo "✓ frontend → $HOST:${DST}（静态文件从磁盘热读，无需重启；回滚: ${DST}.old）"
