@@ -442,8 +442,25 @@ class CaptchaManager:
                 if attempt > 1:
                     logs.ok("captcha", f"求解成功（第 {attempt} 次尝试，出口={tag}）")
                 return _Token(param, region, tag)
-            self._last_error = last_err
+            # _run_solver 无异常返回 None 时，_last_error 已被求解器内部填好
+            # （如 slidex 归因 TRACELESS:DEGRADED）；只在异常路径用 last_err
+            # 覆盖，否则环境归因会被 None 冲掉、下面的止损永远不命中。
+            env_error = self._last_error
+            self._last_error = last_err or env_error
             logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果，重试…")
+            # 环境级失败快速止损（2.7.60 实弹定案）：DEGRADED = 阿里云对
+            # headless 无痕的判定收紧（2026-11-18 深夜对照实验：TP 出口与
+            # 直连 CN 同窗全灭，同形态「假成功回调降级 param + popup 不出」
+            # ——与出口 IP 无关）。换 context / 换求解进程都无法改变环境
+            # 判定，4 连重试 × 240s 预算纯白烧（每号 16 分钟）+ 反复暴露
+            # 求解行为指纹。归因为 DEGRADED 时直接放弃本轮后续重试。
+            if "DEGRADED" in (self._last_error or ""):
+                logs.warn(
+                    "captcha",
+                    f"求解归因 DEGRADED（headless 判定收紧，环境级失败）——止损，"
+                    f"不再重试（出口={tag}）",
+                )
+                break
 
         logs.warn("captcha", f"求解失败: {last_err or '多次重试无结果'}")
         return None

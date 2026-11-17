@@ -174,6 +174,49 @@ def test_slidex_fail_line_feeds_last_error(monkeypatch):
     _aio.run(main())
 
 
+def test_degraded_stops_retry_loop(monkeypatch):
+    """2.7.60 环境级失败快速止损：SLIDEX_FAIL=TRACELESS:DEGRADED（阿里云对
+    headless 判定收紧，2026-11-18 深夜实弹：TP 出口与直连 CN 同窗全灭）时
+    重试无意义——必须只跑 1 次求解进程即止损，不再 4 连重试白烧 16 分钟。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+    exec_calls: list = []
+
+    class _Proc:
+        pid = 12348
+
+        async def communicate(self):
+            return b"SLIDEX_FAIL=TRACELESS:DEGRADED", b""
+
+        def kill(self):
+            pass
+
+    async def fake_comm(self, proc):
+        return await proc.communicate()
+
+    async def fake_cleanup(self, proc):
+        pass
+
+    async def fake_exec(*a, **kw):
+        exec_calls.append(1)
+        return _Proc()
+
+    monkeypatch.setattr(CaptchaManager, "_communicate_solver", fake_comm)
+    monkeypatch.setattr(CaptchaManager, "_cleanup_solver", fake_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def main():
+        param = await mgr._solve_one(
+            {"sceneId": "s", "region": "cn", "prefix": "p"}, "direct", None
+        )
+        assert param is None
+        assert len(exec_calls) == 1  # 止损：1 次即停（非 CAPTCHA_SOLVE_RETRIES 次）
+        assert "DEGRADED" in (mgr._last_error or "")
+
+    _aio.run(main())
+
+
 def test_slidex_stderr_surfaces_on_failure(monkeypatch):
     """2.7.58 诊断透传：失败时 runner stderr 尾部（fatal/归因）必须进日志。
 
