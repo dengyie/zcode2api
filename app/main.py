@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import logs, reqlog, settings
+from . import logs, plan_guard, reqlog, settings
 from .captcha import captcha_manager
 from .claim import claim_round
 from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
@@ -117,6 +117,7 @@ async def lifespan(app: FastAPI):
     installed = _backfill_install_ids()
     if installed:
         logs.ok("install", f"存量账号补配安装身份 ×{installed}")
+    plan_guard.warm()  # 冷却表回读+过期行清理前移到启动，调度路径不承担磁盘 I/O
     monitor.start()
     captcha_manager.start()   # 验证码预解池后台补充
     claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）

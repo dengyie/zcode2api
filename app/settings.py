@@ -316,7 +316,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.56"  # 2.7.55 plan_guard 冷却 SQLite 持久化 + select 模型感知排富；2.7.56 plan_guard.db 磁盘卫生（启动清理过期行 + cooling 到期同步删盘）
+APP_VERSION = "2.7.57"  # 2.7.56 plan_guard.db 磁盘卫生 + supervisor stopwaitsecs=300；2.7.57 plan_guard 并发契约（note/到期摘除锁内原子+重检查）+ warm() 启动预热
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

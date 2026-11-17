@@ -21,7 +21,16 @@ limit 时同号 Flash 窗口仍有 2.9 亿）——点名单一模型的请求�
 9 次重启（含 2 次 SIGKILL），每次重启清零后第一个 GLM-5.3 请求就把全池
 rem=0 的号挨个撞一遍 1005（reqlog 实锤 35 次打点、冷却拦截 0 次）。改落
 SQLite（data/plan_guard.db，与 accounts.db 同目录）：打点/清除即写盘，启动
-时回读（过期条目顺带清扫），重启不再失忆。
+时回读（过期条目顺带清扫），重启不再失忆。2.7.56 补磁盘卫生（启动清理
+过期行 + cooling 到期同步删盘），2.7.57 补并发契约与预热入口。
+
+线程契约（2.7.57）：全部公开函数**只在事件循环线程同步调用**（现状：
+gateway dispatch / quota 后台任务 / admin 路由均在同一 asyncio 线程）；
+运行期读改用 threading.Lock 串行化（note 与 cooling 到期摘除的交错靠
+到期重检查防误删新鲜冷却），移入线程池前必须先过一遍锁语义。
+预热：main.lifespan 调 warm() 显式回读+清理，把首次回读与清理的磁盘
+I/O 挪出请求调度路径；cooling() 的惰性触发保留为兜底（tests 不跑
+lifespan 时依赖它）。
 """
 
 from __future__ import annotations
@@ -63,7 +72,8 @@ def _connect() -> sqlite3.Connection:
 
 
 def _ensure_loaded() -> None:
-    """启动后首次访问时回读盘上未过期条目（一次性）。
+    """启动后首次访问时回读盘上未过期条目（一次性，惰性：随首次 cooling()
+    触发，非进程启动即刻——warm() 显式预热走同一实现）。
 
     顺带把盘上已过期条目物理清除（2.7.56）：cooling() 到期只弹内存，
     DB 行只进不出会无界累积（每次 (账号，模型) 耗尽事件都留一行，进程
@@ -94,6 +104,16 @@ def _ensure_loaded() -> None:
         _loaded = True
 
 
+def warm() -> None:
+    """lifespan 启动预热：显式触发回读+清理，磁盘 I/O 挪出请求调度路径。
+
+    2.7.56 的清理原为惰性触发（首次 cooling()），首次请求的候选循环可能
+    撞上跨进程写锁 busy_timeout（最长 5s）；lifespan 阶段做掉，调度路径
+    只剩内存判定。失败静默（盘不可用时惰性兜底仍在，语义不劣化）。
+    """
+    _ensure_loaded()
+
+
 def _persist(key: str, until: float | None) -> None:
     """单条写盘（note=upsert / clear=delete）；盘失败不影响内存态。"""
     try:
@@ -116,29 +136,43 @@ def _key(account_id: str, model: str) -> str:
 
 
 def note(account_id: str, model: str, until: float) -> None:
-    """记录（账号，模型）额度耗尽冷却的解禁时刻。"""
+    """记录（账号，模型）额度耗尽冷却的解禁时刻。
+
+    内存与盘写同锁串行（2.7.57）：与 cooling() 到期摘除互斥，杜绝
+    「摘除删盘落在重新打点之后」把新鲜冷却洗掉的单侧失忆。表只有
+    主键点查/点写（µs 级），持锁写盘不构成实际竞争面。
+    """
     if not account_id or not model:
         return
     k = _key(account_id, model)
-    _plan_model_exhausted[k] = until
-    _persist(k, until)
+    with _lock:
+        _plan_model_exhausted[k] = until
+        _persist(k, until)
 
 
 def cooling(account_id: str, model: str, now: float | None = None) -> bool:
-    """该（账号，模型）组合是否仍在冷却中；到期自动摘除（自然重探）。"""
+    """该（账号，模型）组合是否仍在冷却中；到期自动摘除（自然重探）。
+
+    到期分支持锁重检查（2.7.57）：锁内二次确认 until 未被 note() 覆盖
+    才摘除——内存与盘在同一临界区内一起变，不会出现单侧失忆。
+    """
     if not account_id or not model:
         return False
     _ensure_loaded()
-    until = _plan_model_exhausted.get(_key(account_id, model), 0)
-    if not until:
+    k = _key(account_id, model)
+    with _lock:
+        until = _plan_model_exhausted.get(k, 0)
+        if not until:
+            return False
+        if (now or time.time()) < until:
+            return True
+        if _plan_model_exhausted.get(k, 0) != until:
+            return True  # 读后已被重新打点（更晚解禁），继续冷却
+        _plan_model_exhausted.pop(k, None)
+        # 2.7.56：到期摘除同步删盘，否则 DB 行只进不出（同键下次 note 会
+        # REPLACE，但废弃键永不清理）；锁内与内存摘除原子（2.7.57）。
+        _persist(k, None)
         return False
-    if (now or time.time()) >= until:
-        _plan_model_exhausted.pop(_key(account_id, model), None)
-        # 2.7.56：到期摘除同步删盘，否则 DB 行只进不出（启动清理兜底前的
-        # 运行期卫生——同键下次 note 会 REPLACE，但废弃键永不清理）。
-        _persist(_key(account_id, model), None)
-        return False
-    return True
 
 
 def clear_model(account_id: str, model: str) -> None:
