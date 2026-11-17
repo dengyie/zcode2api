@@ -64,6 +64,58 @@ def _opener(proxy: str | None):
         urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
 
 
+# 阿里云验证码 SDK 源（solver 经出口拉取的第一个大资源）——claim 求解链的
+# 隐藏依赖。2026-11-17 1117 全灭复盘：TP 节点对它路由劣化（实测 9.9~31.9s/
+# 资源，直连 0.15s）而 zcode 探针照常放行 → SDK 引导/traceless 后端签名
+# 超时 → len-76 无 securityToken 降级 stub（2.7.60 拒收）+ popup 渲染不出。
+ALICDN_PROBE_URL = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"
+
+
+def _alicdn_fetch(proxy_url: str, timeout: float) -> tuple[int, str]:
+    """同步抓取（asyncio.to_thread 调用）：经代理取 AliyunCaptcha.js 前 64KB。
+
+    只读 64KB：探测的是 TLS+路由 TTFB 与吞吐头部，不必整文件（JS ~1MB，
+    健康循环每轮 × 全账号全量拉会白吃出口流量）。"""
+    try:
+        req = urllib.request.Request(
+            ALICDN_PROBE_URL, method="GET",
+            headers={"User-Agent": "ZCode/3.17.2"})
+        with _opener(proxy_url).open(req, timeout=timeout) as r:
+            r.read(65536)
+            return r.status, "ok"
+    except Exception as exc:  # noqa: BLE001 - 路由质量探针：任何异常 = 不合格
+        return 0, f"{type(exc).__name__}: {exc}"[:120]
+
+
+async def probe_alicdn(proxy_url: str | None, *,
+                       fetch_impl=None) -> tuple[bool, float, str]:
+    """经代理 URL 探阿里云验证码 CDN 路由质量。返回 (ok, elapsed_s, detail)。
+
+    ok = HTTP 200 且耗时 ≤ EGRESS_ALICDN_MAX_SECONDS；proxy_url 为空（直连
+    形态）恒过——直连实测 0.15s 量级，不占探针预算。路由差 ≠ 信誉烂：
+    调用方拒收候选即可，绝不能拿它 tp_ban（烧池子）。
+
+    fetch_impl 为 DI 缝（测试注入假 fetch），签名 (proxy_url, timeout) ->
+    (status, detail)。"""
+    if not proxy_url:
+        return True, 0.0, "direct-no-probe"
+    fetch = fetch_impl or _alicdn_fetch
+    timeout = float(settings.EGRESS_ALICDN_PROBE_TIMEOUT)
+
+    def _run():
+        t0 = time.monotonic()
+        st, detail = fetch(proxy_url, timeout)
+        return st, time.monotonic() - t0, detail
+
+    st, elapsed, detail = await asyncio.to_thread(_run)
+    if st != 200:
+        return False, elapsed, detail
+    max_s = float(settings.EGRESS_ALICDN_MAX_SECONDS)
+    if elapsed > max_s:
+        return False, elapsed, f"slow {elapsed:.1f}s > {max_s:g}s"
+    return True, elapsed, detail
+
+
 def gateway_url_for(account) -> str:
     """per-account 网关代理 URL（确定性构造；rebalance 不改变它）。"""
     return egress.tetherpool_gateway_url(account)
@@ -232,6 +284,15 @@ class TetherPoolEgress:
                 continue
             kind = _edge_kind(raw)
             if kind == "JSON-APP":
+                # alicdn 维度验收（2026-11-18 1117 全灭复盘）：zcode 探针放行
+                # ≠ 验证码 SDK 路由可用——alicdn 不合格的候选直接换下一个，
+                # 不 ban（路由差≠信誉烂）。exclude 已含本候选（防 3 轮打转）。
+                ok_cd, elapsed, detail = await probe_alicdn(probe_url)
+                if not ok_cd:
+                    logs.warn("egress_pool",
+                              f"{account.name} 新节点 {node} zcode 探针放行但 alicdn "
+                              f"路由不合格（{detail}）——换下一个候选（不 ban）")
+                    continue
                 account.egress_node = node
                 store.update_account(account)
                 # 换绑成功即清探针失败计数：旧节点累积的 streak 不能背到
@@ -259,10 +320,12 @@ class TetherPoolEgress:
         if d and d.get("node_name"):
             node = d.get("node_name")
             st, raw = await self._probe_via(account, probe_url, jwt)
-            if st == 0 or _edge_kind(raw) != "JSON-APP":
+            ok_cd, _elapsed, cd_detail = await probe_alicdn(probe_url)
+            if st == 0 or _edge_kind(raw) != "JSON-APP" or not ok_cd:
                 logs.warn("egress_pool",
                           f"{account.name} 3 轮均败，回绑候选 {node} 探针仍不过"
-                          f"（TP 绑定停留在此，人工介入）")
+                          f"（zcode={_edge_kind(raw)} alicdn={cd_detail}；"
+                          f"TP 绑定停留在此，人工介入）")
                 account.egress_node = node  # hub 记录对齐 TP 实际绑定
                 store.update_account(account)
                 return False
@@ -330,10 +393,15 @@ class TetherPoolEgress:
     # ── 健康循环 ───────────────────────────────────────────────────────────
     async def health_once(self, account) -> bool:
         """轻探针：Plan 通道经该账号网关 URL（与 rebalance 同一零 strike 口径，
-        3012 JSON = 节点通、边缘放行）。连接级失败/边缘 HTML = 不健康。"""
-        st, raw = await self._probe_via(
-            account, egress.account_proxy(account), account.jwt_token or "")
-        return st != 0 and _edge_kind(raw) == "JSON-APP"
+        3012 JSON = 节点通、边缘放行）。连接级失败/边缘 HTML/alicdn 路由超标
+        （2026-11-18 新增维度，喂 _check_account 的 streak → rebalance）=
+        不健康。"""
+        proxy = egress.account_proxy(account)
+        st, raw = await self._probe_via(account, proxy, account.jwt_token or "")
+        if st == 0 or _edge_kind(raw) != "JSON-APP":
+            return False
+        ok_cd, _elapsed, _detail = await probe_alicdn(proxy)
+        return ok_cd
 
     async def _check_account(self, account) -> None:
         """单账号健康检查（每轮并发派发）：绑定引导 → 探针 → rebalance。

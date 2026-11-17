@@ -626,10 +626,14 @@ async def _rebalance_for_claim(account: Account, reason: str) -> bool:
     try:
         # TP ban reason 是闭合枚举（edge_405_html | unusual_activity_3012 |
         # rate_limited_429_burst，见 TetherPool API 需求 §ban），自由文本 422。
-        # claim 场景即风控拒（403 unusual activity / 求解 F001 / 3007），归
-        # unusual_activity_3012；细粒度归因放 evidence（rebalance 自带）。
+        # ⚠️ unusual_activity_3012 被 TP 服务端强制 quarantine_hours=0（只记录
+        # 不隔离）——2026-11-17 实弹实证：当晚 8 条「ban 已隔离」日志实际全部
+        # 未隔离，烂节点持续被 force_rebalance 分回，claim 换绑死循环的帮凶。
+        # captcha 信誉失败（403 unusual activity / 求解 F001 / 3007）是 IP 级
+        # 封禁信号，必须传唯一真隔离的 edge_405_html；细粒度归因放 evidence
+        # （rebalance 自带）。
         ok = await egress_pool.rebalance(
-            account, "unusual_activity_3012", ban=True
+            account, "edge_405_html", ban=True
         )
         if not ok or account.egress_node == old_node:
             logs.warn("claim", f"账号 {account.name} 换绑未生效（{old_node or '?'}），放弃本轮重试")
@@ -677,7 +681,7 @@ async def claim_with_egress_retry(account: Account, plan_id: str | None = None) 
                 logs.warn("claim", f"账号 {account.name} 换绑调度异常: "
                                    f"{type(rb_err).__name__}: {str(rb_err)[:120]}"
                                    f"——上抛原始 claim 错误")
-                raise err  # 显式上抛原始 ClaimError/CaptchaSolveError，非换绑异常
+                raise err from err  # 显式上抛原始 ClaimError/CaptchaSolveError，非换绑异常
             if not rebalanced:
                 raise
             await asyncio.sleep(_EGRESS_RETRY_DELAY_S)

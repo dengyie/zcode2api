@@ -248,6 +248,15 @@ TP_HEALTH_INTERVAL = max(_int("ZCODE_TP_HEALTH_INTERVAL", 300), 30)  # 下限防
 # 链路秒级抖动各连坐 4/3 个账号齐换绑 = 无谓出口 IP churn）。单轮失败只
 # 留痕，连续 N 轮（跨 ≥N 个间隔）仍失败才判定节点真死。
 TP_HEALTH_FAIL_THRESHOLD = max(_int("ZCODE_TP_HEALTH_FAIL_THRESHOLD", 2), 1)
+# 阿里云验证码 CDN 路由验收（2026-11-18 1117 全灭复盘新增维度）：TP 验收/
+# 健康探针此前只测 zcode.z.ai——teleapi 节点对 o.alicdn.com 路由劣化（实测
+# 9.9~31.9s/资源，直连 0.15s）照样「JSON-APP 放行」，验证码 SDK 引导/
+# traceless 后端签名全部超时 → len-76 无 securityToken 降级 stub（2.7.60
+# 拒收）→ popup 兜底渲染不出 → claim 求解全灭。换绑候选与健康判定新增
+# alicdn 维度：超阈值/失败 = 拒收该候选（不 ban——路由差≠信誉烂，ban 会
+# 白白烧池子）。阈值取实测可用节点（1.7s）与最慢可用档（3.5~5s）之间。
+EGRESS_ALICDN_MAX_SECONDS = _float("ZCODE_EGRESS_ALICDN_MAX", 5.0)
+EGRESS_ALICDN_PROBE_TIMEOUT = _int("ZCODE_EGRESS_ALICDN_PROBE_TIMEOUT", 12)
 # claim IP 信誉驱动重试（2026-11-17 深度迭代收编）：信誉型失败（403 风控文案/
 # 3007/验证码求解失败）换绑重试上限与间隔。间隔给 TP ban/新 allocation 生效
 # 留缓冲；求解单次可达分钟级，上限过大会让 claim 轮拖长（见 2.7.50 review）。
@@ -316,7 +325,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.61"  # 2.7.60 求解器严格 param 校验；2.7.61 DEGRADED 环境级失败快速止损（headless 判定收紧窗口不再 4 连重试白烧 16 分钟/号）
+APP_VERSION = "2.7.62"  # 2.7.61 DEGRADED 快速止损；2.7.62 出口验收/健康探针新增 alicdn 路由维度（烂路由节点不再被分配）+ claim 信誉 ban 改 edge_405_html 真隔离 + solver SDK 预算 45s
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。
