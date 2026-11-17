@@ -31,3 +31,16 @@ async function renderAdminHeader(){
       </div>
     </header>`;
 }
+
+/* ── Motion helpers（awesome-ui 动效：staggered 入场 + 数字弹入）── */
+function staggerCards(root){
+  (root||document).querySelectorAll('.stat-cell,.settings-card').forEach((el,i)=>el.style.setProperty('--ri',i));
+}
+function popStatNumbers(root){
+  (root||document).querySelectorAll('.stat-num').forEach((el,i)=>{
+    el.style.setProperty('--ri',i);
+    el.classList.remove('num-pop');
+    void el.offsetWidth;
+    el.classList.add('num-pop');
+  });
+}

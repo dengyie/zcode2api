@@ -272,6 +272,8 @@ function renderStats(s){
   });
   set('s-quota',fmtNum(totalRem));
   document.getElementById('s-quota').title='日窗口余额 + 已生效一次性活动赠送（赠送池按授权量计入，上游不提供实际剩余）';
+  staggerCards();
+  popStatNumbers();
 }
 
 function renderFilters(){
@@ -292,6 +294,7 @@ function renderList(){
   el.innerHTML=`<div class="acct-scroll"><div class="acct-table">
     <div class="acct-head"><span>凭证 / 账号</span><span>可用状态</span><span>最近请求</span><span>历史用量</span><span>额度信息</span><span class="th-actions">操作</span></div>
     ${items.map(rowHtml).join('')}
+    el.querySelectorAll('.acct-row').forEach((r,idx)=>r.style.setProperty('--ri',idx));
   </div></div>`;
 }
 

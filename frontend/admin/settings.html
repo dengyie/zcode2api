@@ -238,6 +238,8 @@ async function saveSettings(){
     showToast('已保存','success');
   }catch(e){showToast('保存失败: '+e.message,'error');}
 }
+
+window.addEventListener('DOMContentLoaded',()=>staggerCards());
 </script>
 </body>
 </html>

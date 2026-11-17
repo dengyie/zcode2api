@@ -19,11 +19,23 @@
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--font-sans);background:var(--bg);color:var(--ink);line-height:1.6;-webkit-font-smoothing:antialiased;min-height:100vh;position:relative}
+/* 素材库级背景：网格纹理 + 双光斑漂移 + noise 颗粒，三层固定层合成 */
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:
-    radial-gradient(900px 380px at 22% -8%, rgba(232,163,61,.075), transparent 65%),
-    radial-gradient(720px 300px at 88% -6%, rgba(109,168,232,.05), transparent 60%),
-    linear-gradient(180deg,var(--bg-2) 0%,var(--bg) 320px);
+    radial-gradient(1000px 460px at 24% -10%, rgba(232,163,61,.09), transparent 62%),
+    radial-gradient(760px 340px at 86% -8%, rgba(109,168,232,.06), transparent 60%),
+    linear-gradient(180deg,var(--bg-2) 0%,var(--bg) 360px);
+  animation:bgDrift 26s ease-in-out infinite alternate}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.5;
+  background-image:
+    linear-gradient(rgba(255,255,255,.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+  background-size:44px 44px;
+  -webkit-mask-image:radial-gradient(1200px 600px at 50% 0%, #000 30%, transparent 78%);
+          mask-image:radial-gradient(1200px 600px at 50% 0%, #000 30%, transparent 78%)}
+@keyframes bgDrift{
+  0%{background-position:0 0, 0 0, 0 0}
+  100%{background-position:60px 26px, -48px 18px, 0 0}
 }
 body>*{position:relative;z-index:1}
 a{color:inherit;text-decoration:none}
@@ -36,13 +48,26 @@ button{cursor:pointer}
 ::-webkit-scrollbar-track{background:transparent}
 code{font-family:var(--mono);font-size:.92em;background:var(--panel-2);border:1px solid var(--hairline);border-radius:4px;padding:1px 5px;color:var(--amber)}
 
+/* ── Motion（入场 staggered / 数字弹入 / 按钮扫光 / 页面淡入）── */
+@keyframes riseIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes popNum{0%{opacity:0;transform:translateY(8px) scale(.92)}60%{opacity:1;transform:translateY(-2px) scale(1.03)}100%{opacity:1;transform:none}}
+.rise-in{animation:riseIn .55s cubic-bezier(.16,1,.3,1) both;animation-delay:calc(var(--ri,0)*45ms)}
+.page-fade{animation:fadeIn .35s ease both}
+.stat-num.num-pop{animation:popNum .5s cubic-bezier(.34,1.56,.64,1) both;animation-delay:calc(var(--ri,0)*45ms + 120ms)}
+.page-action-btn-primary{position:relative;overflow:hidden}
+.page-action-btn-primary::after{content:"";position:absolute;top:0;left:-60%;width:36%;height:100%;transform:skewX(-22deg);
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);transition:left .45s ease}
+.page-action-btn-primary:hover::after{left:120%}
+.acct-row,.stat-cell{will-change:transform}
+
 /* ── Login ── */
 .login-body{min-height:100vh;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
 .login-body::before{background:
   radial-gradient(820px 420px at 50% -12%, rgba(232,163,61,.11), transparent 62%),
   radial-gradient(520px 320px at 12% 108%, rgba(109,168,232,.06), transparent 58%),
   linear-gradient(180deg,var(--bg-2),var(--bg) 340px)}
-.login-shell{position:relative;z-index:1;width:min(420px,92vw);padding:24px}
+.login-shell{position:relative;z-index:1;width:min(420px,92vw);padding:24px;animation:riseIn .6s cubic-bezier(.16,1,.3,1) both}
 .login-card{background:linear-gradient(180deg,rgba(32,34,41,.92),rgba(26,28,33,.96));border:1px solid var(--hairline);border-radius:18px;padding:28px;box-shadow:var(--shadow-lg), inset 0 1px 0 rgba(255,255,255,.04);transition:border-color .25s,box-shadow .25s;position:relative;overflow:hidden}
 .login-card::before{content:"";position:absolute;inset:0 0 auto;height:2px;background:linear-gradient(90deg,transparent,rgba(232,163,61,.7),transparent);opacity:.85}
 .login-card:hover{border-color:#3a3e48;box-shadow:var(--shadow-lg), 0 0 40px -18px rgba(232,163,61,.3)}
@@ -122,7 +147,7 @@ select.input option{background:var(--panel);color:var(--ink)}
 
 /* ── Stat cards（accent 顶线 + hover glow + 大数字）── */
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:22px}
-.stat-cell{position:relative;min-height:96px;padding:16px 18px;border-radius:14px;background:var(--panel);border:1px solid var(--hairline-soft);display:flex;flex-direction:column;gap:12px;overflow:hidden;transition:border-color .2s,box-shadow .2s,transform .2s}
+.stat-cell{position:relative;min-height:96px;animation:riseIn .55s cubic-bezier(.16,1,.3,1) both;animation-delay:calc(var(--ri,0)*70ms);padding:16px 18px;border-radius:14px;background:var(--panel);border:1px solid var(--hairline-soft);display:flex;flex-direction:column;gap:12px;overflow:hidden;transition:border-color .2s,box-shadow .2s,transform .2s}
 .stat-cell::before{content:"";position:absolute;inset:0 0 auto;height:2px;background:linear-gradient(90deg,transparent,rgba(232,163,61,.5),transparent);opacity:.6;transition:opacity .2s}
 .stat-cell:hover{border-color:#383c46;transform:translateY(-2px);box-shadow:var(--shadow-md)}
 .stat-cell:hover::before{opacity:1}
@@ -138,7 +163,7 @@ select.input option{background:var(--panel);color:var(--ink)}
 .acct-head,.acct-row{display:grid;grid-template-columns:minmax(180px,1.15fr) 150px 150px 150px minmax(240px,1.5fr) 176px;gap:14px;align-items:center}
 .acct-head{padding:0 18px;font-size:11px;font-weight:600;color:var(--ink-mute);letter-spacing:.03em}
 .acct-head .th-actions{text-align:right}
-.acct-row{border:1px solid var(--hairline-soft);border-radius:14px;background:var(--panel);padding:14px 18px;transition:border-color .18s,box-shadow .18s,transform .18s;box-shadow:var(--shadow-sm)}
+.acct-row{border:1px solid var(--hairline-soft);border-radius:14px;background:var(--panel);padding:14px 18px;transition:border-color .18s,box-shadow .18s,transform .18s;box-shadow:var(--shadow-sm);animation:riseIn .5s cubic-bezier(.16,1,.3,1) both;animation-delay:calc(var(--ri,0)*50ms)}
 .acct-row:hover{border-color:#3d414d;transform:translateY(-1px);box-shadow:var(--shadow-md)}
 .acct-row.is-disabled{opacity:.55}
 .notch{flex:none;width:8px;height:8px;border-radius:2.5px}
@@ -266,7 +291,7 @@ select.input option{background:var(--panel);color:var(--ink)}
 .dialog-btn-danger:hover{background:rgba(224,82,82,.2)}
 
 /* Settings card */
-.settings-card{background:var(--panel);border:1px solid var(--hairline-soft);border-radius:14px;padding:24px;margin-bottom:16px;max-width:640px;box-shadow:var(--shadow-sm);transition:border-color .2s}
+.settings-card{background:var(--panel);border:1px solid var(--hairline-soft);border-radius:14px;padding:24px;margin-bottom:16px;max-width:640px;box-shadow:var(--shadow-sm);transition:border-color .2s;animation:riseIn .55s cubic-bezier(.16,1,.3,1) both;animation-delay:calc(var(--ri,0)*70ms)}
 .settings-card:hover{border-color:#33363f}
 .settings-row{display:grid;gap:6px;margin-bottom:18px}
 .settings-row:last-child{margin-bottom:0}

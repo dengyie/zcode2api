@@ -166,6 +166,8 @@ function renderStats(list){
   }
   $('s-calls-spark').innerHTML=spark(buckets,'var(--amber)');
   $('live-count').textContent=total;
+  staggerCards();
+  popStatNumbers();
 }
 
 function statusCell(e){
