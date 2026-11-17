@@ -82,16 +82,28 @@ def window_expired(window: dict, now: float) -> bool:
 
 
 def _plan_bonus_active(plan: dict, now: float) -> bool:
-    """plan 是否带已生效的一次性赠送授权（与 quota._bonus_active 同判定）。
+    """plan 是否带已生效的一次性赠送授权（与前端「活动赠送」行同判定）。
 
     models 不 import quota（quota 反向依赖 models 会循环），故此处留一份
     同语义实现；两侧判定字段来自同一上游结构（entitlements one_time）。
+
+    套餐自身到期后不再有赠送（2.7.64 线上实证：trial-mvxmwyrg 的
+    zcode-v3-start-plan-1116 于 11-17 17:00 到期，但 entitlement 不带
+    ends_at → 旧判定永久 has_bonus=True，账号永不判 EXHAUSTED、池闸门
+    也永不 hold；前端早已按「套餐有效期」兜底，这里补齐同口径）。
     """
-    for e in (plan or {}).get("entitlements") or []:
-        if e.get("period") != "one_time":
+    if not isinstance(plan, dict):
+        return False
+    plan_ends = expires_epoch(plan.get("ends_at") or plan.get("expires_at"))
+    if plan_ends is not None and now > plan_ends:
+        return False
+    for e in plan.get("entitlements") or []:
+        if not isinstance(e, dict) or e.get("period") != "one_time":
             continue
         eff = expires_epoch(e.get("effective_at"))
         ends = expires_epoch(e.get("ends_at") or e.get("expires_at"))
+        if ends is None:
+            ends = plan_ends  # 授权不带结束时间：随套餐到期
         if eff and eff <= now and (ends is None or now <= ends):
             return True
     return False

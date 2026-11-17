@@ -209,8 +209,79 @@ async def test_empty_billing_plans_do_not_wipe_local_plan_cache(gateway_client, 
 
 
 
-_JWT_TRIAL = "trial001.payload.signature"
+_JWT_PLAN_DEAD = "planexp1.payload.signature"
+_JWT_PLAN_LIVE_CACHE = "planlive.payload.signature"
+_JWT_PLAN_NO_END = "plannoend.payload.signature"
 
+
+async def test_expired_plan_with_empty_ledger_marks_exhausted(gateway_client, fresh_app):
+    """上游成功回空账本 + 本地套餐已到期 + 缓存窗口全失效 → 确认无套餐（2.7.64）。
+
+    线上实证：trial-mvxmwyrg 的 zcode-v3-start-plan-1116 于 11-17 17:00 到期，
+    但 billing/current、balance 今天都返空；旧逻辑不覆盖本地缓存、不推进
+    quota_verified_at，账号带着 2.68 亿过期「剩余额度」一直 ACTIVE 可选，每轮
+    继续撞 1005。命中后必须判 EXHAUSTED 且快照保留给前端展示。
+    """
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_PLAN_DEAD, name="a-plan-dead")
+    now = time.time()
+    acc.plans = [{"plan_id": "zcode-v3-start-plan-1116", "ends_at": now - 7200}]
+    acc.plan = acc.plans[0]
+    acc.quota = {"GLM-5.3": {"remaining": 268_292_585, "expires_at": now - 7200}}
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_PLAN_DEAD, "billing_empty")
+
+    res = await quota.fetch_quota(acc)
+
+    assert "error" not in res
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.EXHAUSTED
+    assert "套餐已到期" in (after.last_error or "")
+    assert after.is_selectable() is False
+    assert after.quota_verified_at and after.quota_verified_at > now - 60
+    # 快照与套餐仍保留（前端要能显示「哪个套餐、何时过期」）
+    assert after.plans == acc.plans
+    assert after.quota["GLM-5.3"]["remaining"] == 268_292_585
+
+
+async def test_expired_plan_with_live_cached_window_not_killed(gateway_client, fresh_app):
+    """空账本 + 套餐过期，但本地缓存窗口仍可用 → 不得判死（防上游短暂空账本误杀）。"""
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_PLAN_LIVE_CACHE, name="a-plan-live-cache")
+    now = time.time()
+    acc.plans = [{"plan_id": "old-plan", "ends_at": now - 7200}]
+    acc.plan = acc.plans[0]
+    acc.quota = {"GLM-5.3": {"remaining": 1000, "expires_at": now + 3600}}
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_PLAN_LIVE_CACHE, "billing_empty")
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.ACTIVE
+    assert after.is_selectable() is True
+    assert after.quota_verified_at is None  # 空 balances 仍不算「实查确认」
+
+
+async def test_plan_without_end_date_not_killed(gateway_client, fresh_app):
+    """套餐不带 ends_at（永久/未知）→ 空账本不得判死。"""
+    _client, mock = gateway_client
+    acc = seed_account(fresh_app, _JWT_PLAN_NO_END, name="a-plan-no-end")
+    now = time.time()
+    acc.plans = [{"plan_id": "no-end"}]
+    acc.plan = acc.plans[0]
+    acc.quota = {"GLM-5.3": {"remaining": 100, "expires_at": now - 600}}
+    fresh_app.update_account(acc)
+    _bind(mock, _JWT_PLAN_NO_END, "billing_empty")
+
+    await quota.fetch_quota(acc)
+
+    after = fresh_app.list_accounts("zai")[0]
+    assert after.status == Status.ACTIVE
+    assert after.quota_verified_at is None
+
+
+_JWT_TRIAL = "trial001.payload.signature"
 
 async def test_new_account_trial_served_end_to_end(gateway_client, fresh_app):
     """新号端到端：billing 全空 → 仍被选中 → 真实请求成功 → 状态确认可用。

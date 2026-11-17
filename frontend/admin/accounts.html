@@ -262,7 +262,12 @@ function renderStats(s){
   const now=Date.now()/1000;
   let totalRem=0;
   allAccounts.forEach(a=>{
-    Object.values(a.quota||{}).forEach(w=>{totalRem+=Number(w.remaining)||0;});
+    Object.values(a.quota||{}).forEach(w=>{
+      // 已过期窗口不再计入「可用额度」（快照保留展示，但统计口径剔除）
+      const exp=Number(w.expires_at)||0;
+      if(exp&&exp<=now)return;
+      totalRem+=Number(w.remaining)||0;
+    });
     allEntitlements(a).forEach(e=>{
       const eff=Number(e.effective_at)||0;
       let ends=Number(e.ends_at||e.expires_at)||e._planEnds||0;
@@ -332,7 +337,12 @@ function statusCell(a){
     const planEnd=Math.max(0,...planList(a).map(pl=>Number(pl.ends_at)||Number(pl.expires_at)||0));
     if(planEnd){
       const days=Math.ceil((planEnd*1000-Date.now())/86400000);
-      sub=`<div class="cell-sub${days<=7?' warn-line':''}" title="当前套餐有效期">套餐至 ${fmtDate(planEnd)}</div>`;
+      if(days<0){
+        // 套餐已到期：不再显示成可用的「至 X」，避免误读为仍有额度
+        sub=`<div class="cell-sub warn-line" title="当前套餐已于 ${fmtDate(planEnd)} 到期，本地额度快照仅供追溯">套餐已于 ${fmtDate(planEnd)} 过期</div>`;
+      }else{
+        sub=`<div class="cell-sub${days<=7?' warn-line':''}" title="当前套餐有效期">套餐至 ${fmtDate(planEnd)}</div>`;
+      }
     }
   }
   const err=a.last_error?`<div class="cell-sub err-line" title="${esc(a.last_error)}">${esc(a.last_error.length>26?a.last_error.slice(0,26)+'…':a.last_error)}</div>`:'';
@@ -392,21 +402,24 @@ function rowHtml(a){
 function quotaCell(a){
   const q=a.quota||{};
   const keys=Object.keys(q);
+  const now=Date.now()/1000;
   let rows=keys.map(k=>{
     const w=q[k]||{};const rem=Number(w.remaining)||0,tot=Number(w.total)||0;
     const pct=tot>0?Math.max(0,Math.min(100,Math.round(rem/tot*100))):0;
     const color=rem<=0?'var(--ink-mute)':(pct<15?'var(--amber)':'var(--mint)');
     const exp=Number(w.expires_at)||0;
-    return `<div class="quota-row">
+    // 过期窗口：保留展示（便于追溯「额度去哪了」），但置灰并标「已过期」，
+    // 不再暗示仍可用（2.7.64：trial 号过期快照曾被读成 2.68 亿可用余额）
+    const isExpired=exp>0&&exp<=now;
+    return `<div class="quota-row${isExpired?' is-expired':''}">
       <span class="quota-row-name" title="${esc(k)}">${esc(shortModel(k))}</span>
       <span class="quota-row-track"><span class="quota-row-fill" style="width:${pct}%;background:${color}"></span></span>
-      <span class="quota-row-val"><span>${fmtNum(rem)} / ${fmtNum(tot)}</span>${exp?`<span class="quota-row-exp" title="本窗口额度到期时间">至 ${fmtDate(exp)}</span>`:''}</span>
+      <span class="quota-row-val"><span>${fmtNum(rem)} / ${fmtNum(tot)}</span>${exp?`<span class="quota-row-exp" title="${isExpired?'本窗口额度已于该时间到期，不再计入可用额度':'本窗口额度到期时间'}">${isExpired?'已过期 · ':''}至 ${fmtDate(exp)}</span>`:''}</span>
     </div>`;
   });
   // 活动额度（plan.entitlements）：
   // ① one_time 已生效 —— billing/balance 不体现这类一次性赠送，单独渲染「活动赠送」行
   // ② 待生效（effective_at 在未来）—— 斜纹流动条，过点自动转正
-  const now=Date.now()/1000;
   const ents=allEntitlements(a);
   ents.filter(e=>{
     const eff=Number(e.effective_at)||0, ends=Number(e.ends_at||e.expires_at)||e._planEnds||0;

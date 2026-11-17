@@ -83,6 +83,23 @@ def _auth_headers(account: Account) -> dict:
     return headers
 
 
+def _plans_all_expired(plans: list, now: float) -> bool:
+    """每个套餐都带结束时间且均已到期。
+
+    缺 ends_at/expires_at 的套餐视为「永久/未知」，一律返回 False——只有
+    「确定曾经有、且确定都已结束」才允许空账本判死（新号体验额度必须放行）。
+    """
+    ends = []
+    for plan in plans:
+        if not isinstance(plan, dict):
+            return False
+        end = expires_epoch(plan.get("ends_at") or plan.get("expires_at"))
+        if end is None:
+            return False
+        ends.append(end)
+    return bool(ends) and all(end < now for end in ends)
+
+
 async def fetch_quota(account: Account) -> dict:
     """拉取单个账号的 方案 / 余额 / 用量，写回账号状态并持久化。
 
@@ -160,6 +177,8 @@ async def fetch_quota(account: Account) -> dict:
     # 否则会把 quota 快照 / plans 洗空，看起来像「上游没投放、额度未知」。
     errors: dict[str, int] = {}
     billing_plans: list | None = None  # 本次 billing/current 实际解析到的 plans
+    billing_ok = False                 # billing/current 成功（code 0/200）且已解析
+    balance_empty = False              # balance 成功且 plans/balances 都为空
 
     if billing_res is not None and billing_res.status_code == 200:
         try:
@@ -169,6 +188,7 @@ async def fetch_quota(account: Account) -> dict:
             if code is not None:
                 errors["current"] = code
             else:
+                billing_ok = True
                 plans = (data.get("data") or {}).get("plans") or []
                 billing_plans = plans
                 # 空 plans 不覆盖本地缓存（2.7.33）：billing/current 偶发返回
@@ -193,6 +213,8 @@ async def fetch_quota(account: Account) -> dict:
                 # 这里就是套餐类型的唯一来源——少了它 trial 号会退化成「未知套餐」，
                 # 拿不到体验档的并发收紧（见 models.Account.plan_kind）。
                 bal_plans = (data.get("data") or {}).get("plans") or []
+                bal_windows = (data.get("data") or {}).get("balances") or []
+                balance_empty = not bal_plans and not bal_windows
                 if bal_plans and not account.plans:
                     account.plans = bal_plans
                     account.plan = bal_plans[0]
@@ -283,6 +305,38 @@ async def fetch_quota(account: Account) -> dict:
     elif not (quota_map or billing_plans or result.get("usage")):
         if account.use_count == 0 and account.status == Status.ACTIVE:
             account.last_error = "billing 为空，待首次请求验证（疑似新号体验额度）"
+
+    # 上游**成功**回了空账本 + 本地套餐全部到期 → 确认「已无套餐」（2.7.64 线上实证）。
+    # 以前这条路径不判死：billing/current 返 plans:[] 不覆盖本地缓存（2.7.33 防抖），
+    # balance 返 balances:[] 又什么也不确认，于是 trial-mvxmwyrg 的 11-16 套餐在
+    # 11-17 17:00 到期后，账号仍带 2.68 亿「剩余额度」一直 ACTIVE/可选，每轮
+    # 轮询继续撞 1005。判死条件必须四者同时成立，缺一不可：
+    #   1) billing/current 成功且解析过（billing_ok）——业务错误/超时都不算证据；
+    #   2) balance 成功且 plans、balances 双空（balance_empty）——上游明确「没东西」；
+    #   3) 本地所有已知套餐都带结束时间且已过期——新号无 ends_at 的体验档必须放行；
+    #   4) 本地缓存窗口无一可用——防止上游短暂空账本误杀真有余量的号。
+    # 命中后只推进 quota_verified_at 与状态，**保留 plan/quota 快照**给前端展示。
+    known_plans = [
+        p for p in [account.plan, *(account.plans or [])]
+        if isinstance(p, dict) and p
+    ]
+    no_usable_cached = all(not window_usable(w, now) for w in account.quota.values())
+    if (
+        billing_ok
+        and balance_empty
+        and known_plans
+        and _plans_all_expired(known_plans, now)
+        and no_usable_cached
+        and not has_daily
+        and not has_bonus
+    ):
+        account.quota_verified_at = now
+        if account.status not in (Status.INVALID, Status.DISABLED):
+            if account.status == Status.COOLING and account.is_cooling():
+                account.last_error = "套餐已到期（冷却期内保留冷却态）"
+            else:
+                account.status = Status.EXHAUSTED
+                account.last_error = "套餐已到期（上游无套餐/余额）"
 
     # 状态机（2.7.33 重整）：证据只有两处——balance 窗口（quota_map 非空）
     # 与 plans 一次性赠送池（has_bonus）。缺证据（billing 空/业务错误）不判死。

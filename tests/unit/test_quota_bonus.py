@@ -46,3 +46,24 @@ class TestBonusActive:
         assert _bonus_active({"entitlements": []}, _NOW) is False
         assert _bonus_active({"entitlements": [{"period": "one_time"}]}, _NOW) is False
         assert _bonus_active(None, _NOW) is False
+
+    def test_expired_plan_kills_open_ended_entitlement(self):
+        """套餐到期后，不带 ends_at 的 one_time 授权随套餐一起失效（2.7.64）。
+
+        线上形态：zcode-v3-start-plan-1116 于 11-17 17:00 到期，entitlement 只
+        带 effective_at → 旧判定永久 has_bonus=True，账号永不判 EXHAUSTED。
+        """
+        plan = _plan(ends=None)
+        plan["ends_at"] = _NOW - 1
+        assert _bonus_active(plan, _NOW) is False
+
+    def test_live_plan_keeps_open_ended_entitlement(self):
+        plan = _plan(ends=None)
+        plan["ends_at"] = _NOW + 3600
+        assert _bonus_active(plan, _NOW) is True
+
+    def test_entitlement_end_capped_by_plan_end(self):
+        """授权自带更晚的 ends_at 也不得越过套餐有效期。"""
+        plan = _plan(ends=_NOW + 10_000)
+        plan["ends_at"] = _NOW - 1
+        assert _bonus_active(plan, _NOW) is False

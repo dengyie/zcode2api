@@ -254,7 +254,7 @@ TP_HEALTH_FAIL_THRESHOLD = max(_int("ZCODE_TP_HEALTH_FAIL_THRESHOLD", 2), 1)
 # traceless 后端签名全部超时 → len-76 无 securityToken 降级 stub（2.7.60
 # 拒收）→ popup 兜底渲染不出 → claim 求解全灭。换绑候选与健康判定新增
 # alicdn 维度：超阈值/失败 = 拒收该候选（不 ban——路由差≠信誉烂，ban 会
-# 白白烧池子）。阈值取实测可用节点（1.7s）与最慢可用档（3.5~5s）之间。
+# 白白烧池子）。缺省 5.0s = 实测最慢可用档（3.5~5s）上界：再慢即判不合格。
 EGRESS_ALICDN_MAX_SECONDS = _float("ZCODE_EGRESS_ALICDN_MAX", 5.0)
 EGRESS_ALICDN_PROBE_TIMEOUT = _int("ZCODE_EGRESS_ALICDN_PROBE_TIMEOUT", 12)
 # claim IP 信誉驱动重试（2026-11-17 深度迭代收编）：信誉型失败（403 风控文案/
@@ -325,7 +325,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.63"  # 2.7.62 alicdn 路由维度；2.7.63 全面 review 根修批次——TP 实时对账冲突拒收（假换绑/ban 台账/互斥破约收货前三查）+ 删除即释放 TP 分配 + 求解归因局部化（单槽竞态根除）+ 超时归因 + 孤儿清扫补 playwright 特征 + alicdn 验收整文件档
+APP_VERSION = "2.7.64"  # 2.7.64 过期套餐确认链——上游成功空账本 + 本地套餐全部到期 + 缓存窗口全失效 → 确认无套餐判 EXHAUSTED（推进 quota_verified_at，保留快照）；_plan_bonus_active 补套餐级到期（entitlement 无 ends_at 随套餐失效）；前端过期窗口/套餐置灰标「已过期」且不计入总额度
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。
