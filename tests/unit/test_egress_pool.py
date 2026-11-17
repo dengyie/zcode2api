@@ -879,6 +879,17 @@ async def test_release_account_success_false_is_idempotent_ok(monkeypatch, tp_mo
 
 
 @pytest.mark.asyncio
+async def test_release_account_non_dict_json_is_idempotent_ok(monkeypatch, tp_mode):
+    """review 复核 P3-1：release 返回非 dict JSON（数组/字符串）不得崩，
+    按「无法判读」处理为幂等成功（调用方语义：释放尽力而为）。"""
+    for raw in ('[1,2]', '"ok"', 'null'):
+        def _fake_http(method, url, body=None, headers=None, timeout=15, _raw=raw):
+            return 200, _raw
+        monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
+        assert await egress_pool.tp_release_account("acc-nondict") is True, raw
+
+
+@pytest.mark.asyncio
 async def test_release_account_http_500_returns_false(monkeypatch, tp_mode):
     def _fake_http(method, url, body=None, headers=None, timeout=15):
         return 500, "boom"
@@ -1061,16 +1072,6 @@ async def test_round4_same_node_degrade_rejected_when_banned(tp_mode, monkeypatc
 
 def test_alicdn_full_fetch_caps_oversize(monkeypatch, tp_mode):
     """review P3：full=True 整文件读封顶 4MB——异常超大响应判不合格而非读爆。"""
-    import io
-
-    class _HugeResp(io.RawIOBase):
-        """伪造无限流响应：每次 read 都有数据（模拟代理劫持/异常大文件）。"""
-
-        def readable(self):
-            return True
-
-        def read(self, size=-1):
-            return b"x" * (size if size and size > 0 else 65536)
 
     class _FakeResp:
         status = 200

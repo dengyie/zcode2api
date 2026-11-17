@@ -218,9 +218,11 @@ async def tp_release_account(account_id: str) -> bool:
         None, _tp_headers(), 15)
     if st == 200:
         # body 的 success 字段才是释放结果（2026-11-18 review P3：HTTP 200 +
-        # success:false = 无分配可释，属幂等成功而非失败）。
+        # success:false = 无分配可释，属幂等成功而非失败）。防御非 dict JSON
+        # （数组/字符串，review 复核 P3-1）。
         try:
-            body_ok = json.loads(raw).get("success")
+            body = json.loads(raw)
+            body_ok = body.get("success") if isinstance(body, dict) else None
         except ValueError:
             body_ok = None
         if body_ok is False:

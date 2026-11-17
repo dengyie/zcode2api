@@ -331,7 +331,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.65"  # 2.7.63→65 全面 review 根修收尾——P2#1 收货前地面真相复核（主循环+第4轮，验收窗口竞态收口）+ P2#2 单节点池退化降级接受（4 轮假换绑+全新全量验收通过 → 显式归因「池内无替代节点」）+ P3 批量：release body success 字段幂等语义 / cli 按名删除 find(provider,id_or_name) / 快照 aware-datetime 归一（TypeError 崩溃根除）/ 第4轮复核冲突短路不烧探针 / alicdn 整文件读封顶 4MB / 删除释放 gate 补灰度名单  # 2.7.64 过期套餐确认链——上游成功空账本 + 本地套餐全部到期 + 缓存窗口全失效 → 确认无套餐判 EXHAUSTED（推进 quota_verified_at，保留快照）；_plan_bonus_active 补套餐级到期（entitlement 无 ends_at 随套餐失效）；前端过期窗口/套餐置灰标「已过期」且不计入总额度
+APP_VERSION = "2.7.65"  # 2.7.63→65 全面 review 根修收尾——P2#1 收货前地面真相复核（主循环+第4轮，验收窗口竞态收口）+ P2#2 单节点池退化降级接受（4 轮假换绑+全新全量验收通过 → 显式归因「池内无替代节点」）+ P3 批量：release body success 字段幂等语义 / cli 按名删除 find(provider,id_or_name) / 快照 aware-datetime 归一（TypeError 崩溃根除）/ 第4轮复核冲突短路不烧探针 / alicdn 整文件读封顶 4MB / 删除释放 gate 补灰度名单；2.7.64 过期套餐确认链（上游空账本 + 本地套餐全到期 + 缓存窗口全失效 → EXHAUSTED）
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。
