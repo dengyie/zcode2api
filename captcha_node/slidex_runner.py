@@ -120,9 +120,11 @@ async def _attempt_in_browser(
             page = await context.new_page()
             await page.goto(_PAGE.as_uri(), wait_until="load", timeout=30_000)
             # SDK 就绪（与 solver_pw.js 同款等待；SDK 从 o.alicdn.com 拉取，
-            # 经 context proxy 出站——此处失败=出口不通，fast-fail 归因）
+            # 经 context proxy 出站——此处失败=出口不通，fast-fail 归因）。
+            # 预算 45s（2026-11-18 1117 复盘）：TP 节点对 alicdn 路由实测
+            # 1.7~31.9s/资源，20s 连可用档（3.5~5s）的多资源串行都接不住。
             await page.wait_for_function(
-                "typeof window.initAliyunCaptcha === 'function'", timeout=20_000
+                "typeof window.initAliyunCaptcha === 'function'", timeout=45_000
             )
             # 第一跳：无痕验证（solver_pw.js 线上实证稳定形态）——成功直接出
             # param，不需要拼图。失败（SDK 弹 popup 兜底）再落 slidex 拟人拖拽。
@@ -163,7 +165,7 @@ async def _attempt_in_browser(
                             onError: () => finish("ON_ERROR"),
                         });
                     } catch (e) { finish("EXC:" + e); }
-                    setTimeout(() => finish("TIMEOUT"), 20000);
+                    setTimeout(() => finish("TIMEOUT"), 45000);
                 })""",
                 {"scene": scene, "region": region, "prefix": prefix},
             )

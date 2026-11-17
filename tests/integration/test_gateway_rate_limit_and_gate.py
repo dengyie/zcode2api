@@ -161,7 +161,7 @@ class TestConcurrencyFamily:
         monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 0)
         monkeypatch.setattr(settings, "CONCURRENCY_GIVEUP_AFTER", 2)
         acc1 = seed_account(fresh_app, _JWT_CGV, name="a-giveup")
-        acc2 = seed_account(fresh_app, _JWT_COK, name="a-giveup-next")
+        _acc2 = seed_account(fresh_app, _JWT_COK, name="a-giveup-next")
         # 号1 恒 3008；号2 首次即成功
         mock.state.sequences[_JWT_CGV[:16]] = ["concurrency_3008"]
         mock.state.sequences[_JWT_COK[:16]] = ["ok"]
@@ -185,8 +185,8 @@ class TestConcurrencyFamily:
         monkeypatch.setattr(settings, "RETRY_429_CONCURRENCY_WAIT", 0)
         monkeypatch.setattr(settings, "RETRY_429_TIMES", 3)
         monkeypatch.setattr(settings, "CONCURRENCY_GIVEUP_AFTER", 0)
-        acc1 = seed_account(fresh_app, _JWT_CGV_OFF, name="a-giveup-off")
-        acc2 = seed_account(fresh_app, _JWT_COK2, name="a-giveup-off-next")
+        _acc1 = seed_account(fresh_app, _JWT_CGV_OFF, name="a-giveup-off")
+        _acc2 = seed_account(fresh_app, _JWT_COK2, name="a-giveup-off-next")
         mock.state.sequences[_JWT_CGV_OFF[:16]] = ["concurrency_3008"]
         mock.state.sequences[_JWT_COK2[:16]] = ["ok"]
 

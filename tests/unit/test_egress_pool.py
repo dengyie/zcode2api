@@ -10,12 +10,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
 from app import egress, egress_pool, settings
 from app.egress_pool import gateway_url_for
 from app.models import Account
+
+# autouse fixture 会把 probe_alicdn 换成恒过假探针；probe_alicdn 本体的
+# 单测需要真实现——在 import 期（fixture 生效前）捕获原函数引用。
+_REAL_PROBE_ALICDN = egress_pool.probe_alicdn
 
 
 @pytest.fixture
@@ -28,6 +33,16 @@ def tp_mode(monkeypatch):
     monkeypatch.setattr(settings, "TP_TIER", "standard")
     monkeypatch.setattr(settings, "TP_SERVICE", "zcode-hub")
     monkeypatch.setattr(settings, "TP_REBALANCE_DEBOUNCE", 0)
+
+
+@pytest.fixture(autouse=True)
+def _alicdn_probe_ok(monkeypatch):
+    """默认 alicdn 探针恒过（真实探针是网络调用，单测不得出网）。
+
+    需要失败语义的测试在用例内自行 monkeypatch 覆盖（同属性后写胜出）。"""
+    async def _ok(proxy_url, *, fetch_impl=None):
+        return True, 0.1, "ok"
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _ok)
 
 
 def _account(acc_id="acc-xyz", name="a1", jwt=None):
@@ -530,3 +545,102 @@ def test_messages_egress_tag_matches_gateway_helper(tp_mode):
 
     acc = _account(acc_id="acc-t")
     assert gw._messages_egress(acc) == egress.messages_egress_tag(acc)
+
+
+# ── 2026-11-18 1117 全灭复盘：alicdn 路由维度（2.7.62）─────────────────────
+
+def test_probe_alicdn_fast_ok(monkeypatch):
+    """200 + 快速 → 合格。"""
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
+    ok, elapsed, detail = asyncio.run(
+        egress_pool.probe_alicdn("http://gw", fetch_impl=lambda u, t: (200, "ok")))
+    assert ok is True and detail == "ok"
+
+
+def test_probe_alicdn_direct_passes_without_fetch(monkeypatch):
+    """proxy_url 为空（直连形态）恒过，且不得发起网络调用。"""
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
+    def _boom(url, timeout):
+        raise AssertionError("直连形态不应发起 alicdn 探针")
+    ok, elapsed, detail = asyncio.run(
+        egress_pool.probe_alicdn(None, fetch_impl=_boom))
+    assert ok is True and detail == "direct-no-probe"
+
+
+def test_probe_alicdn_http_fail_rejected(monkeypatch):
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
+    ok, _elapsed, detail = asyncio.run(
+        egress_pool.probe_alicdn("http://gw", fetch_impl=lambda u, t: (0, "SSLError: eof")))
+    assert ok is False and "SSLError" in detail
+
+
+def test_probe_alicdn_slow_rejected(monkeypatch):
+    """超 EGRESS_ALICDN_MAX_SECONDS = 拒收（1117 实测 9.9~31.9s 路由劣化）。"""
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
+    monkeypatch.setattr(settings, "EGRESS_ALICDN_MAX_SECONDS", 0.05)
+
+    def _slow(url, timeout):
+        time.sleep(0.12)
+        return 200, "ok"
+
+    ok, elapsed, detail = asyncio.run(
+        egress_pool.probe_alicdn("http://gw", fetch_impl=_slow))
+    assert ok is False and "slow" in detail
+
+
+@pytest.mark.asyncio
+async def test_rebalance_rejects_alicdn_slow_candidate_without_ban(tp_mode, monkeypatch):
+    """zcode 探针放行但 alicdn 路由不合格 → 换下一个候选且不得 ban（路由差≠信誉烂）。"""
+    stub = _StubPool(
+        [{"node_name": "cand-slow", "exit_ip": "1.2.3.4"},
+         {"node_name": "cand-fast", "exit_ip": "5.6.7.8"}],
+        [(405, '{"code":3012}'), (405, '{"code":3012}')],
+    )
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+
+    async def _slow_first(proxy_url, *, fetch_impl=None):
+        # 覆盖 autouse 恒过 fixture：第 1 候选 alicdn 不合格，其后合格
+        if not getattr(_slow_first, "used", False):
+            _slow_first.used = True
+            return False, 21.0, "slow 21.0s > 5s"
+        return True, 1.2, "ok"
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _slow_first)
+
+    acc = _account(acc_id="acc-cdn")
+    acc.egress_node = "old-node"
+    pool = egress_pool.TetherPoolEgress()
+    ok = await pool.rebalance(acc, reason="edge_405_html", ban=True)
+
+    assert ok is True
+    assert acc.egress_node == "cand-fast"
+    # alicdn 慢的候选绝不进 ban 名单（只隔离信誉烂的）
+    assert stub.bans == ["old-node"]
+
+
+@pytest.mark.asyncio
+async def test_health_once_gates_on_alicdn(tp_mode, monkeypatch):
+    """健康判定新增 alicdn 维度：zcode 探针通但 alicdn 路由烂 = 不健康。"""
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+
+    acc = _account(acc_id="acc-h")
+    acc.egress_node = "node-h"
+    pool = egress_pool.TetherPoolEgress()
+
+    async def _bad(proxy_url, *, fetch_impl=None):
+        return False, 17.0, "slow 17.0s > 5s"
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _bad)
+    assert await pool.health_once(acc) is False
+
+    async def _good(proxy_url, *, fetch_impl=None):
+        return True, 1.2, "ok"
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _good)
+    assert await pool.health_once(acc) is True

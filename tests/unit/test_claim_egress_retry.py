@@ -106,8 +106,11 @@ def test_rebalance_ok_then_captcha_acceptance_passes(monkeypatch, tp_mode):
 
     assert asyncio.run(claim._rebalance_for_claim(acc, "403 unusual")) is True
     assert acc.egress_node == "node-new"
-    # TP ban reason 是闭合枚举（TetherPool API 需求 §ban），必须用枚举值
-    assert pool.calls == [("retry1", "unusual_activity_3012", True)]
+    # TP ban reason 是闭合枚举（TetherPool API 需求 §ban），必须用枚举值；
+    # 且必须是 edge_405_html——unusual_activity_3012 被 TP 服务端强制
+    # quarantine=0（只记录不隔离），captcha 信誉 ban 传它等于白 ban
+    # （2026-11-17 实弹：当晚 8 条「ban 已隔离」实际全部未隔离）
+    assert pool.calls == [("retry1", "edge_405_html", True)]
     # 旧 tag（PROXY 模式下即网关代理 URL）在换绑前被作废，避免坏 IP 池内码复用
     assert invalidated == [egress_proxy_url]
     assert len(solved) == 1 and solved[0]["proxy"]
