@@ -21,6 +21,8 @@ async function renderAdminHeader(){
         </div>
         <nav class="admin-nav">${nav}</nav>
         <div class="admin-header-right">
+          <status-indicator status="online" label="Gateway online"></status-indicator>
+          <theme-toggle storage-key="zcodehub-theme"></theme-toggle>
           ${version?`<span class="admin-header-version">${version}</span>`:''}
           <button onclick="adminLogout()" class="admin-header-icon-btn" title="退出登录" aria-label="退出登录">
             <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>

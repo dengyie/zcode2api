@@ -7,6 +7,11 @@ function _toastContainer(){
 function _esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function showToast(message,type='success'){
   const tone=type==='error'?'error':(type==='info'?'info':'success');
+  const stack=document.getElementById('admin-toasts');
+  if(stack && typeof stack.push==='function'){
+    stack.push(message, tone==='error'?'error':(tone==='info'?'info':'success'));
+    return;
+  }
   const icon=tone==='success'
     ?'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>'
     :tone==='error'

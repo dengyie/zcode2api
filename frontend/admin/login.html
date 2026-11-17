@@ -1,13 +1,22 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 登录</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="css/app.css" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind = { config: { corePlugins: { preflight: false }, darkMode: "class" } };</script>
+  <script type="module" src="vendor/UiIcon.js"></script>
+  <script type="module" src="vendor/StatusIndicator.js"></script>
+  <script type="module" src="vendor/ThemeToggle.js"></script>
+  <script type="module" src="vendor/ToastStack.js"></script>
+  <script type="module" src="vendor/EmptyState.js"></script>
+
 </head>
 <body class="login-body">
+<toast-stack id="admin-toasts"></toast-stack>
   <div class="login-shell">
     <div class="login-card">
       <div class="login-brand">
@@ -15,6 +24,9 @@
         <span>Z<span class="tick" style="color:var(--amber)">·</span>HUB</span>
       </div>
       <div class="login-title">后台管理</div>
+      <div class="login-subtitle" style="display:flex;align-items:center;gap:8px">
+        <status-indicator status="online" label="Gateway online"></status-indicator>
+      </div>
       <div class="login-subtitle">请输入后台密码以继续</div>
       <div class="login-form">
         <input type="password" id="key" placeholder="后台密码" class="input">

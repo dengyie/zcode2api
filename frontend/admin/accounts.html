@@ -1,13 +1,22 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>zcode-hub · 账号池</title>
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="css/app.css" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind = { config: { corePlugins: { preflight: false }, darkMode: "class" } };</script>
+  <script type="module" src="vendor/UiIcon.js"></script>
+  <script type="module" src="vendor/StatusIndicator.js"></script>
+  <script type="module" src="vendor/ThemeToggle.js"></script>
+  <script type="module" src="vendor/ToastStack.js"></script>
+  <script type="module" src="vendor/EmptyState.js"></script>
+
 </head>
 <body>
+<toast-stack id="admin-toasts"></toast-stack>
 <div id="admin-header" data-active="/admin/accounts"></div>
 
 <main class="admin-main">
@@ -279,7 +288,7 @@ function renderList(){
   const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
   document.getElementById('tbl-count').textContent=items.length;
   const el=document.getElementById('acct-list');
-  if(!items.length){el.innerHTML='<div class="empty-state">暂无账号，点击右上角「新增」添加</div>';return;}
+  if(!items.length){el.innerHTML='<empty-state icon="inbox" title="还没有账号" description="点击右上角「新增」或「导入」开始构建你的账号池。"></empty-state>';return;}
   el.innerHTML=`<div class="acct-scroll"><div class="acct-table">
     <div class="acct-head"><span>凭证 / 账号</span><span>可用状态</span><span>最近请求</span><span>历史用量</span><span>额度信息</span><span class="th-actions">操作</span></div>
     ${items.map(rowHtml).join('')}
