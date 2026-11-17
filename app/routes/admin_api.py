@@ -9,7 +9,7 @@ import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
-from .. import logs, reqlog
+from .. import logs, reqlog, settings
 from ..auth_admin import verify_admin_key
 from ..captcha import CaptchaSolveError
 from ..claim import (
@@ -108,6 +108,7 @@ async def add_accounts(payload: dict = Body(...)):
 # ── 删除账号 ─────────────────────────────────────────────────────────────────
 @router.delete("/accounts")
 async def delete_accounts(ids: list[str] = Body(...)):
+    from ..egress_pool import tp_release_account
     from .gateway import clear_key_no_balance
 
     deleted = 0
@@ -115,6 +116,15 @@ async def delete_accounts(ids: list[str] = Body(...)):
         acc = store.find_any(aid)
         if acc and store.remove_account(acc.provider, aid):
             clear_key_no_balance(aid)  # 删除即无残留（Key-1113 冷却记忆）
+            # TP 分配随账号删除一并释放（2026-11-18 review P2 根修）：不释放
+            # 会孤儿化占节点——2026-11-17 实查 27 个分配里 16 个陈旧即历史
+            # 删除账号的残留，池压下把现役账号挤向软排除兜底（ban 节点/共享
+            # 节点）。释放失败只留痕（TP 侧可手工清），不阻断删除。
+            if settings.EGRESS_SUPPLY == "tetherpool" and settings.PER_ACCOUNT_EGRESS:
+                try:
+                    await tp_release_account(aid)
+                except Exception as err:  # noqa: BLE001 - 释放失败不阻断删除
+                    logs.warn("egress_pool", f"TP 分配释放异常 zh-{aid}: {err!r}")
             deleted += 1
     return {"deleted": deleted}
 

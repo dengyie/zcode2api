@@ -52,9 +52,9 @@ async def test_slidex_is_default_mode(monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
-    param = await CaptchaManager()._run_solver("s", "cn", "p", egress.DIRECT)
+    param, _fail = await CaptchaManager()._run_solver("s", "cn", "p", egress.DIRECT)
 
-    assert param == "slidex-param"
+    assert param == "slidex-param" and _fail is None
     assert seen["args"][0] == sys.executable
     assert str(settings.CAPTCHA_SOLVER_PY) in str(seen["args"][2])
 
@@ -137,8 +137,8 @@ def test_runner_parses_credentialed_proxy(monkeypatch):
     assert mod._playwright_proxy() is None
 
 
-def test_slidex_fail_line_feeds_last_error(monkeypatch):
-    """SLIDEX_FAIL=<code> 解析入 _last_error（2.7.50 review P3）：正常退出
+def test_slidex_fail_line_feeds_attribution(monkeypatch):
+    """SLIDEX_FAIL=<code> 归因（2.7.50 review P3 → 2.7.63 局部化）：正常退出
     无 param 的路径失败文案不再是笼统「多次重试无结果」，可归因 F001 等。"""
     import asyncio as _aio
 
@@ -167,9 +167,9 @@ def test_slidex_fail_line_feeds_last_error(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
     async def main():
-        param = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
+        param, fail = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
         assert param is None
-        assert mgr._last_error == "slidex 求解未果（F001）"
+        assert fail == "slidex 求解未果（F001）"
 
     _aio.run(main())
 
@@ -207,12 +207,12 @@ def test_degraded_stops_retry_loop(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
     async def main():
-        param = await mgr._solve_one(
+        token, msg = await mgr._solve_one(
             {"sceneId": "s", "region": "cn", "prefix": "p"}, "direct", None
         )
-        assert param is None
+        assert token is None
         assert len(exec_calls) == 1  # 止损：1 次即停（非 CAPTCHA_SOLVE_RETRIES 次）
-        assert "DEGRADED" in (mgr._last_error or "")
+        assert "DEGRADED" in (msg or "")
 
     _aio.run(main())
 
@@ -259,7 +259,7 @@ def test_slidex_stderr_surfaces_on_failure(monkeypatch):
     )
 
     async def main():
-        param = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
+        param, _fail = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
         assert param is None
         assert len(warns) == 1
         # 只取尾部 3 行且过滤空行：fatal 行必须在，INFO 行保留在尾部窗口内
@@ -302,8 +302,48 @@ def test_slidex_stderr_silent_on_success(monkeypatch):
     )
 
     async def main():
-        param = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
-        assert param == "ok"
+        param, _fail = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
+        assert param == "ok" and _fail is None
         assert warns == []
+
+    _aio.run(main())
+
+
+def test_solve_timeout_yields_attribution(monkeypatch):
+    """2.7.63 review P2#5：240s SIGKILL 超时路径必须归因（此前 return None
+    不写任何归因 → 首拍超时即全程「多次重试无结果」盲区，1117 实弹源头）。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+
+    class _Proc:
+        pid = 12349
+
+        async def communicate(self):
+            raise TimeoutError()
+
+        def kill(self):
+            pass
+
+    async def fake_cleanup(self, proc):
+        pass
+
+    async def fake_exec(*a, **kw):
+        return _Proc()
+
+    monkeypatch.setattr(CaptchaManager, "_communicate_solver",
+                        lambda self, proc: proc.communicate())
+    monkeypatch.setattr(CaptchaManager, "_cleanup_solver", fake_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    async def main():
+        param, fail = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
+        assert param is None
+        assert "超时" in (fail or "") and "SIGKILL" in (fail or "")
+
+        token, msg = await mgr._solve_one(
+            {"sceneId": "s", "region": "cn", "prefix": "p"}, "direct", None
+        )
+        assert token is None and "超时" in (msg or "")
 
     _aio.run(main())

@@ -15,6 +15,7 @@ import time
 import pytest
 
 from app import egress, egress_pool, settings
+from app import store as store_mod
 from app.egress_pool import gateway_url_for
 from app.models import Account
 
@@ -37,12 +38,16 @@ def tp_mode(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _alicdn_probe_ok(monkeypatch):
-    """默认 alicdn 探针恒过（真实探针是网络调用，单测不得出网）。
-
-    需要失败语义的测试在用例内自行 monkeypatch 覆盖（同属性后写胜出）。"""
-    async def _ok(proxy_url, *, fetch_impl=None):
+    """默认 alicdn 探针恒过 + TP 实时对账快照为空（两者都是网络调用，单测
+    不得出网）。需要失败/冲突语义的测试在用例内自行 monkeypatch 覆盖
+    （同属性后写胜出）。"""
+    async def _ok(proxy_url, *, full=False, fetch_impl=None):
         return True, 0.1, "ok"
     monkeypatch.setattr(egress_pool, "probe_alicdn", _ok)
+
+    async def _empty_snapshot():
+        return {}, set()
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _empty_snapshot)
 
 
 def _account(acc_id="acc-xyz", name="a1", jwt=None):
@@ -229,7 +234,6 @@ async def test_health_loop_bootstraps_binding_and_probes(tp_mode, monkeypatch, t
     """健康循环：未绑定账号先 ensure_binding（egress_node 落地 = 风控互斥前提），
     已绑定账号探针失败 → rebalance(ban=False)。DB 走 tmp_path 隔离
     （Store() 直开真实 dev 库已两次污染：2026-11-14 ×8 行 / 2026-11-15 ×2 行）。"""
-    from app import store as store_mod
 
     monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
     store = store_mod.Store()
@@ -273,7 +277,6 @@ async def test_health_probe_single_fail_does_not_rebalance(tp_mode, monkeypatch,
     """探针失败防抖（2026-11-15 生产数据：链路秒级抖动连坐 4 账号齐换绑）：
     单轮失败只留痕，连续 TP_HEALTH_FAIL_THRESHOLD 轮失败才 rebalance；
     中途探针转好 → streak 清零不再累计。"""
-    from app import store as store_mod
 
     monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
     store = store_mod.Store()
@@ -364,7 +367,6 @@ async def test_verify_then_rebalance_unbound_bootstraps(tp_mode, monkeypatch):
 @pytest.mark.asyncio
 async def test_ensure_binding_passes_exclude_node(tp_mode, monkeypatch):
     """绑定引导（风控核心）：首次 acquire 必须带 exclude_node=其它账号节点。"""
-    from app import store as store_mod
 
     monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
     store = store_mod.Store()
@@ -495,7 +497,6 @@ async def test_rebalance_round_rejected_candidates_stay_excluded(tp_mode, monkey
 async def test_conn_fail_cluster_forces_rebalance_despite_probe_ok(tp_mode, monkeypatch, tmp_path):
     """探针盲区收口（2026-11-16 trial-mvxmwyrg 18 连断事故）：半死节点能答
     小探针却断真实流式请求——聚类达阈值后无论探针结果强制 rebalance。"""
-    from app import store as store_mod
 
     monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
     store = store_mod.Store()
@@ -553,14 +554,14 @@ def test_probe_alicdn_fast_ok(monkeypatch):
     """200 + 快速 → 合格。"""
     monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
     ok, elapsed, detail = asyncio.run(
-        egress_pool.probe_alicdn("http://gw", fetch_impl=lambda u, t: (200, "ok")))
+        egress_pool.probe_alicdn("http://gw", fetch_impl=lambda u, t, f: (200, "ok")))
     assert ok is True and detail == "ok"
 
 
 def test_probe_alicdn_direct_passes_without_fetch(monkeypatch):
     """proxy_url 为空（直连形态）恒过，且不得发起网络调用。"""
     monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
-    def _boom(url, timeout):
+    def _boom(url, timeout, full=False):
         raise AssertionError("直连形态不应发起 alicdn 探针")
     ok, elapsed, detail = asyncio.run(
         egress_pool.probe_alicdn(None, fetch_impl=_boom))
@@ -570,7 +571,7 @@ def test_probe_alicdn_direct_passes_without_fetch(monkeypatch):
 def test_probe_alicdn_http_fail_rejected(monkeypatch):
     monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
     ok, _elapsed, detail = asyncio.run(
-        egress_pool.probe_alicdn("http://gw", fetch_impl=lambda u, t: (0, "SSLError: eof")))
+        egress_pool.probe_alicdn("http://gw", fetch_impl=lambda u, t, f: (0, "SSLError: eof")))
     assert ok is False and "SSLError" in detail
 
 
@@ -579,7 +580,7 @@ def test_probe_alicdn_slow_rejected(monkeypatch):
     monkeypatch.setattr(egress_pool, "probe_alicdn", _REAL_PROBE_ALICDN)
     monkeypatch.setattr(settings, "EGRESS_ALICDN_MAX_SECONDS", 0.05)
 
-    def _slow(url, timeout):
+    def _slow(url, timeout, full=False):
         time.sleep(0.12)
         return 200, "ok"
 
@@ -604,7 +605,7 @@ async def test_rebalance_rejects_alicdn_slow_candidate_without_ban(tp_mode, monk
 
     monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
 
-    async def _slow_first(proxy_url, *, fetch_impl=None):
+    async def _slow_first(proxy_url, *, full=False, fetch_impl=None):
         # 覆盖 autouse 恒过 fixture：第 1 候选 alicdn 不合格，其后合格
         if not getattr(_slow_first, "used", False):
             _slow_first.used = True
@@ -635,12 +636,224 @@ async def test_health_once_gates_on_alicdn(tp_mode, monkeypatch):
     acc.egress_node = "node-h"
     pool = egress_pool.TetherPoolEgress()
 
-    async def _bad(proxy_url, *, fetch_impl=None):
+    async def _bad(proxy_url, *, full=False, fetch_impl=None):
         return False, 17.0, "slow 17.0s > 5s"
     monkeypatch.setattr(egress_pool, "probe_alicdn", _bad)
     assert await pool.health_once(acc) is False
 
-    async def _good(proxy_url, *, fetch_impl=None):
+    async def _good(proxy_url, *, full=False, fetch_impl=None):
         return True, 1.2, "ok"
     monkeypatch.setattr(egress_pool, "probe_alicdn", _good)
     assert await pool.health_once(acc) is True
+
+
+# ── 2026-11-18 review P1 根修:TP 实时对账冲突拒收(2.7.63)──────────────────
+
+def _live_snapshot(allocs: dict[str, str], banned: set[str]):
+    async def _snap():
+        return allocs, banned
+    return _snap
+
+
+@pytest.mark.asyncio
+async def test_rebalance_rejects_same_node_return(tp_mode, monkeypatch):
+    """假换绑 acceptance 侧根修（2026-11-18 review P1#2）：TP 池压下无视
+    exclude_node 粘性返回原节点（6154→6154 实锤）——候选 == 旧节点必须视为
+    本轮失败换下一个，探针放行不得收货。"""
+    stub = _StubPool(
+        [{"node_name": "old-node", "exit_ip": "1.1.1.1"},   # 假换绑返回
+         {"node_name": "cand-new", "exit_ip": "2.2.2.2"}],  # 真新节点
+        [(405, '{"code":3012}'), (405, '{"code":3012}')],
+    )
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+    monkeypatch.setattr(egress_pool, "_other_nodes", lambda account: [])
+
+    acc = _account(acc_id="acc-same")
+    acc.egress_node = "old-node"
+    pool = egress_pool.TetherPoolEgress()
+    ok = await pool.rebalance(acc, reason="edge_405_html", ban=True)
+
+    assert ok is True
+    assert acc.egress_node == "cand-new"
+    # 旧节点在第 1 轮被 ban（ban=True 语义不变），假换绑候选不再被「确认成功」
+    assert stub.bans == ["old-node"]
+    assert stub.acquired[0]["exclude"] == ["old-node"]
+
+
+@pytest.mark.asyncio
+async def test_rebalance_rejects_banned_node_candidate(tp_mode, monkeypatch):
+    """TP avoid_banned 兜底破约（2026-11-18 实锤：zcodereg3 绑上在期 ban 的
+    542）——收货前反查在期隔离台账，命中即换下一个候选。"""
+    stub = _StubPool(
+        [{"node_name": "clash-banned-1", "exit_ip": "3.3.3.3"},
+         {"node_name": "cand-ok", "exit_ip": "4.4.4.4"}],
+        [(405, '{"code":3012}'), (405, '{"code":3012}')],
+    )
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+    monkeypatch.setattr(egress_pool, "_other_nodes", lambda account: [])
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot",
+                        _live_snapshot({}, {"clash-banned-1"}))
+
+    acc = _account(acc_id="acc-ban")
+    acc.egress_node = "old-node"
+    pool = egress_pool.TetherPoolEgress()
+    ok = await pool.rebalance(acc, reason="edge_405_html", ban=False)
+
+    assert ok is True
+    assert acc.egress_node == "cand-ok"
+    assert "clash-banned-1" in stub.acquired[1]["exclude"]  # 否决候选进 exclude
+
+
+@pytest.mark.asyncio
+async def test_rebalance_rejects_node_held_by_other_allocation(tp_mode, monkeypatch):
+    """互斥破约实锤（2026-11-18 实查：zcodereg4/5 同占 clash-6157）——候选
+    节点被本 service 其它 zh-* 分配现占时必须换下一个。"""
+    stub = _StubPool(
+        [{"node_name": "clash-shared", "exit_ip": "5.5.5.5"},
+         {"node_name": "cand-solo", "exit_ip": "6.6.6.6"}],
+        [(405, '{"code":3012}'), (405, '{"code":3012}')],
+    )
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+    monkeypatch.setattr(egress_pool, "_other_nodes", lambda account: [])
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _live_snapshot(
+        {"zh-other-account-1": "clash-shared",
+         "zh-acc-dup": "clash-elsewhere"},  # 候选被别的分配占着
+        set()))
+
+    acc = _account(acc_id="acc-dup")
+    acc.egress_node = "old-node"
+    pool = egress_pool.TetherPoolEgress()
+    ok = await pool.rebalance(acc, reason="edge_405_html", ban=False)
+
+    assert ok is True
+    assert acc.egress_node == "cand-solo"
+
+
+@pytest.mark.asyncio
+async def test_rebalance_snapshot_failure_fails_open(tp_mode, monkeypatch):
+    """对账快照拉取失败 = 跳过冲突检查（fail-open），rebalance 语义退回
+    2.7.62 前行为——绝不因控制面抖动而拒绝一切候选。"""
+    async def _dead_snapshot():
+        return {}, set()
+
+    stub = _StubPool([{"node_name": "cand-x", "exit_ip": "7.7.7.7"}],
+                     [(405, '{"code":3012}')])
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _dead_snapshot)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+    monkeypatch.setattr(egress_pool, "_other_nodes", lambda account: [])
+
+    acc = _account(acc_id="acc-open")
+    acc.egress_node = "old-x"  # 快照坏 → 隔离/互斥检查跳过（fail-open）→ 仍收货 cand-x
+    pool = egress_pool.TetherPoolEgress()
+    ok = await pool.rebalance(acc, reason="edge_405_html", ban=False)
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_rebalance_acceptance_uses_full_alicdn_probe(tp_mode, monkeypatch):
+    """alicdn 双档（2.7.63 review P2#9）：换绑验收用整文件强探针（full=True），
+    健康循环保持 64KB 轻探针——头部快 ≠ 整文件快（trial 6154 全文件 10.2s
+    却过 64KB 采样实锤）。"""
+    seen: dict = {}
+
+    async def _recorder(proxy_url, *, full=False, fetch_impl=None):
+        seen.setdefault("fulls", []).append(full)
+        return True, 0.5, "ok"
+
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _recorder)
+
+    stub = _StubPool([{"node_name": "cand-full", "exit_ip": "8.8.8.8"}],
+                     [(405, '{"code":3012}')])
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+    monkeypatch.setattr(egress_pool, "_other_nodes", lambda account: [])
+
+    acc = _account(acc_id="acc-full")
+    pool = egress_pool.TetherPoolEgress()
+    await pool.rebalance(acc, reason="edge_405_html", ban=False)
+    assert seen["fulls"] == [True]  # 验收路径 = 整文件档
+
+
+@pytest.mark.asyncio
+async def test_health_once_uses_light_alicdn_probe(tp_mode, monkeypatch):
+    seen: dict = {}
+
+    async def _recorder(proxy_url, *, full=False, fetch_impl=None):
+        seen["full"] = full
+        return True, 0.5, "ok"
+
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _recorder)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+
+    acc = _account(acc_id="acc-light")
+    pool = egress_pool.TetherPoolEgress()
+    assert await pool.health_once(acc) is True
+    assert seen["full"] is False  # 健康循环 = 64KB 轻档
+
+
+@pytest.mark.asyncio
+async def test_delete_account_handler_releases_tp_allocation(monkeypatch, tp_mode):
+    """账号删除必须释放 TP 分配（2026-11-18 review P2#4：16/27 陈旧分配即
+    历史删除账号残留）——真实 handler 路径：delete_accounts → store.remove
+    → tp_release_account(zh-<id>)。"""
+    from app.routes import admin_api as admin
+
+    class _FakeStore:
+        def __init__(self, acc):
+            self.acc = acc
+            self.removed: list[str] = []
+
+        def find_any(self, aid):
+            return self.acc if self.acc and self.acc.id == aid else None
+
+        def remove_account(self, provider, aid):
+            self.removed.append(aid)
+            return True
+
+    fake = _FakeStore(_account(acc_id="acc-del"))
+    monkeypatch.setattr(admin, "store", fake)
+    released: list[str] = []
+
+    async def fake_release(account_id: str) -> bool:
+        released.append(account_id)
+        return True
+
+    monkeypatch.setattr(egress_pool, "tp_release_account", fake_release)
+
+    out = await admin.delete_accounts(["acc-del"])
+    assert out == {"deleted": 1}
+    assert fake.removed == ["acc-del"]
+    assert released == ["acc-del"]

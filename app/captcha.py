@@ -58,10 +58,15 @@ def _kill_orphan_chromium() -> int:
     node 正常退出时由 solver 侧 exit 钩子清理；但 node 被 SIGKILL（求解超时）
     或同步卡死时，killpg(node 组) 打不到逃逸的 Chromium，必须按孤儿特征兜底：
     父进程已死的 Chromium 必为泄漏残留（并发求解中活跃 Chromium 的父进程是
-    活着的 node，PPID≠1，不会误杀）。
+    活着的 node/driver，PPID≠1，不会误杀）。
 
-    判据用 puppeteer 的临时 profile 目录（`--user-data-dir=<tmp>/puppeteer_dev_chrome_profile-*`），
-    而不是裸 `chromium` 子串——后者会把同机其它 Chromium/Chrome 服务一起 SIGKILL。
+    判据用两条求解链的临时 profile 目录特征（`--user-data-dir=<tmp>/…`），
+    而不是裸 `chromium` 子串——后者会把同机其它 Chromium/Chrome 服务一起
+    SIGKILL：
+    - pw/legacy 路线（puppeteer）：`puppeteer_dev_chrome_profile-*`
+    - slidex 路线（playwright，缺省）：`playwright_chromiumdev_profile-*`
+      （2026-11-18 review P2#7 补——slidex 自 2.7.49 起为主求解器，其逃逸
+      Chromium 一直不被二道防线识别；命名经 tebi 实测确认）
     非 Linux（无 /proc）直接跳过。
     """
     killed = 0
@@ -79,7 +84,8 @@ def _kill_orphan_chromium() -> int:
                 continue
             with open(f"/proc/{entry}/cmdline", "rb") as f:
                 cmdline = f.read().decode("utf-8", "ignore")
-            if "puppeteer_dev_chrome_profile" not in cmdline:
+            if "puppeteer_dev_chrome_profile" not in cmdline and \
+                    "playwright_chromiumdev_profile" not in cmdline:
                 continue
             os.kill(int(entry), signal.SIGKILL)
             killed += 1
@@ -89,11 +95,12 @@ def _kill_orphan_chromium() -> int:
 
 
 def _cleanup_stale_profiles(max_age_seconds: int = 3600) -> int:
-    """清掉 puppeteer 留下的旧临时 profile 目录（2.7.33）。
+    """清掉求解器留下的旧临时 profile 目录（2.7.33；2026-11-18 补 playwright 特征）。
 
-    Chromium 被 SIGKILL 后 `--user-data-dir=/tmp/puppeteer_dev_chrome_profile-*`
-    不会被删，长期运行会堆满 /tmp（单个目录几十 MB）。只删 mtime 超过
-    max_age 的——并发求解中活跃浏览器的 profile 一直在写，不会被误删。
+    Chromium 被 SIGKILL 后 `--user-data-dir=<tmp>/…` 不会被删，长期运行会堆满
+    /tmp（单个目录几十 MB）。只删 mtime 超过 max_age 的——并发求解中活跃
+    浏览器的 profile 一直在写，不会被误删。两条求解链的命名特征都收：
+    puppeteer（pw/legacy 路线）+ playwright（slidex 缺省路线，tebi 实测命名）。
     """
     import glob
     import shutil
@@ -101,15 +108,19 @@ def _cleanup_stale_profiles(max_age_seconds: int = 3600) -> int:
 
     removed = 0
     cutoff = time.time() - max_age_seconds
-    pattern = os.path.join(tempfile.gettempdir(), "puppeteer_dev_chrome_profile-*")
-    for path in glob.glob(pattern):
-        try:
-            if os.path.getmtime(path) > cutoff:
+    patterns = [
+        os.path.join(tempfile.gettempdir(), "puppeteer_dev_chrome_profile-*"),
+        os.path.join(tempfile.gettempdir(), "playwright_chromiumdev_profile-*"),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                if os.path.getmtime(path) > cutoff:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+            except OSError:
                 continue
-            shutil.rmtree(path, ignore_errors=True)
-            removed += 1
-        except OSError:
-            continue
     return removed
 
 
@@ -159,7 +170,6 @@ class CaptchaManager:
         # 走 US 代理 region=sgp），混用会把错地区的 token 配到请求上。
         self._config_cache: dict[str, dict] = {}
         self._config_cache_at: dict[str, float] = {}
-        self._last_error: str | None = None
         # 热路径触发的补货任务强引用（事件循环只持弱引用，裸 create_task 会被 GC）
         self._bg_tasks: set[asyncio.Task] = set()
 
@@ -339,7 +349,6 @@ class CaptchaManager:
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - 后台循环永不退出
-                self._last_error = str(err)
                 logs.warn("captcha", f"补充循环异常: {err}")
                 await asyncio.sleep(5)
 
@@ -354,7 +363,7 @@ class CaptchaManager:
             for _ in range(need):
                 if self._size(tag) >= POOL_MAX:
                     break
-                token = await self._solve_one(config, tag)
+                token, _err = await self._solve_one(config, tag)
                 if token is None:
                     break
                 self._put(token, tag)
@@ -417,36 +426,43 @@ class CaptchaManager:
 
         # 2) 池空/全过期/非热路径出口：同步现解一次
         config = await self.fetch_config(tag, proxy)
-        token = await self._solve_one(config, tag, proxy)
+        token, err = await self._solve_one(config, tag, proxy)
         if token is None:
-            raise CaptchaSolveError(f"验证码求解失败: {self._last_error or '多次重试无结果'}")
+            raise CaptchaSolveError(f"验证码求解失败: {err or '多次重试无结果'}")
         return token.param, token.region
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def _solve_one(self, config: dict, tag: str = egress.DIRECT,
-                         proxy: str | None = None) -> _Token | None:
+                         proxy: str | None = None
+                         ) -> tuple[_Token | None, str | None]:
+        """跑满重试预算求一枚 token。返回 (token | None, 最终归因 | None)。
+
+        归因（2026-11-18 review P2#6 根修）从共享单槽 `self._last_error` 改为
+        本调用局部变量：_solve_sem 只包住 _run_solver 进程段，此前的共享槽在
+        多账号并发求解（admin /claim 逐号 + 轮次 + 消息热路径池空现解）下互相
+        覆盖，A 号的 DEGRADED 止损判定可能读到 B 号的异常文案——误止损/漏止损。"""
         scene = config.get("sceneId") or constants.CAPTCHA_DEFAULTS["sceneId"]
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
 
+        attribution: str | None = None
         last_err: str | None = None
         for attempt in range(1, settings.CAPTCHA_SOLVE_RETRIES + 1):
+            fail_code: str | None = None
             try:
                 # 进程级并发上限：超出排队等前一个浏览器退出，避免内存被打满
                 async with self._solve_sem:
-                    param = await self._run_solver(scene, region, prefix, tag, proxy)
+                    param, fail_code = await self._run_solver(scene, region, prefix, tag, proxy)
             except Exception as err:  # noqa: BLE001
                 last_err = str(err)
                 param = None
             if param:
                 if attempt > 1:
                     logs.ok("captcha", f"求解成功（第 {attempt} 次尝试，出口={tag}）")
-                return _Token(param, region, tag)
-            # _run_solver 无异常返回 None 时，_last_error 已被求解器内部填好
-            # （如 slidex 归因 TRACELESS:DEGRADED）；只在异常路径用 last_err
-            # 覆盖，否则环境归因会被 None 冲掉、下面的止损永远不命中。
-            env_error = self._last_error
-            self._last_error = last_err or env_error
+                return _Token(param, region, tag), None
+            # 归因优先级：本轮 fail_code（求解器内部归因，如 SLIDEX_FAIL /
+            # 求解超时）> 异常文案 > 往轮归因（延续）。共享槽竞态已随局部化根除。
+            attribution = fail_code or last_err or attribution
             logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果，重试…")
             # 环境级失败快速止损（2.7.60 实弹定案）：DEGRADED = 阿里云对
             # headless 无痕的判定收紧（2026-11-18 深夜对照实验：TP 出口与
@@ -454,7 +470,7 @@ class CaptchaManager:
             # ——与出口 IP 无关）。换 context / 换求解进程都无法改变环境
             # 判定，4 连重试 × 240s 预算纯白烧（每号 16 分钟）+ 反复暴露
             # 求解行为指纹。归因为 DEGRADED 时直接放弃本轮后续重试。
-            if "DEGRADED" in (self._last_error or ""):
+            if "DEGRADED" in (attribution or ""):
                 logs.warn(
                     "captcha",
                     f"求解归因 DEGRADED（headless 判定收紧，环境级失败）——止损，"
@@ -462,13 +478,16 @@ class CaptchaManager:
                 )
                 break
 
-        logs.warn("captcha", f"求解失败: {last_err or '多次重试无结果'}")
-        return None
+        msg = attribution or last_err or "多次重试无结果"
+        logs.warn("captcha", f"求解失败: {msg}")
+        return None, msg
 
     async def _run_solver(
         self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT,
         proxy: str | None = None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
+        """求解一次。返回 (param | None, fail_code | None)——fail_code 为求解器
+        内部归因（SLIDEX_FAIL 码 / 求解超时），异常仍向上抛。"""
         if settings.CAPTCHA_SOLVER_MODE == "slidex":
             return await self._run_solver_slidex(scene, region, prefix, tag, proxy)
         return await self._run_solver_pw(scene, region, prefix, tag, proxy)
@@ -476,7 +495,7 @@ class CaptchaManager:
     async def _run_solver_slidex(
         self, scene: str, region: str, prefix: str, tag: str,
         proxy: str | None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         """slidex 路线：python runner + playwright context 级 credentialed proxy。
 
         出口对齐口径与 _run_solver_pw 完全一致：proxy 参数优先，其次按 tag 取
@@ -514,7 +533,12 @@ class CaptchaManager:
         try:
             stdout, stderr = await self._communicate_solver(proc)
         except TimeoutError:
-            return None
+            # 240s SIGKILL：runner 的 SLIDEX_FAIL/stderr 全丢（2026-11-18 review
+            # P2#5——今晚「多次重试无结果」的精确源头：首拍超时即全程盲归因）
+            return None, (
+                f"求解进程超时（>{settings.CAPTCHA_SOLVE_TIMEOUT}s 被 SIGKILL，"
+                f"SLIDEX_FAIL/stderr 全丢，归因不可得）"
+            )
         finally:
             await self._cleanup_solver(proc)
 
@@ -525,12 +549,12 @@ class CaptchaManager:
                 param = line[len("VERIFY_PARAM="):].strip()
             elif line.startswith("SLIDEX_FAIL="):
                 # 诊断归因行（F001=阿里云行为风控全拒/ARM_SHAPE/DRAG/…）：
-                # 正常退出但无 param 的路径 _solve_one 靠它拿到 last_err，
+                # 正常退出但无 param 的路径 _solve_one 靠它归因，
                 # 否则失败文案只有笼统的「多次重试无结果」（2.7.50 review P3
                 # ——实弹 briarlow17 四轮全盲归因的教训）
                 fail_code = line[len("SLIDEX_FAIL="):].strip() or None
         if param is None and fail_code:
-            self._last_error = f"slidex 求解未果（{fail_code}）"
+            fail_code = f"slidex 求解未果（{fail_code}）"
         if param is None:
             # stderr 尾部诊断透传（fatal: <异常> / attempt 归因）——只取
             # 尾部 3 行防刷屏，成功路径完全不产生日志
@@ -540,12 +564,12 @@ class CaptchaManager:
             ][-3:]
             if tail:
                 logs.warn("captcha", f"slidex stderr: {' | '.join(tail)}")
-        return param
+        return param, fail_code
 
     async def _run_solver_pw(
         self, scene: str, region: str, prefix: str, tag: str = egress.DIRECT,
         proxy: str | None = None,
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         solver = settings.CAPTCHA_SOLVER_JS
         if not solver.exists():
             raise RuntimeError(
@@ -585,7 +609,7 @@ class CaptchaManager:
         try:
             stdout, _ = await self._communicate_solver(proc)
         except TimeoutError:
-            return None
+            return None, f"求解进程超时（>{settings.CAPTCHA_SOLVE_TIMEOUT}s 被 SIGKILL，归因不可得）"
         except FileNotFoundError as err:
             raise RuntimeError(f"无法启动 Node（{settings.NODE_PATH}）: {err}") from err
         finally:
@@ -595,7 +619,7 @@ class CaptchaManager:
         for line in stdout.decode("utf-8", "ignore").splitlines():
             if line.startswith("VERIFY_PARAM="):
                 param = line[len("VERIFY_PARAM="):].strip()
-        return param
+        return param, None
 
     async def _communicate_solver(self, proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
         return await asyncio.wait_for(proc.communicate(), timeout=settings.CAPTCHA_SOLVE_TIMEOUT)
