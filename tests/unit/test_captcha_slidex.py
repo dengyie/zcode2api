@@ -172,3 +172,95 @@ def test_slidex_fail_line_feeds_last_error(monkeypatch):
         assert mgr._last_error == "slidex 求解未果（F001）"
 
     _aio.run(main())
+
+
+def test_slidex_stderr_surfaces_on_failure(monkeypatch):
+    """2.7.58 诊断透传：失败时 runner stderr 尾部（fatal/归因）必须进日志。
+
+    2026-11-17 领取连败排查实证：stderr=DEVNULL 吞掉 slidex 的
+    `fatal: TimeoutError: Page.goto ...`，故障窗口只剩笼统「多次重试无结果」，
+    只能盲猜。成功路径不产生日志（防刷屏）。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+    warns: list[str] = []
+
+    class _Proc:
+        pid = 12346
+
+        async def communicate(self):
+            return (
+                b"SLIDEX_FAIL=EXC",
+                b"INFO log line\n[slidex] attempt 1: traceless=None\n"
+                b"[slidex] fatal: TimeoutError: Page.goto: Timeout 30000ms exceeded.\n",
+            )
+
+        def kill(self):
+            pass
+
+    async def fake_comm(self, proc):
+        return await proc.communicate()
+
+    async def fake_cleanup(self, proc):
+        pass
+
+    async def fake_exec(*a, **kw):
+        return _Proc()
+
+    monkeypatch.setattr(CaptchaManager, "_communicate_solver", fake_comm)
+    monkeypatch.setattr(CaptchaManager, "_cleanup_solver", fake_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        "app.captcha.logs.warn",
+        lambda tag, msg: warns.append(msg),
+    )
+
+    async def main():
+        param = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
+        assert param is None
+        assert len(warns) == 1
+        # 只取尾部 3 行且过滤空行：fatal 行必须在，INFO 行保留在尾部窗口内
+        assert "Page.goto" in warns[0]
+
+    _aio.run(main())
+
+
+def test_slidex_stderr_silent_on_success(monkeypatch):
+    """求解成功（含重试后成功）：stderr 诊断不得产生日志（防刷屏）。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+    warns: list[str] = []
+
+    class _Proc:
+        pid = 12347
+
+        async def communicate(self):
+            return (b"VERIFY_PARAM=ok\n", b"[slidex] attempt 1 failed; retrying\n")
+
+        def kill(self):
+            pass
+
+    async def fake_comm(self, proc):
+        return await proc.communicate()
+
+    async def fake_cleanup(self, proc):
+        pass
+
+    async def fake_exec(*a, **kw):
+        return _Proc()
+
+    monkeypatch.setattr(CaptchaManager, "_communicate_solver", fake_comm)
+    monkeypatch.setattr(CaptchaManager, "_cleanup_solver", fake_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        "app.captcha.logs.warn",
+        lambda tag, msg: warns.append(msg),
+    )
+
+    async def main():
+        param = await mgr._run_solver_slidex("scene", "cn", "pfx", "direct", None)
+        assert param == "ok"
+        assert warns == []
+
+    _aio.run(main())

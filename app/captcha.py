@@ -468,12 +468,15 @@ class CaptchaManager:
             sys.executable, "-B", str(settings.CAPTCHA_SOLVER_PY), scene, region, prefix,
             cwd=str(settings.CAPTCHA_SOLVER_DIR),
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            # stderr 收管（2.7.58）：slidex 的 CAPTCHA_DEBUG 诊断（fatal 异常
+            # /F0xx 归因）全走 stderr，DEVNULL 吞掉 = 失败潮时零归因线索
+            # （2026-11-17 领取连败排查实证：只能盲猜出口抖动）。
+            stderr=asyncio.subprocess.PIPE,
             env=solver_env,
             start_new_session=True,
         )
         try:
-            stdout, _ = await self._communicate_solver(proc)
+            stdout, stderr = await self._communicate_solver(proc)
         except TimeoutError:
             return None
         finally:
@@ -492,6 +495,15 @@ class CaptchaManager:
                 fail_code = line[len("SLIDEX_FAIL="):].strip() or None
         if param is None and fail_code:
             self._last_error = f"slidex 求解未果（{fail_code}）"
+        if param is None:
+            # stderr 尾部诊断透传（fatal: <异常> / attempt 归因）——只取
+            # 尾部 3 行防刷屏，成功路径完全不产生日志
+            tail = [
+                ln for ln in stderr.decode("utf-8", "ignore").splitlines()
+                if ln.strip()
+            ][-3:]
+            if tail:
+                logs.warn("captcha", f"slidex stderr: {' | '.join(tail)}")
         return param
 
     async def _run_solver_pw(

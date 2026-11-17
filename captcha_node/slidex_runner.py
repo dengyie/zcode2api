@@ -110,7 +110,12 @@ async def _attempt_in_browser(
                     let done = false;
                     const finish = (v) => { if (!done) { done = true; resolve(v); } };
                     try {
-                        if (args.region && args.region !== "cn")
+                        // region 归一（2.7.58）：上游按出口 IP 下发 sgp（美国 TP 出口
+                        // 拉配置即得），但 sgp 端点 traceless 稳定 TIMEOUT/F001
+                        // （2026-11-17 对照实验：同出口同窗口 cn 一次成功、sgp 6 轮
+                        // 全败；与 solver_pw.js 2026-11-11 修复同款语义——缺省 cn
+                        // 端点走降级无痕路径稳定出参，sgp 显式配置即触发完整 UI 流）。
+                        if (args.region && args.region !== "cn" && args.region !== "sgp")
                             window.AliyunCaptchaConfig = { region: args.region, prefix: args.prefix };
                         window.__slidexCaptchaParam = null;
                         window.__slidexCaptchaFail = null;
