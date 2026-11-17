@@ -63,7 +63,13 @@ def _connect() -> sqlite3.Connection:
 
 
 def _ensure_loaded() -> None:
-    """启动后首次访问时回读盘上未过期条目（一次性）。"""
+    """启动后首次访问时回读盘上未过期条目（一次性）。
+
+    顺带把盘上已过期条目物理清除（2.7.56）：cooling() 到期只弹内存，
+    DB 行只进不出会无界累积（每次 (账号，模型) 耗尽事件都留一行，进程
+    长寿 + 多号多模型下按周累积）。启动清理 = 每进程生命周期一次，
+    频率无忧。
+    """
     global _loaded
     if _loaded:
         return
@@ -78,6 +84,11 @@ def _ensure_loaded() -> None:
                 (now,),
             ).fetchall()
             _plan_model_exhausted.update(dict(rows))
+            # 过期行物理清除：磁盘卫生，不影响语义（过期条目本就不该再拦）
+            conn.execute(
+                "DELETE FROM plan_model_exhausted WHERE until <= ?", (now,)
+            )
+            conn.commit()
         except sqlite3.Error:
             pass  # 盘不可用退化为纯内存，与旧形态等价
         _loaded = True
@@ -123,6 +134,9 @@ def cooling(account_id: str, model: str, now: float | None = None) -> bool:
         return False
     if (now or time.time()) >= until:
         _plan_model_exhausted.pop(_key(account_id, model), None)
+        # 2.7.56：到期摘除同步删盘，否则 DB 行只进不出（启动清理兜底前的
+        # 运行期卫生——同键下次 note 会 REPLACE，但废弃键永不清理）。
+        _persist(_key(account_id, model), None)
         return False
     return True
 

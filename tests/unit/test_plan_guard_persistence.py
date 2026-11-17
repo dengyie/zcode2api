@@ -29,6 +29,10 @@ def _fresh_guard(tmp_path, monkeypatch):
             conn.close()
         except Exception:
             pass
+        # 关闭后必须置回 None：同进程后续集成测试（conftest 换了 DATA_DIR）
+        # 的 _connect() 若拿到这个已关闭连接，sqlite3.Error 会被吞掉，
+        # note() 静默不落盘——2.7.56 全量回归实锤的测试间污染。
+        plan_guard._local.conn = None
 
 
 class TestPersistence:
@@ -93,3 +97,38 @@ class TestPersistence:
         plan_guard._plan_model_exhausted.clear()
         plan_guard._loaded = False
         assert not plan_guard.cooling("acc-7", "GLM-5.3")
+
+
+class TestDiskHygiene:
+    """2.7.56 磁盘卫生：DB 行只进不出会无界累积——启动清理 + 到期同步删盘。"""
+
+    def _db_rows(self, tmp_path):
+        db = tmp_path / "data" / "plan_guard.db"
+        with sqlite3.connect(db) as conn:
+            return conn.execute(
+                "SELECT key FROM plan_model_exhausted"
+            ).fetchall()
+
+    def test_startup_prune_deletes_expired_rows(self, tmp_path):
+        """启动回读顺带物理清除过期行：磁盘不随历史耗尽事件无界累积。"""
+        plan_guard.note("acc-old", "GLM-5.3", time.time() - 10)  # 过期行
+        plan_guard.note("acc-live", "GLM-5.3", time.time() + 1800)
+        plan_guard._plan_model_exhausted.clear()
+        plan_guard._loaded = False
+
+        # 任意 cooling() 触发一次性回读 + 启动清理
+        assert plan_guard.cooling("acc-live", "GLM-5.3")
+
+        keys = {k for (k,) in self._db_rows(tmp_path)}
+        assert all("acc-old" not in k for k in keys)  # 过期行已被物理删除
+        assert any("acc-live" in k for k in keys)  # 未过期行保留
+
+    def test_cooling_expiry_deletes_db_row(self, tmp_path):
+        """cooling() 到期摘除同步删盘（显式 now 参数，免 sleep）。"""
+        plan_guard.note("acc-8", "GLM-5.3", time.time() + 1800)
+        assert plan_guard.cooling("acc-8", "GLM-5.3")
+
+        # now 越过 until：到期分支 pop 内存 + _persist(None) 删盘
+        assert not plan_guard.cooling("acc-8", "GLM-5.3", now=time.time() + 2000)
+        assert not plan_guard.cooling("acc-8", "GLM-5.3")  # 内存已摘
+        assert self._db_rows(tmp_path) == []  # 盘已删
