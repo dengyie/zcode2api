@@ -9,7 +9,7 @@ import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
-from .. import logs, reqlog, settings
+from .. import egress, logs, reqlog, settings
 from ..auth_admin import verify_admin_key
 from ..captcha import CaptchaSolveError
 from ..claim import (
@@ -120,7 +120,12 @@ async def delete_accounts(ids: list[str] = Body(...)):
             # 会孤儿化占节点——2026-11-17 实查 27 个分配里 16 个陈旧即历史
             # 删除账号的残留，池压下把现役账号挤向软排除兜底（ban 节点/共享
             # 节点）。释放失败只留痕（TP 侧可手工清），不阻断删除。
-            if settings.EGRESS_SUPPLY == "tetherpool" and settings.PER_ACCOUNT_EGRESS:
+            # TP 分配随账号删除一并释放（2026-11-18 review P2 根修）：不释放
+            # 则孤儿分配永久占节点。gate 补灰度名单检查（review Suggestion）：
+            # 灰度名单非空且该账号不在名单 = 从未持有 TP 分配，跳过释放。
+            if (settings.EGRESS_SUPPLY == "tetherpool"
+                    and settings.PER_ACCOUNT_EGRESS
+                    and egress.tetherpool_enabled_for(acc)):
                 try:
                     await tp_release_account(aid)
                 except Exception as err:  # noqa: BLE001 - 释放失败不阻断删除

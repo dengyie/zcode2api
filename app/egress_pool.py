@@ -84,7 +84,20 @@ def _alicdn_fetch(proxy_url: str, timeout: float,
             ALICDN_PROBE_URL, method="GET",
             headers={"User-Agent": "ZCode/3.17.2"})
         with _opener(proxy_url).open(req, timeout=timeout) as r:
-            r.read() if full else r.read(65536)
+            if full:
+                # 整文件读封顶 4MB（2026-11-18 review P3）：AliyunCaptcha.js
+                # 实际 ~1MB，防异常响应（代理劫持/无限流）把 read() 撑爆内存；
+                # 超限即不合格——正常文件远小于此。
+                total = 0
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > 4 * 1024 * 1024:
+                        return 0, f"oversize {total}B > 4MB cap"
+            else:
+                r.read(65536)
             return r.status, "ok"
     except Exception as exc:  # noqa: BLE001 - 路由质量探针：任何异常 = 不合格
         return 0, f"{type(exc).__name__}: {exc}"[:120]
@@ -204,7 +217,17 @@ async def tp_release_account(account_id: str) -> bool:
         _tp_http, "POST", f"{settings.TP_API}/v1/allocation/release?{q}",
         None, _tp_headers(), 15)
     if st == 200:
-        logs.info("egress_pool", f"TP 分配已释放: zh-{account_id}")
+        # body 的 success 字段才是释放结果（2026-11-18 review P3：HTTP 200 +
+        # success:false = 无分配可释，属幂等成功而非失败）。
+        try:
+            body_ok = json.loads(raw).get("success")
+        except ValueError:
+            body_ok = None
+        if body_ok is False:
+            logs.info("egress_pool",
+                      f"TP 分配释放 zh-{account_id}: 无分配可释（幂等成功）")
+        else:
+            logs.info("egress_pool", f"TP 分配已释放: zh-{account_id}")
         return True
     logs.warn("egress_pool",
               f"TP 分配释放失败 zh-{account_id}: HTTP {st} {raw.strip()[:100]}")
@@ -239,15 +262,21 @@ async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
         None, _tp_headers(), 15)
     if st == 200:
         try:
-            now = _dt.datetime.now()
+            # now 取 aware 本地时；台账时间 naive 视为本地（TP 与 hub 同机）、
+            # aware astimezone 归一——避免 aware/naive 相减抛 TypeError 使整个
+            # 快照崩掉（2026-11-18 review P3）。
+            now = _dt.datetime.now().astimezone()
             for b in json.loads(raw):
                 until = b.get("quarantined_until")
                 if not until:
                     continue
                 try:
-                    if _dt.datetime.fromisoformat(str(until)) > now:
+                    u = _dt.datetime.fromisoformat(str(until))
+                    if u.tzinfo is None:
+                        u = u.astimezone()
+                    if u > now:
                         banned.add(b.get("node_name") or "")
-                except ValueError:
+                except (ValueError, TypeError):
                     continue
         except ValueError:
             pass
@@ -317,6 +346,7 @@ class TetherPoolEgress:
         # acquire 失败的 no-op rebalance 吃掉后续 120s 内更高优的 ban 触发）
 
         old_node = account.egress_node
+        orig_node = old_node  # 原始节点恒定（old_node 会被轮内被 ban 候选改写）
         jwt = account.jwt_token or ""
         # exclude 必须含本账号要离开的旧节点（2026-11-16 生产实证：exclude 只有
         # 其它账号的节点时，force_rebalance 会把绑定换回原节点 = 假换绑——
@@ -334,9 +364,24 @@ class TetherPoolEgress:
         own_aid = "zh-" + str(account.id)
         snapshot_ok = bool(live_allocs) or bool(live_banned)
         if not snapshot_ok:
-            from . import logs
             logs.warn("egress_pool",
                       f"{account.name} TP 实时对账快照拉取失败——本轮冲突检查跳过")
+
+        async def _ground_truth_recheck(node: str) -> str:
+            """收货前地面真相复核（2026-11-18 review P2#1）：收货快照与提交
+            之间隔了探针 + alicdn 整文件验收（秒~十秒级窗口），同 service 其它
+            账号的 rebalance/删除释放会在窗口内改写分配台账——提交前重拉一次。
+            返回冲突描述；快照拉取失败返回空串（fail-open，与收货快照同语义）。"""
+            re_allocs, re_banned = await _tp_live_snapshot()
+            if not re_allocs and not re_banned:
+                return ""
+            if node in re_banned:
+                return "在期隔离节点（复核）"
+            holders = [aid for aid, n in re_allocs.items()
+                       if n == node and aid != own_aid]
+            if holders:
+                return f"其它分配占用（{holders[0]}，复核）"
+            return ""
 
         for attempt in range(1, 4):
             if attempt == 1 and ban and old_node:
@@ -398,6 +443,15 @@ class TetherPoolEgress:
                               f"{account.name} 新节点 {node} zcode 探针放行但 alicdn "
                               f"路由不合格（{detail}）——换下一个候选（不 ban）")
                     continue
+                # 收货复核（review P2#1）：验收窗口内台账可能已被其它账号的
+                # rebalance/删除释放改写——提交前重查地面真相，冲突即换下一个
+                # 候选（候选已在 exclude，不会回收打转）。
+                conflict2 = await _ground_truth_recheck(node)
+                if conflict2:
+                    logs.warn("egress_pool",
+                              f"{account.name} 候选 {node} 收货复核冲突"
+                              f"（{conflict2}）——换下一个候选")
+                    continue
                 account.egress_node = node
                 store.update_account(account)
                 # 换绑成功即清探针失败计数：旧节点累积的 streak 不能背到
@@ -424,23 +478,52 @@ class TetherPoolEgress:
                              extra_exclude=exclude)
         if d and d.get("node_name"):
             node = d.get("node_name")
-            conflict = ""
-            if snapshot_ok:
-                if node == old_node:
-                    conflict = "假换绑（==旧节点）"
-                elif node in live_banned:
-                    conflict = "在期隔离节点"
-                else:
-                    holders = [aid for aid, n in live_allocs.items()
-                               if n == node and aid != own_aid]
-                    if holders:
-                        conflict = f"其它分配占用（{holders[0]}）"
+            # 第 4 轮以地面真相复核先行（review P3：冲突候选不烧探针；review
+            # P2#1：收货快照已旧，判定以复核快照为准），fail-open 保持既有
+            # 行为（快照坏 → 探针决定去留）。
+            re_allocs, re_banned = await _tp_live_snapshot()
+            re_ok = bool(re_allocs) or bool(re_banned)
+            re_holders = [aid for aid, n in re_allocs.items()
+                          if n == node and aid != own_aid] if re_ok else []
+            re_banned_hit = node in re_banned if re_ok else False
+            if re_ok and (re_banned_hit or re_holders):
+                logs.warn("egress_pool",
+                          f"{account.name} 3 轮均败，第 4 轮候选 {node} 复核冲突"
+                          f"（{'在期隔离' if re_banned_hit else '其它分配占用 ' + re_holders[0]}）"
+                          f"——不烧探针直接判败，TP 绑定停留在此，人工介入")
+                account.egress_node = node  # hub 记录对齐 TP 实际绑定
+                store.update_account(account)
+                return False
             st, raw = await self._probe_via(account, probe_url, jwt)
             ok_cd, _elapsed, cd_detail = await probe_alicdn(probe_url, full=True)
-            if conflict or st == 0 or _edge_kind(raw) != "JSON-APP" or not ok_cd:
+            if re_ok and node == orig_node:
+                # P2#2 单节点池退化（2026-11-18 review）：4 轮全为「TP 无视
+                # exclude 粘性返回原节点」= 池内已无替代节点，而非分配器随机
+                # 破约。此时若不在隔离台账（ban=True 时原节点已被我们自己 ban，
+                # 必在台账 → 走上面的复核冲突判败，不会到这里）、无他人占用、
+                # 且全新全量验收（zcode JSON-APP + alicdn 整文件）通过 → 降级
+                # 接受原节点 + 显式归因，区分「分配器破约」与「池枯」。
+                if st != 0 and _edge_kind(raw) == "JSON-APP" and ok_cd:
+                    logs.warn("egress_pool",
+                              f"⚠️ {account.name} 4 轮全为假换绑（{orig_node}）"
+                              f"= 池内无替代节点，全新全量验收通过 → 降级接受"
+                              f"原节点（exit={d.get('exit_ip')}）继续观察；"
+                              f"节点若真坏由健康循环再触发")
+                    account.egress_node = node
+                    store.update_account(account)
+                    self.clear_probe_streak(account.id)
+                    return True
+                logs.warn("egress_pool",
+                          f"{account.name} 3 轮均败，第 4 轮仍回原节点 {node} "
+                          f"且验收不过（zcode={_edge_kind(raw)} alicdn={cd_detail}）"
+                          f"——判败，人工介入")
+                account.egress_node = node
+                store.update_account(account)
+                return False
+            if st == 0 or _edge_kind(raw) != "JSON-APP" or not ok_cd:
                 logs.warn("egress_pool",
                           f"{account.name} 3 轮均败，回绑候选 {node} 仍不过"
-                          f"（{conflict or f'zcode={_edge_kind(raw)} alicdn={cd_detail}'}；"
+                          f"（zcode={_edge_kind(raw)} alicdn={cd_detail}；"
                           f"TP 绑定停留在此，人工介入）")
                 account.egress_node = node  # hub 记录对齐 TP 实际绑定
                 store.update_account(account)

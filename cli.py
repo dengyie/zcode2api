@@ -165,18 +165,24 @@ def cmd_remove_account(args: list[str]) -> None:
     if len(args) < 2:
         print(c("格式: python cli.py remove-account <provider> <id|name>", "red"))
         return
-    # 先解析账号拿 id（删除后 find_any 即 None，TP 释放需要 id 构造 zh-<id>）
-    acc = store.find_any(args[1])
+    # 先解析账号拿 id（删除后即 None，TP 释放需要 id 构造 zh-<id>）。用
+    # store.find(provider, id_or_name)——find_any 只认 id，不支持按名字删
+    # （2026-11-18 review P3）。
+    acc = store.find(args[0], args[1])
     if store.remove_account(args[0], args[1]):
         # TP 分配随账号删除一并释放（2026-11-18 review P2 根修，与 admin
-        # 删除路径同口径）：孤儿分配永久占节点，池压下挤歪现役账号。
+        # 删除路径同口径）：孤儿分配永久占节点，池压下挤歪现役账号。gate 同
+        # admin 口径补灰度名单检查。
         if acc is not None:
             import asyncio as _aio
 
+            from app import egress as _egress
             from app import settings as _settings
             from app.egress_pool import tp_release_account
 
-            if _settings.EGRESS_SUPPLY == "tetherpool" and _settings.PER_ACCOUNT_EGRESS:
+            if (_settings.EGRESS_SUPPLY == "tetherpool"
+                    and _settings.PER_ACCOUNT_EGRESS
+                    and _egress.tetherpool_enabled_for(acc)):
                 try:
                     _aio.run(tp_release_account(acc.id))
                 except Exception as err:  # noqa: BLE001 - 释放失败不影响删除结果

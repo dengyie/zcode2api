@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -22,6 +23,7 @@ from app.models import Account
 # autouse fixture 会把 probe_alicdn 换成恒过假探针；probe_alicdn 本体的
 # 单测需要真实现——在 import 期（fixture 生效前）捕获原函数引用。
 _REAL_PROBE_ALICDN = egress_pool.probe_alicdn
+_REAL_TP_SNAPSHOT = egress_pool._tp_live_snapshot
 
 
 @pytest.fixture
@@ -857,3 +859,271 @@ async def test_delete_account_handler_releases_tp_allocation(monkeypatch, tp_mod
     assert out == {"deleted": 1}
     assert fake.removed == ["acc-del"]
     assert released == ["acc-del"]
+
+
+# ── 2.7.65 review 收尾批次 ──────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_release_account_success_false_is_idempotent_ok(monkeypatch, tp_mode):
+    """HTTP 200 + body success:false = 无分配可释（幂等成功），必须返回 True
+    且不落 warn（2026-11-18 review P3：此前只看状态码）。"""
+    calls: list[tuple] = []
+
+    def _fake_http(method, url, body=None, headers=None, timeout=15):
+        calls.append((method, url))
+        return 200, '{"success": false, "error": "no allocation"}'
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
+    ok = await egress_pool.tp_release_account("acc-rel")
+    assert ok is True
+    assert len(calls) == 1 and "release" in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_release_account_http_500_returns_false(monkeypatch, tp_mode):
+    def _fake_http(method, url, body=None, headers=None, timeout=15):
+        return 500, "boom"
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
+    assert await egress_pool.tp_release_account("acc-rel2") is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_accepts_aware_and_naive_quarantine(monkeypatch, tp_mode):
+    """quarantined_until 带 tzinfo（aware）不得 TypeError 崩快照（review P3）：
+    aware/naive 都归一后正确入隔离集；过期/坏格式跳过。"""
+    import datetime as _dt
+
+    future_aware = (_dt.datetime.now().astimezone()
+                    + _dt.timedelta(hours=1)).isoformat()
+    past_aware = (_dt.datetime.now().astimezone()
+                  - _dt.timedelta(hours=1)).isoformat()
+    payload = [
+        {"node_name": "n-aware-future", "quarantined_until": future_aware},
+        {"node_name": "n-aware-past", "quarantined_until": past_aware},
+        {"node_name": "n-naive-future",
+         "quarantined_until": (_dt.datetime.now() + _dt.timedelta(hours=1)).isoformat()},
+        {"node_name": "n-garbage", "quarantined_until": "not-a-date"},
+        {"node_name": "n-null", "quarantined_until": None},
+    ]
+
+    def _fake_http(method, url, body=None, headers=None, timeout=15):
+        if "/feedback/bans" in url:
+            return 200, json.dumps(payload)
+        return 200, "[]"
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _REAL_TP_SNAPSHOT)
+    allocs, banned = await egress_pool._tp_live_snapshot()
+    assert "n-aware-future" in banned
+    assert "n-naive-future" in banned
+    assert "n-aware-past" not in banned
+    assert "n-garbage" not in banned and "n-null" not in banned
+    assert allocs == {}
+
+
+@pytest.mark.asyncio
+async def test_main_loop_post_acceptance_recheck_rejects_holder(tp_mode, monkeypatch):
+    """P2#1 收货复核：验收窗口内台账被其它账号占用（复核快照 != 收货快照）
+    → 候选拒绝换下一个。"""
+    acc = _account(acc_id="acc-recheck")
+    acc.egress_node = "old-node"
+    stub = _StubPool(
+        [{"node_name": "cand-a", "exit_ip": "1.2.3.4"},
+         {"node_name": "cand-b", "exit_ip": "1.2.3.5"}],
+        [(405, '{"code":3012}')],  # 主循环候选探针恒 JSON-APP
+    )
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+
+    async def _probe_ok(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe_ok)
+
+    # 收货快照空（fail-open 放行探针链）→ 复核快照发现 cand-a 已被他人占用
+    snapshots = iter([
+        ({}, set()),                                  # 收货快照（rebalance 开头）
+        ({"zh-other": "cand-a"}, set()),              # 候选 cand-a 收货复核
+        ({}, set()),                                  # 候选 cand-b 收货复核
+    ])
+
+    async def _seq_snapshot():
+        return next(snapshots)
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _seq_snapshot)
+
+    ok = await egress_pool.egress_pool.rebalance(acc, reason="test", ban=False)
+    assert ok is True
+    assert acc.egress_node == "cand-b"  # cand-a 被复核拒绝，落在 cand-b
+
+
+@pytest.mark.asyncio
+async def test_round4_conflict_short_circuits_before_probes(tp_mode, monkeypatch):
+    """review P3：第 4 轮候选命中复核冲突 → 不烧探针直接判败。"""
+    acc = _account(acc_id="acc-r4sc")
+    acc.egress_node = "old-node"
+
+    async def _fake_acquire(account, force_rebalance=False, extra_exclude=None):
+        return {"node_name": f"cand-{len(extra_exclude or [])}"}
+
+    probe_calls: list[int] = []
+
+    async def _probe(self, account, proxy_url, jwt):
+        probe_calls.append(1)
+        return 0, '{"code":3012}'
+
+    async def _noop_ban(node, reason, evidence, account_name):
+        pass
+
+    monkeypatch.setattr(egress_pool, "tp_acquire", _fake_acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", _noop_ban)
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe)
+
+    # 复核快照恒返回 cand-* 全部被 zh-other 占用
+    async def _conflict_snapshot():
+        return {"zh-other": "cand-4"}, set()
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _conflict_snapshot)
+
+    ok = await egress_pool.egress_pool.rebalance(acc, reason="test", ban=False)
+    assert ok is False
+    assert len(probe_calls) == 3, \
+        "主循环 3 轮探针合法；第 4 轮复核冲突候选不得烧探针"
+
+
+@pytest.mark.asyncio
+async def test_round4_same_node_degrade_accept_on_fresh_acceptance(tp_mode, monkeypatch):
+    """P2#2 单节点池退化：4 轮全为假换绑（TP 粘性返回原节点）+ 不在隔离台账
+    + 无他人占用 + 全新全量验收通过 → 降级接受原节点并恢复服务。"""
+    acc = _account(acc_id="acc-degrade")
+    acc.egress_node = "only-node"
+
+    async def _fake_acquire(account, force_rebalance=False, extra_exclude=None):
+        return {"node_name": "only-node", "exit_ip": "5.6.7.8"}
+
+    async def _probe(self, account, proxy_url, jwt):
+        return 405, '{"code":3012}'  # zcode 探针 JSON-APP 放行
+
+    async def _ok_cd(proxy_url, *, full=False, fetch_impl=None):
+        assert full is True, "降级验收必须整文件档"
+        return True, 1.0, "ok"
+
+    async def _noop_ban(node, reason, evidence, account_name):
+        pass
+
+    # 复核快照干净：only-node 既不在隔离台账也无他人占用（ban=False 路径）
+    async def _clean_snapshot():
+        return {"zh-acc-degrade": "only-node"}, set()
+
+    monkeypatch.setattr(egress_pool, "tp_acquire", _fake_acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", _noop_ban)
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe)
+    monkeypatch.setattr(egress_pool, "probe_alicdn", _ok_cd)
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _clean_snapshot)
+
+    ok = await egress_pool.egress_pool.rebalance(acc, reason="test", ban=False)
+    assert ok is True, "池内无替代节点 + 全新验收通过应降级接受"
+    assert acc.egress_node == "only-node"
+
+
+@pytest.mark.asyncio
+async def test_round4_same_node_degrade_rejected_when_banned(tp_mode, monkeypatch):
+    """P2#2 反例：ban=True 时原节点被自己 ban 进台账 → 复核冲突判败，
+    绝不降级接受刚隔离的节点。"""
+    acc = _account(acc_id="acc-degrade2")
+    acc.egress_node = "only-node"
+
+    async def _fake_acquire(account, force_rebalance=False, extra_exclude=None):
+        return {"node_name": "only-node", "exit_ip": "5.6.7.8"}
+
+    probe_calls: list[int] = []
+
+    async def _probe(self, account, proxy_url, jwt):
+        probe_calls.append(1)
+        return 405, '{"code":3012}'
+
+    async def _noop_ban(node, reason, evidence, account_name):
+        pass
+
+    # 复核快照：only-node 在期隔离（自家 ban 生效）
+    async def _banned_snapshot():
+        return {}, {"only-node"}
+
+    monkeypatch.setattr(egress_pool, "tp_acquire", _fake_acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", _noop_ban)
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe)
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _banned_snapshot)
+
+    ok = await egress_pool.egress_pool.rebalance(acc, reason="test", ban=True)
+    assert ok is False
+    assert acc.egress_node == "only-node"  # hub 记录对齐 TP 实际绑定
+
+
+def test_alicdn_full_fetch_caps_oversize(monkeypatch, tp_mode):
+    """review P3：full=True 整文件读封顶 4MB——异常超大响应判不合格而非读爆。"""
+    import io
+
+    class _HugeResp(io.RawIOBase):
+        """伪造无限流响应：每次 read 都有数据（模拟代理劫持/异常大文件）。"""
+
+        def readable(self):
+            return True
+
+        def read(self, size=-1):
+            return b"x" * (size if size and size > 0 else 65536)
+
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, size=-1):
+            return b"x" * (size if size and size > 0 else 65536)
+
+        def close(self):
+            pass
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _FakeResp()
+
+    monkeypatch.setattr(egress_pool, "_opener", lambda proxy: _FakeOpener())
+    st, detail = egress_pool._alicdn_fetch("http://gw", 5.0, full=True)
+    assert st == 0 and "oversize" in detail
+
+
+@pytest.mark.asyncio
+async def test_delete_gate_skips_graylist_excluded_account(monkeypatch, tp_mode):
+    """review Suggestion：灰度名单非空且账号不在名单 → 从未持有 TP 分配，
+    删除路径不得调 release。"""
+    from app.routes import admin_api as admin
+
+    monkeypatch.setattr(settings, "TP_GRAY_ACCOUNTS", ["some-other-account"])
+
+    class _FakeStore:
+        def __init__(self, acc):
+            self.acc = acc
+
+        def find_any(self, aid):
+            return self.acc if self.acc and self.acc.id == aid else None
+
+        def remove_account(self, provider, aid):
+            return True
+
+    fake = _FakeStore(_account(acc_id="acc-gray"))
+    monkeypatch.setattr(admin, "store", fake)
+    released: list[str] = []
+
+    async def fake_release(account_id: str) -> bool:
+        released.append(account_id)
+        return True
+
+    monkeypatch.setattr(egress_pool, "tp_release_account", fake_release)
+
+    out = await admin.delete_accounts(["acc-gray"])
+    assert out == {"deleted": 1}
+    assert released == []  # 不在灰度名单 = 不释放（从未分配）

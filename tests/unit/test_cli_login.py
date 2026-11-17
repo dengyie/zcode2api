@@ -57,3 +57,29 @@ async def test_login_persists_oauth_token_for_jwt_account(monkeypatch, fresh_app
     assert jwt_acc.public_view()["has_oauth_token"] is True
     # 兑换链路不受影响：API Key 账号仍然入池
     assert any(a.api_key == "api-key-0001" for a in fresh_app.list_accounts("zai"))
+
+
+
+def test_remove_account_resolves_by_name(monkeypatch, fresh_app):
+    """review P3：cli remove-account 用 store.find(provider, id_or_name)——
+    find_any 只认 id，按名字删除时 TP 释放拿不到账号。"""
+
+    import app.egress_pool as ep
+    from app import settings as app_settings
+
+    acc = fresh_app.add_account("zai", "my-acc-name", "jwt-secret-1")
+    monkeypatch.setattr(cli, "store", fresh_app)
+    monkeypatch.setattr(app_settings, "EGRESS_SUPPLY", "tetherpool")
+    monkeypatch.setattr(app_settings, "PER_ACCOUNT_EGRESS", True)
+
+    released: list[str] = []
+
+    async def fake_release(account_id: str) -> bool:
+        released.append(account_id)
+        return True
+
+    monkeypatch.setattr(ep, "tp_release_account", fake_release)
+
+    cli.cmd_remove_account(["zai", "my-acc-name"])  # 按名字删
+    assert released == [acc.id], "按名删除必须先解析出 id 再释放 TP 分配"
+    assert fresh_app.find("zai", "my-acc-name") is None
