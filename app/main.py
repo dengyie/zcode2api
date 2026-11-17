@@ -147,6 +147,7 @@ async def lifespan(app: FastAPI):
         flushed = reqlog.shutdown_flush()
         if flushed:
             logs.info("reqlog", f"停机收口在途请求 ×{flushed}")
+        logs.opslog_close()  # opslog 落盘句柄收口（防停机缓冲丢失）
         await monitor.stop()
         await claim_round.stop()
         await version_tracker.stop()

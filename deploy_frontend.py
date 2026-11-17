@@ -35,13 +35,14 @@ def main():
     n = 0
     for rel in (ROOT / "frontend" / "admin").rglob("*.html"):
         t = rel.read_text(encoding="utf-8")
+        # 先刷新已有 ?v=，再给尚无参数的引用打标（两步都写回）
         t = re.sub(r'(href="css/app\.css)\?v=[\w.]+"', r"\1?v=" + new + '"', t)
         t = re.sub(r'(src="(?:vendor|js)/[A-Za-z0-9_]+\.js)\?v=[\w.]+"', r"\1?v=" + new + '"', t)
-        t2 = re.sub(r'(href="css/app\.css)"', r"\1?v=" + new + '"', t)
-        t2 = re.sub(r'(src="(?:vendor|js)/[A-Za-z0-9_]+\.js)"', r"\1?v=" + new + '"', t2)
-        if t2 != t:
-            n += t2.count("?v=" + new)
-            rel.write_text(t2, encoding="utf-8")
+        t = re.sub(r'(href="css/app\.css)"', r"\1?v=" + new + '"', t)
+        t = re.sub(r'(src="(?:vendor|js)/[A-Za-z0-9_]+\.js)"', r"\1?v=" + new + '"', t)
+        if "?v=" + new in t:
+            n += t.count("?v=" + new)
+            rel.write_text(t, encoding="utf-8")
     print(f"cache-bust refs -> ?v={new}: {n}")
 
     sh("git add frontend/ && git commit -m 'chore(frontend): release " + new + "' || true", check=False)
