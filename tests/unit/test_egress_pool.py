@@ -151,7 +151,10 @@ async def test_rebalance_bans_dead_probes_then_succeeds(tp_mode, monkeypatch):
 
     assert ok is True
     assert acc.egress_node == "cand-2"
-    assert stub.bans == ["old-node", "cand-1"]  # 死探针的候选也被隔离
+    # 2.7.68 ban 延后到确认离开：轮内死探针候选照常隔离，orig_node 在成功
+    # 换绑后才隔离（旧实现 attempt-1 先 ban old-node，TP 粘性回同节点时
+    # 唯一可用节点进隔离台账且降级接受路径被堵死）
+    assert stub.bans == ["cand-1", "old-node"]
 
 
 @pytest.mark.asyncio
@@ -394,9 +397,45 @@ async def test_ensure_binding_passes_exclude_node(tp_mode, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rebalance_gateway_abort_aligns_binding(tp_mode, monkeypatch):
+    """2.7.68 网关级熔断：连续候选探针连接级失败 = 本地网关故障，rebalance
+    中止且不再 churn；退出前 hub 记录经 TP 快照对齐实际绑定（分叉=互斥集合
+    被污染）。"""
+    seq = {"probe": 0}
+
+    async def fake_tp_ban(node, reason, evidence, account_name):
+        pass
+
+    async def fake_tp_acquire(account, force_rebalance=False, extra_exclude=None):
+        seq["probe"] += 1
+        return {"node_name": f"node-cand-{seq['probe']}"}
+
+    async def fake_probe(account, proxy_url, jwt):
+        return 0, "ConnectError: dead"  # 全部候选连接级失败（网关死的形态）
+
+    async def fake_snapshot():
+        # TP 侧已完成 2 次 force_rebalance，实际绑定在第 2 候选
+        return {"zh-acc-r1": "node-cand-2"}, set()
+
+    monkeypatch.setattr(egress_pool, "tp_ban", fake_tp_ban)
+    monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    monkeypatch.setattr(egress_pool.egress_pool, "_probe_via", fake_probe)
+
+    acc = _account(acc_id="acc-r1", name="r1")
+    acc.egress_node = "node-old"
+
+    ok = await egress_pool.egress_pool.rebalance(acc, reason="health_probe_fail", ban=False)
+    assert ok is False  # 熔断 = 未达成健康换绑
+    assert acc.egress_node == "node-cand-2", \
+        "hub 记录必须对齐 TP 实际绑定（分叉 = 互斥集合被污染）"
+
+
+@pytest.mark.asyncio
 async def test_rebalance_recovers_after_all_rounds_fail(tp_mode, monkeypatch):
-    """rebalance 3 轮全败：服务端绑定已随 force_rebalance 移走——第 4 轮
-    acquire+探针验收，hub 记录必须对齐 TP 实际绑定（不留在旧节点）。"""
+    """熔断关闭（TP_GATEWAY_FAIL_ABORT=0）时的既有行为回归：rebalance 3 轮
+    全败——服务端绑定已随 force_rebalance 移走——第 4 轮 acquire+探针验收，
+    hub 记录必须对齐 TP 实际绑定（不留在旧节点）。"""
     seq = {"probe": 0}
 
     async def fake_tp_ban(node, reason, evidence, account_name):
@@ -409,6 +448,7 @@ async def test_rebalance_recovers_after_all_rounds_fail(tp_mode, monkeypatch):
         seq["probe"] += 1
         return 0, "ConnectError: dead"  # 前三轮全部探不通
 
+    monkeypatch.setattr(settings, "TP_GATEWAY_FAIL_ABORT", 0)
     monkeypatch.setattr(egress_pool, "tp_ban", fake_tp_ban)
     monkeypatch.setattr(egress_pool, "tp_acquire", fake_tp_acquire)
     monkeypatch.setattr(egress_pool.egress_pool, "_probe_via", fake_probe)
@@ -989,6 +1029,9 @@ async def test_round4_conflict_short_circuits_before_probes(tp_mode, monkeypatch
     monkeypatch.setattr(egress_pool, "tp_acquire", _fake_acquire)
     monkeypatch.setattr(egress_pool, "tp_ban", _noop_ban)
     monkeypatch.setattr(egress_pool.TetherPoolEgress, "_probe_via", _probe)
+    # 本测试探针桩返回 st=0（连接级失败）——2.7.68 起这会触发网关级熔断；
+    # 此处关注第 4 轮短路语义，显式关闭熔断（熔断另有专测）
+    monkeypatch.setattr(settings, "TP_GATEWAY_FAIL_ABORT", 0)
 
     # 复核快照恒返回 cand-* 全部被 zh-other 占用
     async def _conflict_snapshot():
@@ -1128,3 +1171,65 @@ async def test_delete_gate_skips_graylist_excluded_account(monkeypatch, tp_mode)
     out = await admin.delete_accounts(["acc-gray"])
     assert out == {"deleted": 1}
     assert released == []  # 不在灰度名单 = 不释放（从未分配）
+
+
+@pytest.mark.asyncio
+async def test_rebalance_debounce_stamped_at_end(tp_mode, monkeypatch):
+    """2.7.68 去抖戳 = 本轮收尾时刻：成功 rebalance（2-3 分钟 > 120s 去抖）
+    结束瞬间，下一个触发必须被去抖拦住（旧实现取入口/首轮 acquire 时刻，
+    长轮一结束去抖窗已耗尽 = 故障期背靠背无限 churn）。"""
+    stub = _StubPool(
+        [{"node_name": "cand-1", "exit_ip": "1.2.3.4"}],
+        [(405, '{"code":3012}')],
+    )
+    monkeypatch.setattr(egress_pool, "tp_acquire", stub.acquire)
+    monkeypatch.setattr(egress_pool, "tp_ban", stub.ban)
+
+    async def _empty_snapshot():
+        return {}, set()
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _empty_snapshot)
+    acc = _account(acc_id="acc-z")
+    acc.egress_node = "old-node"
+
+    pool = egress_pool.TetherPoolEgress()
+    monkeypatch.setattr(settings, "TP_REBALANCE_DEBOUNCE", 120)
+    ok = await pool.rebalance(acc, reason="edge_405_html", ban=False)
+    assert ok is True
+    first_end = pool._rebalance_at[acc.id]
+    assert first_end > 0
+    # 立即第二次触发：去抖窗内（戳是收尾时刻）→ 跳过
+    ok2 = await pool.rebalance(acc, reason="edge_405_html", ban=False)
+    assert ok2 is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_orphans_releases_stale_allocations(tp_mode, monkeypatch):
+    """2.7.68 启动对账：allocs 里 zh-<id> 不在本库账号集合 → release；
+    在库 id 与非 zh- 前缀不动。"""
+
+    released: list[str] = []
+
+    async def fake_release(account_id: str) -> bool:
+        released.append(account_id)
+        return True
+
+    async def fake_snapshot():
+        return {"zh-live-1": "node-a", "zh-stale-old": "node-b",
+                "other-service-acc": "node-c"}, set()
+
+    class _FakeStore:
+        @staticmethod
+        def list_accounts(provider):
+            return [_account(acc_id="live-1")]
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    monkeypatch.setattr(egress_pool, "tp_release_account", fake_release)
+    import app.egress_pool as _ep
+    monkeypatch.setattr(_ep, "PROVIDERS", ("zai",))
+    monkeypatch.setattr("app.store.store.list_accounts",
+                        lambda provider: [_account(acc_id="live-1")])
+
+    pool = egress_pool.egress_pool
+    await pool._reconcile_orphans_once(initial_delay=0)
+    assert released == ["stale-old"]

@@ -155,6 +155,21 @@ def _normalize_captcha_region(config: dict, tag: str) -> None:
         logs.info("captcha", f"出口 {tag} 配置 region=sgp 归一为 cn（sgp 端点 headless 必败，签发与校验头同走 cn）")
 
 
+def _timeout_attribution(attribution: str | None) -> bool:
+    """超时型归因判定（2.7.68 链式超时止损）。
+
+    覆盖 11-18 晚主故障形态：DEADLINE（runner 硬截止）/ TRACELESS:TIMEOUT /
+    EXC:TimeoutError / SETUP:TimeoutError / 求解进程超时（>240s SIGKILL）。
+    这些形态共享同一语义——求解链没能在预算内完成——换 context / 换求解进程
+    都改变不了环境，连续出现即环境级失败（与 DEGRADED 同级），继续跑满重试
+    预算纯白烧（当晚 159 次求解 0 成功，主形态即链式超时，每号白烧 16 分钟）。
+    """
+    if not attribution:
+        return False
+    up = attribution.upper()
+    return "TIMEOUT" in up or "DEADLINE" in up or "求解进程超时" in attribution
+
+
 class CaptchaManager:
     def __init__(self) -> None:
         # 按出口分池：token 只能用在签发它的那个出口上，混池会让请求与
@@ -397,12 +412,16 @@ class CaptchaManager:
                 self._put(token, one)
 
     async def get_verify_param(self, egress_tag: str | None = None,
-                               proxy: str | None = None) -> tuple[str, str | None]:
+                               proxy: str | None = None,
+                               retries: int | None = None) -> tuple[str, str | None]:
         """取一枚可用 token：优先池内现成的（跳过过期），池空才同步现解。
 
         `egress_tag` 必须是本次请求真实使用的出口（per-account 模式 = 账号绑定
         代理 URL），否则拿到的 token 与请求 IP 不一致，上游会判 unusual
         activity。只有热路径出口有池；其它出口现解。
+        `retries`：本调用的求解重试预算覆盖（2.7.68 预算解耦）——claim 链传
+        `CAPTCHA_CLAIM_SOLVE_RETRIES`（缺省 2），messages 池路径不传走全量
+        `CAPTCHA_SOLVE_RETRIES`（热路径可用性兜底值得跑满）。
 
         返回 (verify_param, region)。region 可为 None（旧求解器无 region 概念）。
         """
@@ -426,28 +445,34 @@ class CaptchaManager:
 
         # 2) 池空/全过期/非热路径出口：同步现解一次
         config = await self.fetch_config(tag, proxy)
-        token, err = await self._solve_one(config, tag, proxy)
+        token, err = await self._solve_one(config, tag, proxy, max_retries=retries)
         if token is None:
             raise CaptchaSolveError(f"验证码求解失败: {err or '多次重试无结果'}")
         return token.param, token.region
 
     # ── 求解 ─────────────────────────────────────────────────────────────────
     async def _solve_one(self, config: dict, tag: str = egress.DIRECT,
-                         proxy: str | None = None
+                         proxy: str | None = None,
+                         max_retries: int | None = None,
                          ) -> tuple[_Token | None, str | None]:
         """跑满重试预算求一枚 token。返回 (token | None, 最终归因 | None)。
 
         归因（2026-11-18 review P2#6 根修）从共享单槽 `self._last_error` 改为
         本调用局部变量：_solve_sem 只包住 _run_solver 进程段，此前的共享槽在
         多账号并发求解（admin /claim 逐号 + 轮次 + 消息热路径池空现解）下互相
-        覆盖，A 号的 DEGRADED 止损判定可能读到 B 号的异常文案——误止损/漏止损。"""
+        覆盖，A 号的 DEGRADED 止损判定可能读到 B 号的异常文案——误止损/漏止损。
+        `max_retries`：重试预算覆盖（2.7.68 预算解耦）——claim 链传小值防单号
+        长尾吃穿领取窗口；None = settings.CAPTCHA_SOLVE_RETRIES 全量。
+        """
         scene = config.get("sceneId") or constants.CAPTCHA_DEFAULTS["sceneId"]
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
+        retries = max(1, int(max_retries or settings.CAPTCHA_SOLVE_RETRIES))
 
         attribution: str | None = None
         last_err: str | None = None
-        for attempt in range(1, settings.CAPTCHA_SOLVE_RETRIES + 1):
+        timeout_streak = 0  # 连续超时型归因计数（跨 attempt，非超时归因清零）
+        for attempt in range(1, retries + 1):
             fail_code: str | None = None
             try:
                 # 进程级并发上限：超出排队等前一个浏览器退出，避免内存被打满
@@ -463,7 +488,7 @@ class CaptchaManager:
             # 归因优先级：本轮 fail_code（求解器内部归因，如 SLIDEX_FAIL /
             # 求解超时）> 异常文案 > 往轮归因（延续）。共享槽竞态已随局部化根除。
             attribution = fail_code or last_err or attribution
-            logs.warn("captcha", f"第 {attempt}/{settings.CAPTCHA_SOLVE_RETRIES} 次求解未果，重试…")
+            logs.warn("captcha", f"第 {attempt}/{retries} 次求解未果，重试…")
             # 环境级失败快速止损（2.7.60 实弹定案）：DEGRADED = 阿里云对
             # headless 无痕的判定收紧（2026-11-18 深夜对照实验：TP 出口与
             # 直连 CN 同窗全灭，同形态「假成功回调降级 param + popup 不出」
@@ -477,6 +502,21 @@ class CaptchaManager:
                     f"不再重试（出口={tag}）",
                 )
                 break
+            # 链式超时止损（2.7.68）：DEADLINE / TIMEOUT / 求解进程超时等形态
+            # 此前不命中任何止损，每号照样跑满 4×240s。连续
+            # CAPTCHA_TIMEOUT_GIVEUP_AFTER 次（换过 context/进程仍超时）=
+            # 环境级失败，第 N 次起不再白烧。
+            if _timeout_attribution(attribution):
+                timeout_streak += 1
+                if timeout_streak >= settings.CAPTCHA_TIMEOUT_GIVEUP_AFTER:
+                    logs.warn(
+                        "captcha",
+                        f"求解归因连续 {timeout_streak} 次超时型"
+                        f"（{attribution}）——环境级失败，止损不再重试（出口={tag}）",
+                    )
+                    break
+            else:
+                timeout_streak = 0
 
         msg = attribution or last_err or "多次重试无结果"
         logs.warn("captcha", f"求解失败: {msg}")

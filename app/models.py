@@ -109,6 +109,19 @@ def _plan_bonus_active(plan: dict, now: float) -> bool:
     return False
 
 
+def _remaining_positive(window: dict) -> bool:
+    """窗口余量是否应视为「有量」（2.7.68 统一口径）。
+
+    `remaining` 缺失/None = **未知但有量**（window_usable / _max_remaining
+    同款约定：上游有的窗口只给 total/used）。此前 quota_expired /
+    next_window_start 的快速通道用 `(w.get("remaining") or 0) > 0`，把 None
+    混同成 0，在 `quota_verified_at` 证据门之前就短路判死——与 window_usable
+    的「缺失=未知但有量」直接矛盾，且日窗翻新 + 快照缺 remaining 的号无法
+    自愈（与 2.7.8 要救的「能用的号被永久封死」同型）。"""
+    remaining = window.get("remaining")
+    return remaining is None or remaining > 0
+
+
 def jwt_upstream_uid(token: str | None) -> str | None:
     """从 JWT 解析上游身份（**user_id claim**）——同一上游账号跨次登录签发的
     token 不同，但 user_id 恒定。账号去重按 uid 而非 token 全文（2026-11-15
@@ -291,8 +304,9 @@ class Account:
         now = now or time.time()
         if any(window_usable(w, now) for w in self.quota.values()):
             return False
-        # 余额本身已归零 = 确定耗尽，与快照新旧无关（赠送池由调用方另判）
-        if not any((w.get("remaining") or 0) > 0 for w in self.quota.values()):
+        # 余额本身已归零 = 确定耗尽，与快照新旧无关（赠送池由调用方另判）。
+        # remaining 缺失/None = 未知但有量，不算归零（2.7.68 口径统一）
+        if not any(_remaining_positive(w) for w in self.quota.values()):
             return True
         # 有余额、但每个窗口都过了期：可能只是快照停在上一轮日窗 → 需确认
         ends = [e for e in (expires_epoch(w.get("expires_at")) for w in self.quota.values()) if e]
@@ -320,14 +334,11 @@ class Account:
         if any(window_usable(w, now) for w in self.quota.values()):
             return 0.0
         # 一次性赠送池在 balance 里不出现，但其额度真实可用：有它就不拦
-        plan_now = self.plan or {}
-        if _plan_bonus_active(plan_now, now) or any(
-            _plan_bonus_active(p, now) for p in (self.plans or [])
-        ):
+        if self._bonus_usable(now):
             return 0.0
         if not self.quota:
             return None  # 新号/未刷新 = 未知
-        if not any((w.get("remaining") or 0) > 0 for w in self.quota.values()):
+        if not any(_remaining_positive(w) for w in self.quota.values()):
             # 余额本身归零 = 确定耗尽，与快照新旧无关（quota_expired 同口径）
             return self._future_effective_at(now)
         ends = [e for e in (expires_epoch(w.get("expires_at")) for w in self.quota.values()) if e]
@@ -358,6 +369,17 @@ class Account:
                 starts.append(eff)
         return min(starts) if starts else -1.0
 
+    def _bonus_usable(self, now: float) -> bool:
+        """一次性赠送授权是否仍生效（plan + plans 双源；2.7.68 收口）。
+
+        next_window_start / is_selectable / quota.py 状态机共用同一判定——
+        「日窗扣完但赠送池在效」的号必须三处口径一致（原 is_selectable 漏判：
+        quota.py 把这类号复活成 ACTIVE，轮询却照样不选，流量 503 或压到别的号）。"""
+        plan_now = self.plan or {}
+        return _plan_bonus_active(plan_now, now) or any(
+            _plan_bonus_active(p, now) for p in (self.plans or [])
+        )
+
     def record_result(self, ok: bool, detail: str = "", keep: int = 20) -> None:
         """记录单次请求结果明细（后台「最近请求」tick 悬停展示），只保留最近 keep 条。
 
@@ -382,8 +404,14 @@ class Account:
         if self.status in (Status.INVALID, Status.DISABLED):
             # 回退通道（api.z.ai + API Key）花的是 Key 自己的额度，与套餐快照无关。
             return self.has_apikey_fallback()
+        now = now or time.time()
         if self.status == Status.EXHAUSTED or self.quota_expired(now):
-            return False
+            # 一次性赠送授权仍生效的号不判死（2.7.68）：quota.py 会按 has_bonus
+            # 把「日窗扣完、bonus 在效」的号复活成 ACTIVE，但本判定若仍按
+            # quota_expired 拦截，复活号照样选不中——与 next_window_start 的
+            # bonus-aware 口径对齐
+            if not self._bonus_usable(now):
+                return False
         if self.status == Status.COOLING:
             now = now or time.time()
             return bool(self.cooling_until and now >= self.cooling_until)

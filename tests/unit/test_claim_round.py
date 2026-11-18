@@ -400,3 +400,95 @@ def test_activation_err_text_keeps_nonempty_detail():
     err = claim_module._activation_err_text(
         "app_launch", RuntimeError("event/report app_launch HTTP 500: boom"))
     assert err == "激活事件 app_launch 上报失败: event/report app_launch HTTP 500: boom"
+
+
+@pytest.mark.asyncio
+async def test_round_budget_skips_remaining_accounts(monkeypatch):
+    """2.7.68 轮级 wall-clock 预算：预算耗尽后剩余账号本轮跳过（下拍续领），
+    单号长尾不再把整晚窗口吃穿。"""
+    import app.claim as claim_module
+    from app import settings
+
+    accounts = [_FakeAccount(f"acc-{i}", billing=True) for i in range(4)]
+    monkeypatch.setattr("app.store.store", _fake_store(accounts))
+    monkeypatch.setattr(settings, "CLAIM_ROUND_BUDGET", 0.05)
+    monkeypatch.setattr(settings, "CLAIM_ROUND_CONCURRENCY", 1)
+
+    async def fake_auto_claim(acc, *, skip_plan_ids=None):
+        await asyncio.sleep(0.08)  # 单号 80ms > 预算 50ms：第 2 个号起必超
+        return []
+
+    monkeypatch.setattr(claim_module, "auto_claim_all_plans", fake_auto_claim)
+    visited: list[str] = []
+
+    real_auto = fake_auto_claim
+
+    async def spy_auto(acc, *, skip_plan_ids=None):
+        visited.append(acc.id)
+        return await real_auto(acc, skip_plan_ids=skip_plan_ids)
+
+    monkeypatch.setattr(claim_module, "auto_claim_all_plans", spy_auto)
+    mgr = ClaimRoundManager()
+    await mgr._round()
+    # 预算 0.05s：串行下第 1 号执行后预算耗尽，后续号全部跳过
+    assert len(visited) <= 2
+
+
+@pytest.mark.asyncio
+async def test_round_concurrency_runs_accounts_in_parallel(monkeypatch):
+    """2.7.68 账号并发：CLAIM_ROUND_CONCURRENCY=2 时两个慢号并行完成
+    （串行 2×0.2s ≈ 0.4s，并行 ≈ 0.2s）。"""
+    import app.claim as claim_module
+    from app import settings
+
+    accounts = [_FakeAccount("slow-1", billing=True), _FakeAccount("slow-2", billing=True)]
+    monkeypatch.setattr("app.store.store", _fake_store(accounts))
+    monkeypatch.setattr(settings, "CLAIM_ROUND_BUDGET", 0)
+    monkeypatch.setattr(settings, "CLAIM_ROUND_CONCURRENCY", 2)
+
+    inflight = {"n": 0, "max": 0}
+
+    async def fake_auto_claim(acc, *, skip_plan_ids=None):
+        inflight["n"] += 1
+        inflight["max"] = max(inflight["max"], inflight["n"])
+        await asyncio.sleep(0.2)
+        inflight["n"] -= 1
+        return []
+
+    monkeypatch.setattr(claim_module, "auto_claim_all_plans", fake_auto_claim)
+    mgr = ClaimRoundManager()
+    await mgr._round()
+    assert inflight["max"] == 2
+
+
+@pytest.mark.asyncio
+async def test_same_account_claim_mutex_serializes(monkeypatch):
+    """2.7.68 同号互斥：手动端点 / 领取轮 / 入池任务三条链对同一账号并发时
+    串行（双链并发 = captcha 池争抢 + billing 双写 + token IP 漂移）。"""
+    import app.claim as claim_module
+    from app.models import Account
+
+    acc = Account(id="mx-1", name="mx", provider="zai", mode="jwt", jwt_token="a.b.c")
+    inflight = {"n": 0, "max": 0}
+
+    async def fake_locked(account, *, skip_plan_ids=None):
+        inflight["n"] += 1
+        inflight["max"] = max(inflight["max"], inflight["n"])
+        await asyncio.sleep(0.05)
+        inflight["n"] -= 1
+        return []
+
+    monkeypatch.setattr(claim_module, "_auto_claim_all_plans_locked", fake_locked)
+    await asyncio.gather(claim_module.auto_claim_all_plans(acc),
+                         claim_module.auto_claim_all_plans(acc),
+                         claim_module.auto_claim_all_plans(acc))
+    assert inflight["max"] == 1
+
+
+def test_today_key_is_beijing_anchored():
+    """2.7.68 口径统一：激活日门锚定北京时钟（gmtime(t+8h) 的日期字段），
+    与领取窗口同口径——host 换 UTC 不漂。"""
+    from app.claim import _today_key
+
+    expected = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+    assert _today_key() == expected

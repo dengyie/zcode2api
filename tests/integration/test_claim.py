@@ -26,7 +26,7 @@ def claim_env(gateway_client, fresh_app, monkeypatch):
             self.solve_count = 0
             self.invalidated = 0
 
-        async def get_verify_param(self, egress_tag=None, proxy=None):
+        async def get_verify_param(self, egress_tag=None, proxy=None, retries=None):
             self.solve_count += 1
             return "stub-verify-param", "sgp"
 
@@ -247,7 +247,7 @@ class TestClaim:
 
         client, _mock, stub, acc = claim_env
 
-        async def _exhausted(self, egress_tag=None, proxy=None):
+        async def _exhausted(self, egress_tag=None, proxy=None, retries=None):
             raise CaptchaSolveError("验证码求解失败: 多次重试无结果")
 
         monkeypatch.setattr(type(stub), "get_verify_param", _exhausted)

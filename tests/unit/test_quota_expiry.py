@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -137,3 +138,84 @@ class TestSelectable:
         acc = _acc({"GLM-5.3": {"remaining": 10, "expires_at": now - 10}},
                    quota_verified_at=now)
         assert acc.is_selectable() is False
+
+
+class TestUnknownRemainingSemantics:
+    """2.7.68：remaining 缺失/None = 未知但有量（与 window_usable 同口径），
+    不得在 quota_verified_at 证据门之前短路判死。"""
+
+    def test_unknown_remaining_without_verify_is_not_expired(self):
+        acc = _acc({"GLM-5.3": {"total": 100, "used": 5,
+                                "expires_at": _NOW - 60}})
+        assert acc.quota_expired(_NOW) is False
+
+    def test_unknown_remaining_with_post_expiry_verify_is_expired(self):
+        acc = _acc({"GLM-5.3": {"total": 100, "used": 5,
+                                "expires_at": _NOW - 60}},
+                   quota_verified_at=_NOW - 1)
+        assert acc.quota_expired(_NOW) is True
+
+    def test_explicit_zero_remaining_is_expired_regardless(self):
+        acc = _acc({"GLM-5.3": {"total": 100, "used": 100, "remaining": 0,
+                                "expires_at": _NOW + 60}})
+        assert acc.quota_expired(_NOW) is True
+
+    def test_next_window_start_unknown_remaining_not_confirmed_dead(self):
+        acc = _acc({"GLM-5.3": {"total": 100, "used": 5,
+                                "expires_at": _NOW - 60}})
+        # 未知余量 + 无过期后实查 → 不可判定（None），不得返回 -1/未来窗口
+        assert acc.next_window_start(_NOW) is None
+
+    def test_is_selectable_bonus_active_overrides_exhausted(self):
+        """2.7.68 bonus-aware：日窗扣完但一次性赠送授权在效的号可选
+        （quota.py 会把它复活成 ACTIVE，轮询必须真能选中它）。"""
+        acc = _acc({"GLM-5.3": {"total": 100, "used": 100, "remaining": 0,
+                                "expires_at": _NOW + 60}},
+                   status=Status.EXHAUSTED)
+        acc.plans = [{
+            "plan_id": "zcode-v3-start-plan-1118",
+            "ends_at": _NOW + 86400,
+            "entitlements": [{"period": "one_time", "effective_at": _NOW - 10,
+                              "ends_at": _NOW + 86400}],
+        }]
+        assert acc.is_selectable(_NOW) is True
+
+    def test_is_selectable_expired_bonus_still_exhausted(self):
+        acc = _acc({"GLM-5.3": {"total": 100, "used": 100, "remaining": 0,
+                                "expires_at": _NOW + 60}},
+                   status=Status.EXHAUSTED)
+        acc.plans = [{
+            "plan_id": "zcode-v3-start-plan-1116",
+            "ends_at": _NOW - 10,  # 套餐已到期 → 赠送随之失效
+            "entitlements": [{"period": "one_time", "effective_at": _NOW - 20,
+                              "ends_at": _NOW - 10}],
+        }]
+        assert acc.is_selectable(_NOW) is False
+
+
+class TestRefreshCoalescing:
+    """2.7.68 跨入口刷新合并：同账号并发 refresh_accounts 只跑一次真实刷新。"""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_refresh_coalesces_same_account(self, monkeypatch):
+        import app.quota as quota_module
+        from app.models import Account
+
+        acc = Account(id="coal-1", name="coal", provider="zai", mode="jwt",
+                      jwt_token="a.b.c")
+        calls = {"n": 0, "max": 0, "inflight": 0}
+
+        async def fake_fetch(acc):
+            calls["inflight"] += 1
+            calls["max"] = max(calls["max"], calls["inflight"])
+            await asyncio.sleep(0.05)
+            calls["inflight"] -= 1
+            calls["n"] += 1
+            return {"billing": {}}
+
+        monkeypatch.setattr(quota_module, "fetch_quota", fake_fetch)
+        await asyncio.gather(quota_module.refresh_accounts([acc]),
+                             quota_module.refresh_accounts([acc]),
+                             quota_module.refresh_accounts([acc]))
+        assert calls["n"] == 1, "同账号 3 路并发必须合并为 1 次真实刷新"
+        assert calls["max"] == 1

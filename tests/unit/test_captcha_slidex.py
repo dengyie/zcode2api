@@ -347,3 +347,128 @@ def test_solve_timeout_yields_attribution(monkeypatch):
         assert token is None and "超时" in (msg or "")
 
     _aio.run(main())
+
+
+def test_timeout_streak_stops_retry_loop(monkeypatch):
+    """2.7.68 链式超时止损：DEADLINE / TRACELESS:TIMEOUT 等超时型归因连续
+    CAPTCHA_TIMEOUT_GIVEUP_AFTER 次（换过 context/进程仍超时）= 环境级失败，
+    第 N 次起不再白烧（11-18 晚 159 次求解 0 成功、每号白烧 16 分钟的主形态）。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+    exec_calls: list = []
+
+    class _Proc:
+        pid = 12349
+
+        async def communicate(self):
+            return b"SLIDEX_FAIL=DEADLINE", b""
+
+        def kill(self):
+            pass
+
+    async def fake_comm(self, proc):
+        return await proc.communicate()
+
+    async def fake_cleanup(self, proc):
+        pass
+
+    async def fake_exec(*a, **kw):
+        exec_calls.append(1)
+        return _Proc()
+
+    monkeypatch.setattr(CaptchaManager, "_communicate_solver", fake_comm)
+    monkeypatch.setattr(CaptchaManager, "_cleanup_solver", fake_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(settings, "CAPTCHA_SOLVE_RETRIES", 4)
+    monkeypatch.setattr(settings, "CAPTCHA_TIMEOUT_GIVEUP_AFTER", 2)
+
+    async def main():
+        token, msg = await mgr._solve_one(
+            {"sceneId": "s", "region": "cn", "prefix": "p"}, "direct", None
+        )
+        assert token is None
+        # 止损：连续 2 次超时即停（非 4 次跑满）
+        assert len(exec_calls) == 2
+        assert "DEADLINE" in (msg or "")
+
+    _aio.run(main())
+
+
+def test_timeout_streak_resets_on_non_timeout(monkeypatch):
+    """非超时归因（F 码行为风控）打断超时连击计数：F001 后换 context 重试
+    仍有价值（2.7.66/67 手势/指纹修复正打这类形态），不得被超时止损误伤。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+    exec_calls: list = []
+
+    class _Proc:
+        pid = 12350
+
+        def __init__(self, fail: bytes):
+            self._fail = fail
+
+        async def communicate(self):
+            return self._fail, b""
+
+        def kill(self):
+            pass
+
+    procs: list[bytes] = [b"SLIDEX_FAIL=DEADLINE", b"SLIDEX_FAIL=DRAG:F001",
+                          b"SLIDEX_FAIL=DEADLINE", b"SLIDEX_FAIL=DEADLINE"]
+
+    async def fake_comm(self, proc):
+        return await proc.communicate()
+
+    async def fake_cleanup(self, proc):
+        pass
+
+    async def fake_exec(*a, **kw):
+        exec_calls.append(1)
+        return _Proc(procs[len(exec_calls) - 1])
+
+    monkeypatch.setattr(CaptchaManager, "_communicate_solver", fake_comm)
+    monkeypatch.setattr(CaptchaManager, "_cleanup_solver", fake_cleanup)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(settings, "CAPTCHA_SOLVE_RETRIES", 4)
+    monkeypatch.setattr(settings, "CAPTCHA_TIMEOUT_GIVEUP_AFTER", 2)
+
+    async def main():
+        token, msg = await mgr._solve_one(
+            {"sceneId": "s", "region": "cn", "prefix": "p"}, "direct", None
+        )
+        assert token is None
+        # 超时(F1) → F001 清零 → 超时(F3) → 超时(F4) 达阈值止损 = 4 次跑满
+        assert len(exec_calls) == 4
+        assert "DEADLINE" in (msg or "")
+
+    _aio.run(main())
+
+
+def test_get_verify_param_retries_override_reaches_solve(monkeypatch):
+    """claim 链求解预算解耦（2.7.68）：get_verify_param(retries=2) 必须传到
+    _solve_one 的 max_retries——预算不生效等于没解耦。"""
+    import asyncio as _aio
+
+    mgr = CaptchaManager()
+    seen: dict = {}
+
+    async def _config(tag=None, proxy=None):
+        return {"sceneId": "s", "region": "cn", "prefix": "p"}
+
+    async def _solve(config, tag=egress.DIRECT, proxy=None, max_retries=None):
+        seen["max_retries"] = max_retries
+        return None, "SLIDEX_FAIL=DEADLINE"
+
+    monkeypatch.setattr(mgr, "fetch_config", _config)
+    monkeypatch.setattr(mgr, "_solve_one", _solve)
+
+    async def main():
+        try:
+            await mgr.get_verify_param(egress_tag=egress.DIRECT, retries=2)
+        except Exception:  # noqa: BLE001 - 求解失败正常上抛，断言只看透传
+            pass
+        assert seen["max_retries"] == 2
+
+    _aio.run(main())

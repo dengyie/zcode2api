@@ -161,3 +161,25 @@ def test_opslog_write_failure_degrades_silently(_opslog_env, monkeypatch):
     logs.err("captcha", "写失败也不崩")
     # 句柄已被重置为 None（下次重试打开）
     assert logs_mod._fh is None
+
+
+def test_opslog_corrupt_first_line_still_persists(_opslog_env, monkeypatch):
+    """2.7.68 首行容错：半行/损坏首行曾让 JSONDecodeError 冒泡进外层 except →
+    句柄作废 → 下一条重开再读再炸的粘性瘫死（opslog 从此一条不落）。修复后
+    解析失败按「今日」处理，绝不连坐句柄。"""
+    # 预写一条损坏的半行 JSON（无尾换行 → 新条目与其同物理行）
+    _opslog_env.write_text('{"_ts": "2026-11-1', encoding="utf-8")
+    logs.warn("claim", "损坏首行后的第一条")
+    content = _opslog_env.read_text(encoding="utf-8")
+    assert "损坏首行后的第一条" in content, "损坏首行不得阻断落盘"
+    # 关键不变量：句柄未作废（旧实现就此瘫死，后续每条都丢）
+    logs.warn("claim", "第二条仍须落盘")
+    assert "第二条仍须落盘" in _opslog_env.read_text(encoding="utf-8")
+
+
+def test_opslog_oversize_first_line_still_persists(_opslog_env):
+    """首行超 4096 被 readline(4096) 截断 → JSON 解析必败 → 同上不得瘫死。"""
+    _opslog_env.write_text('{"_ts": "' + "x" * 5000, encoding="utf-8")
+    logs.warn("captcha", "超长首行后的第一条")
+    lines = _opslog_env.read_text(encoding="utf-8").strip().splitlines()
+    assert any("超长首行后的第一条" in ln for ln in lines)

@@ -99,8 +99,8 @@ def test_rebalance_ok_then_captcha_acceptance_passes(monkeypatch, tp_mode):
     monkeypatch.setattr(ep_mod, "egress_pool", pool)
     monkeypatch.setattr(claim.captcha_manager, "invalidate",
                         lambda tag: invalidated.append(tag))
-    async def fake_solve(egress_tag=None, proxy=None):
-        solved.append({"tag": egress_tag, "proxy": proxy})
+    async def fake_solve(egress_tag=None, proxy=None, retries=None):
+        solved.append({"tag": egress_tag, "proxy": proxy, "retries": retries})
         return "param-x"
     monkeypatch.setattr(claim.captcha_manager, "get_verify_param", fake_solve)
 
@@ -318,3 +318,57 @@ def test_acceptance_failure_breaks_plan_loop(monkeypatch, tp_mode):
     outcomes = asyncio.run(auto_claim_all_plans(acc))
     assert attempts == ["p1"]  # p2 不再烧码
     assert all(not o["ok"] for o in outcomes)
+
+
+def test_403_claim_error_breaks_plan_loop(monkeypatch, tp_mode):
+    """2.7.68：403（unusual activity 文案实锤）与 3007 同级止损——多套餐投放期
+    403 后不再打第二个套餐（同坏出口白烧一枚码）。"""
+    from app.claim import auto_claim_all_plans
+
+    acc = _account()
+    attempts: list[str] = []
+
+    async def fake_claim(account, plan_id=None):
+        attempts.append(plan_id)
+        raise ClaimError("上游风控拒绝 HTTP 403（非凭证失效）: unusual activity", code=403)
+
+    monkeypatch.setattr(claim, "claim", fake_claim)
+
+    async def fake_preview(account):
+        return [{"plan_id": "p1", "name": "P1", "priority": 2, "grants": []},
+                {"plan_id": "p2", "name": "P2", "priority": 1, "grants": []}]
+
+    monkeypatch.setattr(claim, "preview_plans", fake_preview)
+
+    outcomes = asyncio.run(auto_claim_all_plans(acc))
+    assert attempts == ["p1"]  # 403 即止损，p2 不烧
+    assert all(not o["ok"] for o in outcomes)
+
+
+def test_claim_passes_claim_retries_budget(monkeypatch, tp_mode):
+    """2.7.68 求解预算解耦：claim() 给 get_verify_param 传
+    CAPTCHA_CLAIM_SOLVE_RETRIES（而非 messages 全量 4 次）。"""
+    import app.claim as claim_module
+    from app import settings as _settings
+
+    acc = _account()
+    acc.jwt_token = "x.y.z"
+    acc.mode = "jwt"
+    seen: dict = {}
+
+    async def fake_gvp(egress_tag=None, proxy=None, retries=None):
+        seen["retries"] = retries
+        return "param-x", "cn"
+
+    async def fake_config(egress_tag=None, proxy=None):
+        return {"region": "cn"}
+
+    async def fake_billing(account, method, path, **kwargs):
+        return {"code": 0, "data": {"plan": {"name": "P"}}}
+
+    monkeypatch.setattr(claim_module.captcha_manager, "get_verify_param", fake_gvp)
+    monkeypatch.setattr(claim_module.captcha_manager, "fetch_config", fake_config)
+    monkeypatch.setattr(claim_module, "_billing_request", fake_billing)
+
+    asyncio.run(claim_module.claim(acc, "p1"))
+    assert seen["retries"] == _settings.CAPTCHA_CLAIM_SOLVE_RETRIES

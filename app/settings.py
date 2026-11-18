@@ -103,6 +103,17 @@ CAPTCHA_SOLVER_JS = CAPTCHA_SOLVER_DIR / (
 # Chromium 可执行文件（solver_pw.js 用；env 可覆盖，缺省按常见路径探测）
 CHROMIUM_PATH = os.getenv("ZCODE_CHROMIUM_PATH", "/usr/local/bin/chromium")
 CAPTCHA_SOLVE_RETRIES = _int("ZCODE_CAPTCHA_RETRIES", 4)
+# 领取链求解重试上限（2.7.68 预算解耦）：messages 池路径保持 CAPTCHA_SOLVE_RETRIES
+# （求解是热路径可用性兜底，跑满预算值得）；claim 一小时一轮 × 11 号串行，单号
+# 跑满 4×240s ≈ 16 分钟会把整晚窗口吃穿（11-16~11-18 三晚 0 成功的结构性放大器，
+# opslog 实测轮内 19:11→20:25 逐号串行）。领取路径缺省 2 次，env 可覆盖。
+CAPTCHA_CLAIM_SOLVE_RETRIES = max(_int("ZCODE_CAPTCHA_CLAIM_RETRIES", 2), 1)
+# 连续 N 次超时型归因即止损（2.7.68）：DEGRADED 是环境级判定（单次即止），
+# 但 DEADLINE / TRACELESS:TIMEOUT / EXC:TimeoutError / SETUP:TimeoutError /
+# 求解进程超时这些链式超时形态此前不命中任何止损——每号照样跑满 4×240s
+# （11-18 opslog：159 次求解 0 成功，主形态即链式超时）。连续 2 次（换过
+# context/进程仍超时）= 环境级失败，第 3 次起不再白烧。1 = 首次超时即止。
+CAPTCHA_TIMEOUT_GIVEUP_AFTER = max(_int("ZCODE_CAPTCHA_TIMEOUT_GIVEUP_AFTER", 2), 1)
 # 每次求解超时（秒）：真浏览器含 launch（内存压力下可 30s+）+ SDK 加载 + 无痕验证，
 # 且 solver 进程内自旋重试 3 次（约 40s×3），须容得下
 CAPTCHA_SOLVE_TIMEOUT = _int("ZCODE_CAPTCHA_TIMEOUT", 240)
@@ -249,6 +260,16 @@ TP_TYPE = os.getenv("ZCODE_TP_TYPE", "clash_proxy").strip()
 TP_TIER = os.getenv("ZCODE_TP_TIER", "standard").strip()
 TP_GRAY_ACCOUNTS = [g.strip() for g in os.getenv("ZCODE_TP_GRAY_ACCOUNTS", "").split(",") if g.strip()]
 TP_REBALANCE_DEBOUNCE = _int("ZCODE_TP_REBALANCE_DEBOUNCE", 120)
+# 网关级故障熔断（2.7.68）：一次 rebalance 内连续 N 个候选都「探针连接级失败
+# （st=0）」= 本地网关（EasyTier→TP 9101）故障而非节点问题——继续 acquire/
+# 探针只会全池 churn 并把 egress_node 改写到从未探通的候选（11-18 晚 EasyTier
+# 崩溃重启期实测形态）。命中即中止本轮 rebalance 并显式告警。1 = 首个连接失败
+# 即熔断（最保守）；0/负 = 关闭（旧行为）。
+TP_GATEWAY_FAIL_ABORT = max(_int("ZCODE_TP_GATEWAY_FAIL_ABORT", 2), 0)
+# 启动时 TP 孤儿分配对账（2.7.68）：allocs 里 zh-<id> 不在本库账号集合 → 逐个
+# release。11-17 实查 27 个分配 16 个陈旧（历史删除账号），删除释放只堵新增
+# 不清存量；对账从源头回收占位。默认开。
+TP_ORPHAN_RECONCILE = _bool("ZCODE_TP_ORPHAN_RECONCILE", True)
 TP_HEALTH_INTERVAL = max(_int("ZCODE_TP_HEALTH_INTERVAL", 300), 30)  # 下限防 0 自旋
 # 健康探针连续失败多少轮才 rebalance（2026-11-15 生产数据：03:48/04:13 探针
 # 链路秒级抖动各连坐 4/3 个账号齐换绑 = 无谓出口 IP churn）。单轮失败只
@@ -268,6 +289,19 @@ EGRESS_ALICDN_PROBE_TIMEOUT = _int("ZCODE_EGRESS_ALICDN_PROBE_TIMEOUT", 12)
 # 留缓冲；求解单次可达分钟级，上限过大会让 claim 轮拖长（见 2.7.50 review）。
 CLAIM_EGRESS_RETRIES = max(_int("ZCODE_CLAIM_EGRESS_RETRIES", 2), 0)
 CLAIM_EGRESS_RETRY_DELAY = _float("ZCODE_CLAIM_EGRESS_RETRY_DELAY", 20.0)
+# 领取轮级 wall-clock 预算（秒，2.7.68）：单号最坏 ≈90 分钟（求解长尾 × 换绑链），
+# 11 号串行会把 19-23 点窗口吃穿、轮尾下一拍已出窗。预算到点后剩余账号本轮跳过
+# （下拍自然续领），保证轮在窗口内收尾。0/负 = 不限（旧行为）。缺省 2700s（45min）
+# = interval 3600s 内留出健康余量。
+CLAIM_ROUND_BUDGET = _float("ZCODE_CLAIM_ROUND_BUDGET", 2700.0)
+# 领取轮账号并发数（2.7.68）：轮内逐号串行是三天 0 成功的吞吐瓶颈；求解进程级
+# 上限（CAPTCHA_MAX_CONCURRENT_SOLVES）与 TP rebalance 互斥（per-account lock）
+# 都有自己的全局闸，这里 2 并发只是调度并行度，不会放大浏览器/上游压力。
+CLAIM_ROUND_CONCURRENCY = max(_int("ZCODE_CLAIM_ROUND_CONCURRENCY", 2), 1)
+# 手动 POST /admin/api/claim 的响应预算（秒，2.7.68）：预算内跑完多少号就返回
+# 多少号的结果，剩余账号转后台 job 继续执行（GET /admin/api/claim/{job_id} 续查）。
+# 缺省 90s——CF Tunnel 100s 硬超时之内，客户端永不 524。
+CLAIM_API_BUDGET = _float("ZCODE_CLAIM_API_BUDGET", 90.0)
 # 套餐自动领取轮间隔（秒）：周期对全部可打 billing 的 JWT 账号轮一遍
 # preview + 领取（有可领套餐才补激活上报，见 claim.auto_claim_all_plans）。
 # 默认 3600（2.6.5 整改）：zcode-switch 参照系下 preview/领取只在用户点界面
@@ -331,7 +365,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.65"  # 2.7.63→65 全面 review 根修收尾——P2#1 收货前地面真相复核（主循环+第4轮，验收窗口竞态收口）+ P2#2 单节点池退化降级接受（4 轮假换绑+全新全量验收通过 → 显式归因「池内无替代节点」）+ P3 批量：release body success 字段幂等语义 / cli 按名删除 find(provider,id_or_name) / 快照 aware-datetime 归一（TypeError 崩溃根除）/ 第4轮复核冲突短路不烧探针 / alicdn 整文件读封顶 4MB / 删除释放 gate 补灰度名单；2.7.64 过期套餐确认链（上游空账本 + 本地套餐全到期 + 缓存窗口全失效 → EXHAUSTED）
+APP_VERSION = "2.7.68"  # 2.7.66-67 solver 对齐（language cn/恒定 config/plan_factory 接线/指纹加固）之上：全仓 review 根修批次——领取链预算与止损（轮级 wall-clock 预算+账号并发+claim 求解预算解耦+403 入止损集+链式超时止损+GET 瞬态重试）/ 手动 claim 端点混合 job 化（响应预算 < CF 100s + job_id 续查 + 同号互斥）/ rebalance ban 延后到确认离开+去抖按收尾时刻+网关级熔断+绑定对齐+TP 启动孤儿对账 / quota remaining=None 未知语义统一+is_selectable bonus-aware+刷新跨入口合并 / anthropic-beta 剥除 / lifespan 逐段隔离+发版偏斜自检 / opslog 首行容错
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。

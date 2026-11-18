@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -15,6 +16,7 @@ from ..captcha import CaptchaSolveError
 from ..claim import (
     AUTH_EXPIRED_MESSAGE,
     ClaimError,
+    account_claim_lock,
     auto_claim_all_plans,
     billing_block_reason,
     claim_with_captcha,
@@ -528,6 +530,11 @@ async def claim_preview(account_id: str | None = None):
 async def claim(payload: dict = Body(default=None)):
     """领取套餐（body 可选 account_ids / plan_id）；缺省对全部 JWT 账号自动选最优套餐。
 
+    2.7.68 混合 job 化：CLAIM_API_BUDGET（缺省 90s < CF 100s）内跑完的账号
+    同步返回结果；未跑完的转后台 job 继续执行，响应带 job_id（
+    GET /admin/api/claim/{job_id} 续查最终结果）。前端契约兼容——outcomes/
+    summary 恒在，预算内未完成的账号在响应视图里以 pending=true 标注。
+
     返回 outcomes[]：{account_id, account_name, ok, plan_name?, grants?, message?}。
     """
     payload = payload or {}
@@ -538,43 +545,40 @@ async def claim(payload: dict = Body(default=None)):
         return {"outcomes": [], "summary": {"ok": 0, "fail": 0}}
 
     # 废 JWT 不领取（billing/claim 打过去只会 401）；冷却 / 风控禁用 / 停用照领
-    outcomes = [
+    pre_blocked = [
         {"account_id": a.id, "account_name": a.name, "ok": False,
          "message": billing_block_reason(a) or AUTH_EXPIRED_MESSAGE}
         for a in candidates if not a.allows_billing()
     ]
-    for acc in candidates:
-        if not acc.allows_billing():
-            continue
-        try:
-            result = await do_claim(acc, plan_id)
-        except ClaimError as err:
-            logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
-            outcome = {"account_id": acc.id, "account_name": acc.name,
-                       "ok": False, "message": str(err)}
-            if err.code != -1:
-                outcome["code"] = err.code
-            if err.next_at:
-                outcome["next_at"] = err.next_at
-            outcomes.append(outcome)
-            continue
-        except CaptchaSolveError as err:
-            # 验证码求解失败（get_verify_param）：明确业务回执而非裸 500
-            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
-            outcomes.append({"account_id": acc.id, "account_name": acc.name,
-                             "ok": False, "message": str(err)})
-            continue
-        except RuntimeError as err:
-            # 兜底：captcha 层历史语义的运行时故障，防回归裸 500
-            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
-            outcomes.append({"account_id": acc.id, "account_name": acc.name,
-                             "ok": False, "message": str(err)})
-            continue
-        await refresh_accounts([acc])
-        outcomes.append({"account_id": acc.id, "account_name": acc.name,
-                         "ok": True, **result})
-    ok = sum(1 for o in outcomes if o["ok"])
-    return {"outcomes": outcomes, "summary": {"ok": ok, "fail": len(outcomes) - ok}}
+    runnable = [a for a in candidates if a.allows_billing()]
+
+    job_id = uuid.uuid4().hex[:12]
+    rec: dict = {"outcomes": list(pre_blocked), "done": False, "created_at": time.time()}
+    _claim_jobs[job_id] = rec
+    while len(_claim_jobs) > _CLAIM_JOB_KEEP:  # 最老挤出，防无界增长
+        _claim_jobs.pop(next(iter(_claim_jobs)))
+
+    task = asyncio.create_task(_run_claim_job(runnable, plan_id, rec))
+    _claim_job_tasks.add(task)
+    task.add_done_callback(_claim_job_tasks.discard)
+
+    # 预算内等待（await 让出事件循环，不影响其它请求）；到点即回，job 续跑
+    deadline = time.monotonic() + max(5.0, float(settings.CLAIM_API_BUDGET))
+    while not rec["done"] and time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+
+    responded = {o.get("account_id") for o in rec["outcomes"]}
+    outcomes_view = list(rec["outcomes"])
+    for a in runnable:
+        if a.id not in responded:
+            outcomes_view.append({
+                "account_id": a.id, "account_name": a.name, "ok": False, "pending": True,
+                "message": f"响应预算内未完成，已转后台继续"
+                           f"（GET /admin/api/claim/{job_id} 查结果）",
+            })
+    return {"job_id": job_id, "outcomes": outcomes_view, "summary": _claim_summary(outcomes_view)}
+
+
 
 
 @router.get("/claim/captcha-config")
@@ -594,6 +598,67 @@ async def claim_captcha_config():
         "prefix": config.get("prefix") or "",
     }
 
+
+@router.get("/claim/{job_id}")
+async def claim_job_result(job_id: str):
+    """手动领取 job 结果续查（2.7.68）：POST /claim 超预算返回 job_id 后，
+    用本端点拿最终全量 outcomes（job 在后台不受响应预算约束，跑完为止）。"""
+    rec = _claim_jobs.get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="job 不存在或已过期")
+    return {
+        "job_id": job_id,
+        "status": "done" if rec["done"] else "running",
+        "outcomes": rec["outcomes"],
+        "summary": _claim_summary(rec["outcomes"]),
+    }
+
+
+# 手动领取 job 登记（2.7.68 混合 job 化）：响应预算内未完成的账号转后台续跑，
+# 结果经 GET /admin/api/claim/{job_id} 续查。保留上限防无界增长；任务强引用防 GC。
+_claim_jobs: dict[str, dict] = {}
+_claim_job_tasks: set[asyncio.Task] = set()
+_CLAIM_JOB_KEEP = 50
+
+
+def _claim_summary(outcomes: list[dict]) -> dict:
+    ok = sum(1 for o in outcomes if o.get("ok"))
+    return {"ok": ok, "fail": len(outcomes) - ok}
+
+
+async def _run_claim_job(runnable: list, plan_id: str | None, rec: dict) -> None:
+    """后台逐号领取（无响应预算约束；同号经 account_claim_lock 与领取轮互斥）。"""
+    for acc in runnable:
+        try:
+            async with account_claim_lock(acc.id):
+                result = await do_claim(acc, plan_id)
+            rec["outcomes"].append(
+                {"account_id": acc.id, "account_name": acc.name, "ok": True, **result})
+            await refresh_accounts([acc])
+        except ClaimError as err:
+            logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
+            outcome = {"account_id": acc.id, "account_name": acc.name,
+                       "ok": False, "message": str(err)}
+            if err.code != -1:
+                outcome["code"] = err.code
+            if err.next_at:
+                outcome["next_at"] = err.next_at
+            rec["outcomes"].append(outcome)
+        except CaptchaSolveError as err:
+            # 验证码求解失败（get_verify_param）：明确业务回执而非裸 500
+            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
+            rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
+                                    "ok": False, "message": str(err)})
+        except RuntimeError as err:
+            # 兜底：captcha 层历史语义的运行时故障，防回归裸 500
+            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
+            rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
+                                    "ok": False, "message": str(err)})
+        except Exception as err:  # noqa: BLE001 - 后台任务无人接收，必须自兜
+            logs.err("claim", f"账号 {acc.name} 领取任务异常: {type(err).__name__}: {err}")
+            rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
+                                    "ok": False, "message": str(err)})
+    rec["done"] = True
 
 @router.post("/claim/manual")
 async def claim_manual(payload: dict = Body(...)):

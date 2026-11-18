@@ -147,7 +147,7 @@ class TestCaptchaEgressSeparation:
         async def _config(tag=None, proxy=None):
             return {"sceneId": "s", "region": "cn", "prefix": "p"}
 
-        async def _solve(config, tag=egress.DIRECT, proxy=None):
+        async def _solve(config, tag=egress.DIRECT, proxy=None, max_retries=None):
             solved.append(tag)
             return _Token(f"tok-{tag}", "cn", tag), None
 

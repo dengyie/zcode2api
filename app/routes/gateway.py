@@ -781,7 +781,7 @@ async def _dispatch(req_id, body, incoming_headers, provider):
     if not reason:
         active_tags = sorted({
             _messages_egress(a) for a in store.list_accounts("zai")
-            if a.enabled and a.status is Status.ACTIVE
+            if a.enabled and a.status == Status.ACTIVE
         })
         held = [t for t in active_tags
                 if gate.hold_reason(t) in ("edge_hold", "busy_hold")]
@@ -1035,7 +1035,7 @@ def _pool_inflight_saturated(limit: int) -> bool:
     if limit <= 0:
         return False
     pool = [a for a in store.list_accounts("zai")
-            if a.enabled and a.status is Status.ACTIVE]
+            if a.enabled and a.status == Status.ACTIVE]
     return bool(pool) and all(_inflight.get(a.id, 0) >= limit for a in pool)
 
 

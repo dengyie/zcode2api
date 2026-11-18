@@ -48,6 +48,11 @@ _DROP_HEADERS = {
     # 否则指纹一致性被破坏，恰是本剔除表要防的方向（2026-11-14 review）
     "content-type",
     "anthropic-version",
+    # anthropic-beta 是 Anthropic API 的 beta 通道头，官方 ZCode 桌面端对 z.ai
+    # 上游永不携带（本文件 144-146 行注释明载 Plan 通道不带 anthropic-beta）；
+    # Claude Code / Anthropic SDK 客户端会带——透传进去 = 官方不会发的形状，
+    # 本仓 3012 归因哲学（形状问题优先）下的结构性嫌疑面（2.7.68 review）
+    "anthropic-beta",
 }
 
 # 前缀剔除：本服务仿真的头族 + 客户端 SDK 特征头族。

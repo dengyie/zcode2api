@@ -233,9 +233,14 @@ async def fetch_quota(account: Account) -> dict:
                 }
                 prev = quota_map.get(name)
                 if prev:
-                    # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者
+                    # 防御：同模型多窗口（如日窗 + 一次性）合并，避免后者覆盖前者。
+                    # 2.7.68：任一侧 remaining/total/used 缺失（None）= 未知，
+                    # 合并结果保持 None——旧实现 `(x or 0) + (y or 0)` 把未知
+                    # 硬算成 0，window_usable 从「未知但有量」翻转为 False，
+                    # 状态机据此误判 EXHAUSTED（与 2.7.8 要救的形态同型）。
                     for k in ("total", "used", "remaining"):
-                        prev[k] = (prev.get(k) or 0) + (window.get(k) or 0)
+                        a, b = prev.get(k), window.get(k)
+                        prev[k] = None if (a is None or b is None) else (a + b)
                     # expires_at 保留**更晚**的那个。该字段线上是 epoch 秒、
                     # 快照里也出现过 ISO8601 字符串，直接 max() 会按字典序比
                     # （str 与 int 混型甚至 TypeError），必须先归一成 epoch 再挑。
@@ -440,16 +445,45 @@ async def fetch_coding_limits(account: Account) -> dict:
     return {"limits": _normalize_limits(data), "raw": data}
 
 
+# 跨入口同账号刷新合并（2.7.68）：monitor 轮 / admin /accounts/refresh /
+# gateway _safe_refresh / claim 轮四处入口可同时发起同一账号的刷新——旧实现
+# 只在 refresh_accounts 内部 Semaphore(8)，四路叠加瞬时上限 24 条 billing 请求
+# （每 fetch_quota gather 3 条 GET），而 constants 明载「billing 连续查询易触发
+# 拦截」且 403 会把号标 INVALID。同账号在飞任务合并为一次 await。
+_refresh_inflight: dict[str, asyncio.Task] = {}
+
+
 async def refresh_accounts(accounts: list[Account]) -> dict:
-    """并发刷新一批账号，返回汇总。"""
+    """并发刷新一批账号，返回汇总。同账号并发调用合并为一次真实刷新。"""
     if not accounts:
         return {"ok": 0, "fail": 0}
     sem = asyncio.Semaphore(8)
 
-    async def _one(acc: Account) -> bool:
+    async def _run_one(acc: Account) -> bool:
         async with sem:
             res = await fetch_quota(acc)
             return "error" not in res
+
+    async def _one(acc: Account) -> bool:
+        existing = _refresh_inflight.get(acc.id)
+        if existing is not None:
+            # shield：调用方被取消时不得捎带取消别人的在飞刷新
+            try:
+                return bool(await asyncio.shield(existing))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 刷新失败按 fail 计
+                return False
+        task = asyncio.create_task(_run_one(acc))
+        _refresh_inflight[acc.id] = task
+        try:
+            return bool(await asyncio.shield(task))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return False
+        finally:
+            _refresh_inflight.pop(acc.id, None)
 
     results = await asyncio.gather(*[_one(a) for a in accounts], return_exceptions=True)
     ok = sum(1 for r in results if r is True)

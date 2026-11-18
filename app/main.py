@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -15,6 +16,7 @@ from .claim import claim_round
 from .egress_pool import egress_pool  # 单例实例（module.start 不存在——start 是实例方法）
 from .quota import monitor
 from .routes import admin_api, gateway, pages
+from .store import store
 from .version_tracker import version_tracker
 
 
@@ -98,6 +100,36 @@ def _backfill_install_ids() -> int:
 _install_task: asyncio.Task | None = None
 
 
+def _startup_precheck() -> None:
+    """发版偏斜自检（2.7.68）：发版 = scp 真身，偏斜窗口内「新 main.py + 旧
+    egress_pool.py」曾以运行期 AttributeError 崩溃（err.log 实锤，supervisor
+    autorestart 拉起后自愈）——把这类不匹配从运行期 AttributeError 提前为
+    启动期一条明确版本配对错误，fail-fast 带完整上下文。"""
+    missing = [name for name, obj in (
+        ("egress_pool.start/stop", egress_pool),
+        ("captcha_manager.start/close", captcha_manager),
+        ("claim_round.start/stop", claim_round),
+        ("version_tracker.start/stop", version_tracker),
+        ("monitor.start/stop", monitor),
+    ) if not (hasattr(obj, "start") and hasattr(obj, "stop"))]
+    if missing:
+        raise RuntimeError(
+            f"发版偏斜：缺少 {', '.join(missing)} —— app/ 真身不完整或版本不配对，"
+            f"请重新完整发版（不要只 scp 单文件）")
+
+
+def _start_component(name: str, fn) -> None:
+    """单组件启动隔离（2.7.68）：任一后台组件 start 抛异常只降级该组件并留痕，
+    不再放大成整个 lifespan 失败 → 进程崩溃循环 + HA 看门狗连环重启（在途
+    请求全砍）。"""
+    try:
+        fn()
+    except Exception as err:  # noqa: BLE001 - 单组件失败不拖垮启动
+        logs.err("lifespan",
+                 f"{name} 启动失败（降级运行，其余组件不受影响）: "
+                 f"{type(err).__name__}: {err}")
+
+
 def _run_install_sequence_on_start() -> None:
     """启动后台执行一次安装序（官方客户端每次启动都拉 configs + 发 app_launch，
     日活去重在上游按 device_mid+日期）。失败只留痕，绝不影响启动。"""
@@ -116,6 +148,7 @@ def _run_install_sequence_on_start() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _startup_precheck()
     if settings.REQLOG_PERSIST:
         restored = reqlog.restore()
         if restored:
@@ -129,12 +162,21 @@ async def lifespan(app: FastAPI):
     if installed:
         logs.ok("install", f"存量账号补配安装身份 ×{installed}")
     plan_guard.warm()  # 冷却表回读+过期行清理前移到启动，调度路径不承担磁盘 I/O
-    monitor.start()
-    captcha_manager.start()   # 验证码预解池后台补充
-    claim_round.start()       # 套餐自动领取轮（间隔 0 = 关闭）
-    version_tracker.init_from_store()
-    version_tracker.start()   # 官方版本自动探测与同步
-    egress_pool.start()       # TetherPool 出口健康循环（supply=tetherpool 时生效）
+    # env 钉死告警（2.7.68 review P3）：admin_key 首启写库后 env 轮换静默失效
+    # ——「以为换了锁其实没换」。启动时对账一条 warn。
+    try:
+        if os.getenv("ZCODE_ADMIN_KEY") and store.admin_key() != settings.DEFAULT_ADMIN_KEY:
+            logs.warn("lifespan",
+                      "env ZCODE_ADMIN_KEY 与数据库 admin_key 不一致，以数据库为准"
+                      "（env 仅首次启动写库生效）；如需轮换请在后台设置页修改")
+    except Exception:  # noqa: BLE001 - 纯观测告警，不阻断启动
+        pass
+    _start_component("quota monitor", monitor.start)
+    _start_component("captcha pool", captcha_manager.start)
+    _start_component("claim round", claim_round.start)
+    _start_component("version tracker", version_tracker.init_from_store)
+    _start_component("version tracker", version_tracker.start)
+    _start_component("egress pool", egress_pool.start)
     _run_install_sequence_on_start()
     base = f"http://{_display_host()}:{settings.PORT}"
     logs.banner([
@@ -145,15 +187,28 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        flushed = reqlog.shutdown_flush()
-        if flushed:
-            logs.info("reqlog", f"停机收口在途请求 ×{flushed}")
-        logs.opslog_close()  # opslog 落盘句柄收口（防停机缓冲丢失）
-        await monitor.stop()
-        await claim_round.stop()
-        await version_tracker.stop()
-        await egress_pool.stop()
-        await captcha_manager.close()
+        # 停机逐段隔离（2.7.68）：首段抛异常会跳过其余收口（在途请求证据丢失、
+        # 后台任务逃逸）——每段独立 try/except，停机路径绝不中断
+        for name, fn in (
+            ("reqlog", lambda: reqlog.shutdown_flush()),
+            ("opslog", lambda: logs.opslog_close()),
+            ("monitor", monitor.stop),
+            ("claim_round", claim_round.stop),
+            ("version_tracker", version_tracker.stop),
+            ("egress_pool", egress_pool.stop),
+            ("captcha_manager", captcha_manager.close),
+        ):
+            try:
+                result = fn()
+                if asyncio.iscoroutine(result):
+                    await result
+                if name == "reqlog" and result:
+                    logs.info("reqlog", f"停机收口在途请求 ×{result}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - 停机收口绝不互相牵连
+                logs.err("lifespan", f"{name} 停机收口异常（已跳过）: "
+                                     f"{type(err).__name__}: {err}")
 
 
 def create_app() -> FastAPI:

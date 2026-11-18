@@ -77,8 +77,17 @@ def _opslog(level: str, tag: str, msg: str) -> None:
                 _path.parent.mkdir(parents=True, exist_ok=True)
                 _fh = _path.open("a", encoding="utf-8")
                 if _path.exists() and _path.stat().st_size > 0:
-                    with _path.open("r", encoding="utf-8") as f:
-                        first_ts = (json.loads(f.readline(4096) or "{}")).get("_ts", "")
+                    # 首行日探测独立容错（2.7.68 review P2）：半行/超长损坏曾经
+                    # JSONDecodeError 冒泡进外层 except → 句柄作废 → 下一条重开
+                    # 再读再炸的粘性瘫死（opslog 从此一条不落，恰好发生在最需要
+                    # 证据的时刻）。对齐 reqlog.py:54-57 的正确回退：解析失败
+                    # 按「今日」处理，绝不连坐句柄。
+                    first_ts = ""
+                    try:
+                        with _path.open("r", encoding="utf-8") as f:
+                            first_ts = (json.loads(f.readline(4096) or "{}")).get("_ts", "")
+                    except (OSError, ValueError):
+                        first_ts = ""
                     _current_day = first_ts[:10] or time.strftime("%Y-%m-%d")
                 else:
                     _current_day = time.strftime("%Y-%m-%d")

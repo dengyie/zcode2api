@@ -214,6 +214,11 @@ async def fetch_marketing_touch_plans(account: Account) -> list[dict]:
 async def _billing_request(account: Account, method: str, path: str, **kwargs) -> dict:
     headers = dict(kwargs.pop("headers"))
     url = path if path.startswith("http") else f"{settings.ZCODE_BILLING_BASE}{path}"
+    # 瞬态网络重试（2.7.68）：连接/读超时是出口链路瞬态（EasyTier 重启窗口、
+    # 家宽线抖动，tebi 实锤多次），单发即败会让本轮整号报废（-1 非信誉型，
+    # wrapper 不重试，下轮要等 3600s）。GET/HEAD 幂等可安全重试；POST claim
+    # 是写操作，超时后上游可能已入账，重发会撞 1003——保持单发。
+    attempts = 2 if method.upper() in ("GET", "HEAD") else 1
     try:
         # 出口由 settings.BILLING_EGRESS 决定（trust_env 按 direct/proxy 切）。
         # 2026-11-13 tebi 实证：GCP 大厂 ASN 直连可用（历史缺省），机房小 ASN
@@ -226,10 +231,22 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
         client_kw = ({"proxy": account_proxy, "trust_env": False} if account_proxy
                      else {"trust_env": trust_env})
         async with httpx.AsyncClient(timeout=25, **client_kw) as client:
-            res = await client.request(
-                method, url,
-                headers=headers, **kwargs,
-            )
+            res: httpx.Response | None = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    res = await client.request(
+                        method, url,
+                        headers=headers, **kwargs,
+                    )
+                    break
+                except httpx.TransportError as err:
+                    if attempt >= attempts:
+                        raise
+                    logs.info("claim",
+                              f"账号 {account.name} billing {method} 瞬态网络错误"
+                              f"（{type(err).__name__}），2s 后重试（{attempt}/{attempts - 1}）")
+                    await asyncio.sleep(2)
+        assert res is not None  # 循环必经 break/raise
     except httpx.HTTPError as err:
         # 连接/超时等网络故障统一转业务错误：路由层只需面对 ClaimError 一种失败
         raise ClaimError(f"上游网络错误: {err}") from err
@@ -316,7 +333,22 @@ _ACTIVATION_REPORTED: dict[str, str] = {}
 
 
 def _today_key() -> str:
-    return time.strftime("%Y-%m-%d")
+    """北京时区当日键（2.7.68 口径统一）：激活日门此前用宿主本地时区，与领取
+    窗口的 gmtime+8 口径分裂——host 换 UTC 后日门翻转点从北京 0 点漂成 08:00，
+    「每天 19:00 放量」的资格信号（app_daily_active）会在窗口中途才重置。"""
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+
+
+# 同账号领取互斥（2.7.68）：手动端点 / 领取轮 / 入池任务三条链可对同一账号
+# 并发跑 auto_claim_all_plans / claim——双链并发会 captcha 池争抢 + billing
+# 双写重复打上游，且另一条链的 rebalance 插入「求解完成 → claim POST」窗口
+# 时，token 的签发 IP 与请求 IP 漂移（上游判 unusual activity）。三条链的
+# 账号段全部经此锁串行（锁只包账号段，跨账号天然并行）。
+_ACCOUNT_CLAIM_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def account_claim_lock(account_id: str) -> asyncio.Lock:
+    return _ACCOUNT_CLAIM_LOCKS.setdefault(account_id, asyncio.Lock())
 
 
 async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | None = None) -> list[dict]:
@@ -334,6 +366,14 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
     """
     if not (account.mode == "jwt" and account.jwt_token):
         return []
+    # 同账号三条领取链互斥（2.7.68）：锁只包账号段，跨账号天然并行
+    async with account_claim_lock(account.id):
+        return await _auto_claim_all_plans_locked(account, skip_plan_ids=skip_plan_ids)
+
+
+async def _auto_claim_all_plans_locked(account: Account, *,
+                                       skip_plan_ids: set[str] | None = None) -> list[dict]:
+    """auto_claim_all_plans 的锁内实现（同号互斥语义见外层函数）。"""
     outcomes: list[dict] = []
 
     if _ACTIVATION_REPORTED.get(account.id) != _today_key():
@@ -388,9 +428,12 @@ async def auto_claim_all_plans(account: Account, *, skip_plan_ids: set[str] | No
                 outcome["next_at"] = err.next_at
             outcomes.append(outcome)
             logs.warn("claim", f"账号 {account.name} 自动领取 {plan['plan_id']} 失败: {err}")
-            if err.code == 3007:
-                # 验证码被拒是上游风险信号：本账号本轮不再打第二个套餐
-                #（单发即止，2.6.5 口径；此前循环继续 → 每个套餐都白烧一枚码）
+            if err.code in (3007, 403):
+                # 验证码被拒（3007）/ 上游风控 403（unusual activity 文案实锤，
+                # _billing_request 只在命中 RISK_CONTROL_MARKERS 时才发 code=403）
+                # 都是出口 IP 风险信号，403 的证据强度不亚于 3007——本账号本轮
+                # 不再打第二个套餐（2.7.68 把 403 补进止损集：此前多套餐投放期
+                # 403 后循环继续，同坏出口每个套餐都白烧一枚码）。
                 break
         except Exception as err:  # noqa: BLE001
             logs.warn("claim", f"账号 {account.name} 自动领取异常: {err}")
@@ -557,7 +600,10 @@ async def claim(account: Account, plan_id: str | None = None) -> dict:
     claim_egress = egress.egress_tag_for(account, settings.BILLING_EGRESS)
     claim_proxy = egress.account_proxy(account)
     verify_param, verify_region = await captcha_manager.get_verify_param(
-        egress_tag=claim_egress, proxy=claim_proxy
+        egress_tag=claim_egress, proxy=claim_proxy,
+        # 领取链求解预算解耦（2.7.68）：单号最坏 4×240s 会把整晚窗口吃穿，
+        # claim 路径缺省 2 次起（settings.CAPTCHA_CLAIM_RETRIES 可调）
+        retries=settings.CAPTCHA_CLAIM_SOLVE_RETRIES,
     )
     config = await captcha_manager.fetch_config(claim_egress, claim_proxy)
     headers = _claim_headers(account, verify_param, verify_region or config.get("region"))
@@ -640,10 +686,12 @@ async def _rebalance_for_claim(account: Account, reason: str) -> bool:
             return False
 
         # 验收：新节点上现解一枚验证码。这一步同时完成①IP 连通性②阿里云对该
-        # 新 IP 的信誉评分。失败 = 新节点同样烂，不重打。
+        # 新 IP 的信誉评分。失败 = 新节点同样烂，不重打。预算走领取链口径
+        # （2.7.68）：验收是决策探针不是可用性兜底，跑满 4 次只会拖长换绑链。
         new_tag = egress.egress_tag_for(account, settings.BILLING_EGRESS)
         await captcha_manager.get_verify_param(egress_tag=new_tag,
-                                               proxy=egress.account_proxy(account))
+                                               proxy=egress.account_proxy(account),
+                                               retries=settings.CAPTCHA_CLAIM_SOLVE_RETRIES)
         logs.ok("claim", f"账号 {account.name} 新出口 {account.egress_node} 验证码验收通过")
         return True
     except CaptchaSolveError as err:
@@ -745,18 +793,41 @@ class ClaimRoundManager:
             for aid, pl in self._claim_holds.items()
         }
         self._claim_holds = holds
-        claimed = 0
-        for acc in accounts:
-            acc_holds = holds.get(acc.id, {})
+        # 轮级 wall-clock 预算（2.7.68）：单号最坏 ≈90 分钟（求解长尾 × 换绑链），
+        # 11 号串行会把 19-23 点窗口吃穿（三晚 0 成功的结构性放大器）。预算到点
+        # 后剩余账号本轮跳过（下拍自然续领），保证轮在窗口内收尾。
+        budget = float(settings.CLAIM_ROUND_BUDGET or 0)
+        deadline = time.monotonic() + budget if budget > 0 else None
+        concurrency = max(1, int(settings.CLAIM_ROUND_CONCURRENCY))
+        skipped_by_budget = 0
+
+        async def _claim_one(acc: Account, acc_holds: dict[str, int]) -> bool:
+            """单账号领取段：预算内执行 + 退避表更新 + 入账刷新。返回是否入账。"""
+            nonlocal skipped_by_budget
+            if deadline is not None and time.monotonic() >= deadline:
+                skipped_by_budget += 1
+                logs.info("claim",
+                          f"账号 {acc.name} 本轮预算耗尽跳过（轮级预算 "
+                          f"{int(budget)}s 已用完，下拍续领）")
+                return False
             if acc_holds:
                 soon = max(0, (min(acc_holds.values()) - now_ms) / 1000)
                 logs.info("claim", f"账号 {acc.name} {len(acc_holds)} 个套餐名额等待中"
                                    f"（约 {int(soon)}s 后恢复重试）")
+            # 单号硬截止 = 轮级剩余预算（求解长尾被 wait_for 兜住，不再拖垮整轮）
+            left = (deadline - time.monotonic()) if deadline is not None else None
             try:
-                outcomes = await auto_claim_all_plans(acc, skip_plan_ids=set(acc_holds))
+                outcomes = await asyncio.wait_for(
+                    auto_claim_all_plans(acc, skip_plan_ids=set(acc_holds)),
+                    timeout=left,
+                )
+            except TimeoutError:
+                logs.warn("claim",
+                          f"账号 {acc.name} 本轮领取超轮级预算被截断（下拍续领）")
+                return False
             except Exception as err:  # noqa: BLE001 - 单账号异常不中断整轮
                 logs.warn("claim", f"轮次领取 账号 {acc.name} 异常: {err}")
-                continue
+                return False
             # 按本轮实绩更新退避表：1005+next_at 记忆；成功/其余失败清除
             # （被跳过的套餐无 outcome，等待自然延续到 next_at）
             updated = dict(acc_holds)
@@ -774,14 +845,30 @@ class ClaimRoundManager:
             else:
                 holds.pop(acc.id, None)
             if not any(o.get("ok") for o in outcomes):
-                continue
-            claimed += 1
+                return False
             live = store.find("zai", acc.id)
             if live is not None:
                 try:
                     await refresh_accounts([live])  # 领到额度立即反映到 UI
                 except Exception as err:  # noqa: BLE001
                     logs.warn("claim", f"轮次领取 账号 {acc.name} 额度刷新失败: {err}")
+            return True
+
+        # 并发调度（2.7.68）：求解进程级上限与 TP rebalance 互斥都有自己的全局
+        # 闸，这里的并发只是调度并行度，不放大浏览器/上游压力。
+        claimed = 0
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _worker(acc: Account) -> None:
+            nonlocal claimed
+            async with sem:
+                if await _claim_one(acc, holds.get(acc.id, {})):
+                    claimed += 1
+
+        await asyncio.gather(*[_worker(acc) for acc in accounts], return_exceptions=True)
+        if skipped_by_budget:
+            logs.info("claim",
+                      f"本轮 {skipped_by_budget} 个账号因轮级预算耗尽未执行（下拍续领）")
         if claimed:
             logs.ok("claim", f"自动领取轮完成: {claimed} 个账号有新套餐入账")
 
