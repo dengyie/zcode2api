@@ -118,14 +118,25 @@ async def _attempt_in_browser(
         )
         try:
             page = await context.new_page()
-            await page.goto(_PAGE.as_uri(), wait_until="load", timeout=30_000)
-            # SDK 就绪（与 solver_pw.js 同款等待；SDK 从 o.alicdn.com 拉取，
-            # 经 context proxy 出站——此处失败=出口不通，fast-fail 归因）。
-            # 预算 45s（2026-11-18 1117 复盘）：TP 节点对 alicdn 路由实测
-            # 1.7~31.9s/资源，20s 连可用档（3.5~5s）的多资源串行都接不住。
-            await page.wait_for_function(
-                "typeof window.initAliyunCaptcha === 'function'", timeout=45_000
-            )
+            # setup 段（goto + SDK 就绪）异常不得逃出 attempt 循环——2026-11-18
+            # 19:1x 实弹：慢 alicdn 节点（trial 24.7s/整文件）上 45s 等不到
+            # initAliyunCaptcha，TimeoutError 直接穿到 main() 顶层兜底，归因
+            # 退化成裸 EXC:TimeoutError，claim 侧只见「求解未果」丢失环境线索。
+            try:
+                await page.goto(_PAGE.as_uri(), wait_until="load", timeout=30_000)
+                # SDK 就绪（与 solver_pw.js 同款等待；SDK 从 o.alicdn.com 拉取，
+                # 经 context proxy 出站——此处失败=出口不通，fast-fail 归因）。
+                # 预算 45s（2026-11-18 1117 复盘）：TP 节点对 alicdn 路由实测
+                # 1.7~31.9s/资源，20s 连可用档（3.5~5s）的多资源串行都接不住。
+                await page.wait_for_function(
+                    "typeof window.initAliyunCaptcha === 'function'", timeout=45_000
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — 环境级失败：归因后换 context
+                last_fail = f"SETUP:{type(exc).__name__}"
+                _debug(f"attempt {attempt}: setup failed: {last_fail}; retrying")
+                continue
             # 第一跳：无痕验证（solver_pw.js 线上实证稳定形态）——成功直接出
             # param，不需要拼图。失败（SDK 弹 popup 兜底）再落 slidex 拟人拖拽。
             traceless = await page.evaluate(
@@ -185,7 +196,13 @@ async def _attempt_in_browser(
                            f"no securityToken) — reject and retry")
                 last_fail = f"TRACELESS:{await page.evaluate('() => window.__slidexCaptchaFail') or ('DEGRADED' if param else 'NO_PARAM')}"
                 _debug(f"traceless no param, fail={last_fail}")
-                # 无痕被拒后 SDK 已弹 popup 兜底 → 落第二跳拟人拖拽
+                # 无痕被拒后 SDK 已弹 popup 兜底 → 落第二跳拟人拖拽。
+                # 手势 ladder（2026-11-18 19:4x 实弹）：real（CDP 可信事件）
+                # 像素级命中（target=240.0px / readback sl='240px'）仍被
+                # F001/F008/F015 连拒——上游拒的是轨迹形态本身；slidex 手册
+                # 端到端唯一成功样本是 synthetic（页面内合成手势，纯前进无回
+                # 拉）。故 real 判败后同 attempt 立即补一发 synthetic，两种
+                # 形态都给上游一次机会，不再互相独占预算。
                 provider = provider_cls()
                 result = await provider.acquire_verify_param(
                     page, scene,
@@ -195,6 +212,20 @@ async def _attempt_in_browser(
                     verdict_timeout_ms=8000,
                     deadline_s=max(10, int(deadline_ms / 1000 - (_time.monotonic() - start))),
                 )
+                if not _verify_param_ok(result.get("param")) and drag == "real":
+                    _debug(f"drag=real failed ({result.get('fail_code')}) — retry synthetic")
+                    result2 = await provider.acquire_verify_param(
+                        page, scene,
+                        region=region, prefix=prefix,
+                        drag="synthetic",
+                        max_attempts=2,
+                        verdict_timeout_ms=8000,
+                        deadline_s=max(10, int(deadline_ms / 1000 - (_time.monotonic() - start))),
+                    )
+                    if _verify_param_ok(result2.get("param")):
+                        result = result2
+                    elif result2.get("param"):
+                        _debug(f"synthetic param degraded (len={len(result2['param'])}) — reject")
                 if _verify_param_ok(result.get("param")):
                     print(f"VERIFY_PARAM={result['param']}", flush=True)
                     _debug(f"ok via drag (attempt {attempt})")
