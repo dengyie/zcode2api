@@ -105,17 +105,17 @@ def _startup_precheck() -> None:
     egress_pool.py」曾以运行期 AttributeError 崩溃（err.log 实锤，supervisor
     autorestart 拉起后自愈）——把这类不匹配从运行期 AttributeError 提前为
     启动期一条明确版本配对错误，fail-fast 带完整上下文。"""
-    missing = [name for name, obj in (
-        ("egress_pool.start/stop", egress_pool),
-        ("captcha_manager.start/close", captcha_manager),
-        ("claim_round.start/stop", claim_round),
-        ("version_tracker.start/stop", version_tracker),
-        ("monitor.start/stop", monitor),
-    ) if not (hasattr(obj, "start") and hasattr(obj, "stop"))]
+    missing = [name for name, obj, *attrs in (
+        ("egress_pool", egress_pool, "start", "stop"),
+        ("captcha_manager", captcha_manager, "start", "close"),
+        ("claim_round", claim_round, "start", "stop"),
+        ("version_tracker", version_tracker, "start", "stop"),
+        ("monitor", monitor, "start", "stop"),
+    ) if not all(hasattr(obj, a) for a in attrs)]
     if missing:
         raise RuntimeError(
-            f"发版偏斜：缺少 {', '.join(missing)} —— app/ 真身不完整或版本不配对，"
-            f"请重新完整发版（不要只 scp 单文件）")
+            f"发版偏斜：缺少 {', '.join(missing)} 的生命周期方法 —— app/ 真身不完整"
+            f"或版本不配对，请重新完整发版（不要只 scp 单文件）")
 
 
 def _start_component(name: str, fn) -> None:

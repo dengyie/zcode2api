@@ -15,10 +15,15 @@ from app import main
 
 
 class _Ok:
+    """全生命周期方法齐备的组件桩（captcha_manager 的停机方法是 close）。"""
+
     def start(self):
         pass
 
     def stop(self):
+        pass
+
+    def close(self):
         pass
 
 
