@@ -133,19 +133,23 @@ async def _attempt_in_browser(
                     let done = false;
                     const finish = (v) => { if (!done) { done = true; resolve(v); } };
                     try {
-                        // region 归一（2.7.58）：上游按出口 IP 下发 sgp（美国 TP 出口
-                        // 拉配置即得），但 sgp 端点 traceless 稳定 TIMEOUT/F001
-                        // （2026-11-17 对照实验：同出口同窗口 cn 一次成功、sgp 6 轮
-                        // 全败；与 solver_pw.js 2026-11-11 修复同款语义——缺省 cn
-                        // 端点走降级无痕路径稳定出参，sgp 显式配置即触发完整 UI 流）。
-                        if (args.region && args.region !== "cn" && args.region !== "sgp")
-                            window.AliyunCaptchaConfig = { region: args.region, prefix: args.prefix };
+                        // region 归一（2.7.58 + 2.7.66 修正）：上游按出口 IP 下发
+                        // sgp（美国 TP 出口拉配置即得），但 sgp 端点 traceless 稳定
+                        // TIMEOUT/F001（2026-11-17 对照实验：同出口同窗口 cn 一次
+                        // 成功、sgp 6 轮全败）——故统一钉 cn 端点。
+                        // 2.7.66 实证：cn/sgp 也不能省 AliyunCaptchaConfig——SDK
+                        // 缺省不再回落 CN 端点，直接请求
+                        // https://undefined.captcha-open.aliyuncs.com/（requestfailed
+                        // + 无痕假成功回调吐 len-76 降级 param，claim 必 3007）。
+                        window.AliyunCaptchaConfig = { region: "cn", prefix: args.prefix };
                         window.__slidexCaptchaParam = null;
                         window.__slidexCaptchaFail = null;
                         window.initAliyunCaptcha({
                             SceneId: args.scene,
                             mode: "popup",
-                            language: "zh-CN",
+                            // 语言白名单只有 cn/tw/en/…（SDK 内置 languageError）：
+                            // "zh-CN" 2.7.66 实测被判非法，SDK 不初始化即降级 stub。
+                            language: "cn",
                             showErrorTip: false,
                             element: "#cap-holder",
                             button: "#cap-btn",
