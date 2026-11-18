@@ -323,7 +323,11 @@ class TetherPoolEgress:
         """懒引导：egress_node 为空的绑定账号 acquire 一次（幂等，TP 粘性）。
 
         必须带 exclude_node=其它账号节点（风控核心）：首次分配正是节点归属
-        发生的时刻，不带互斥 = 新账号可静默落到已属其它账号的节点。"""
+        发生的时刻，不带互斥 = 新账号可静默落到已属其它账号的节点。
+        非 tetherpool 供给（listeners）无 TP 引导语义：出口 = account.egress
+        已配，直接视为已绑定（2.7.68 供给模式 gate）。"""
+        if not (settings.PER_ACCOUNT_EGRESS and settings.EGRESS_SUPPLY == "tetherpool"):
+            return bool(account.egress)
         if account.egress_node:
             return True
         d = await tp_acquire(account, extra_exclude=_other_nodes(account))
@@ -345,6 +349,17 @@ class TetherPoolEgress:
     async def _rebalance_locked(self, account, reason: str, ban: bool) -> bool:
         from . import logs
         from .store import store
+        # 供给模式 gate（2.7.68 收尾 review）：rebalance/引导/ban 全是 TetherPool
+        # 语义——listeners 供给下出口 = account.egress（mihomo listener），打 TP
+        # API 改绑定毫无意义（纯写流量 + egress_node 字段污染，重打还是同一
+        # listener 出口）。claim 换绑链在 listeners 模式下经此干净退出
+        # （rebalance False → wrapper 上抛原始错误 = 单发止损，家宽线抖动
+        # 由 CONNECT_FAIL_COOLDOWN 自愈，不需要换绑）。
+        if not (settings.PER_ACCOUNT_EGRESS and settings.EGRESS_SUPPLY == "tetherpool"):
+            logs.info("egress_pool",
+                      f"{account.name} 非 tetherpool 供给（supply={settings.EGRESS_SUPPLY}），"
+                      f"无 TP 节点可换——保持绑定 {account.egress_node or ''}")
+            return False
         now = time.monotonic()
         if now - self._rebalance_at.get(account.id, 0) < settings.TP_REBALANCE_DEBOUNCE:
             logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")

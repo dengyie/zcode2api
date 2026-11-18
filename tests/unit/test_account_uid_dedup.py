@@ -148,6 +148,12 @@ class TestProbeStreakLifecycle:
         """R1：换绑提交即清 streak——旧节点失败账不得背到新节点头上。
         （否则新节点首轮抖动即够 2/2 误换绑。）"""
         from app import egress_pool as egress_pool_mod
+        from app import settings as _settings
+
+        # 本测试验证 TP rebalance 语义，显式进 tetherpool 供给
+        # （2.7.68 起 listeners 供给被供给模式 gate 拦截，另有专测）
+        monkeypatch.setattr(_settings, "PER_ACCOUNT_EGRESS", True)
+        monkeypatch.setattr(_settings, "EGRESS_SUPPLY", "tetherpool")
 
         pool = egress_pool_mod.egress_pool
         acc = fresh_app.add_account("zai", "streak-acc", _jwt("uid-STREAK"))

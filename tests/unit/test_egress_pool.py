@@ -1233,3 +1233,51 @@ async def test_reconcile_orphans_releases_stale_allocations(tp_mode, monkeypatch
     pool = egress_pool.egress_pool
     await pool._reconcile_orphans_once(initial_delay=0)
     assert released == ["stale-old"]
+
+
+@pytest.mark.asyncio
+async def test_listeners_supply_rebalance_gate(tp_mode, monkeypatch):
+    """2.7.68 供给模式 gate：listeners 供给下 rebalance 不打 TP API（改绑定
+    对 listener 出口毫无意义），干净返回 False——claim 换绑链据此单发止损。"""
+    acquire_calls: list = []
+
+    async def _spy_acquire(account, force_rebalance=False, extra_exclude=None):
+        acquire_calls.append(1)
+        return {"node_name": "cand-x", "exit_ip": "1.2.3.4"}
+
+    monkeypatch.setattr(egress_pool, "tp_acquire", _spy_acquire)
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "listeners")  # 非 tetherpool
+
+    acc = _account(acc_id="acc-ls")
+    acc.egress_node = "stale-tp-node"
+    acc.egress = "http://127.0.0.1:11031"
+
+    pool = egress_pool.egress_pool
+    ok = await pool.rebalance(acc, reason="edge_405_html", ban=True)
+    assert ok is False
+    assert acquire_calls == [], "listeners 供给下不得打 TP acquire"
+    assert acc.egress_node == "stale-tp-node"  # 绑定不被 TP 污染
+
+
+@pytest.mark.asyncio
+async def test_ensure_binding_listeners_supply_no_tp(tp_mode, monkeypatch):
+    """listeners 供给：绑定引导不打 TP，egress 已配即视为已绑定。"""
+    acquire_calls: list = []
+
+    async def _spy_acquire(account, force_rebalance=False, extra_exclude=None):
+        acquire_calls.append(1)
+        return {"node_name": "cand-x"}
+
+    monkeypatch.setattr(egress_pool, "tp_acquire", _spy_acquire)
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "listeners")
+
+    acc = _account(acc_id="acc-ls2")
+    acc.egress = "http://127.0.0.1:11032"
+    acc.egress_node = None  # 无 TP 节点（listeners 时代的合法形态）
+
+    pool = egress_pool.egress_pool
+    ok = await pool.ensure_binding(acc)
+    assert ok is True
+    assert acquire_calls == [], "listeners 供给下绑定引导不得打 TP"
