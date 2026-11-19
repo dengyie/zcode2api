@@ -214,11 +214,13 @@ async def fetch_marketing_touch_plans(account: Account) -> list[dict]:
 async def _billing_request(account: Account, method: str, path: str, **kwargs) -> dict:
     headers = dict(kwargs.pop("headers"))
     url = path if path.startswith("http") else f"{settings.ZCODE_BILLING_BASE}{path}"
-    # 瞬态网络重试（2.7.68）：连接/读超时是出口链路瞬态（EasyTier 重启窗口、
-    # 家宽线抖动，tebi 实锤多次），单发即败会让本轮整号报废（-1 非信誉型，
-    # wrapper 不重试，下轮要等 3600s）。GET/HEAD 幂等可安全重试；POST claim
+    # 瞬态网络重试（2.7.68/2.7.71）：连接/读超时是出口链路瞬态（EasyTier 重启
+    # 窗口、家宽线抖动，tebi 实锤多次），单发即败会让本轮整号报废（-1 非信誉
+    # 型，wrapper 不重试，下轮要等 3600s）。GET/HEAD 幂等可安全重试；POST claim
     # 是写操作，超时后上游可能已入账，重发会撞 1003——保持单发。
-    attempts = 2 if method.upper() in ("GET", "HEAD") else 1
+    # 2.7.71 提到 3 次（2s/4s 阶梯）：19 点轮实证两次 ConnectError 连续失败的
+    # 账号要等到下一窗口（+3600s）才补上，3 次基本吃满抖动窗口。
+    attempts = 3 if method.upper() in ("GET", "HEAD") else 1
     try:
         # 出口由 settings.BILLING_EGRESS 决定（trust_env 按 direct/proxy 切）。
         # 2026-11-13 tebi 实证：GCP 大厂 ASN 直连可用（历史缺省），机房小 ASN
@@ -242,10 +244,12 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
                 except httpx.TransportError as err:
                     if attempt >= attempts:
                         raise
+                    wait = 2 * attempt
                     logs.info("claim",
                               f"账号 {account.name} billing {method} 瞬态网络错误"
-                              f"（{type(err).__name__}），2s 后重试（{attempt}/{attempts - 1}）")
-                    await asyncio.sleep(2)
+                              f"（{type(err).__name__}），{wait}s 后重试"
+                              f"（{attempt}/{attempts - 1}）")
+                    await asyncio.sleep(wait)
         assert res is not None  # 循环必经 break/raise
     except httpx.HTTPError as err:
         # 连接/超时等网络故障统一转业务错误：路由层只需面对 ClaimError 一种失败

@@ -277,6 +277,78 @@ def stats() -> dict:
         }
 
 
+def hourly(window_hours: int = 24) -> list[dict]:
+    """逐小时聚合（2.7.71 监控增强，管理端监控页/巡检用）。
+
+    每小时桶：请求数、成败、p95/最大总时长、峰值并发（区间重叠扫描，在飞请求
+    会计入其起始小时的并发窗口）、模型分布 TOP3。覆盖内存环（KEEP 条）——
+    比环更早的小时缺席，不做持久化回扫。按小时升序。"""
+    from collections import Counter
+
+    now = time.time()
+    events: list[tuple[float, int]] = []
+    buckets: dict[int, dict] = {}
+
+    def bucket(h: int) -> dict:
+        b = buckets.get(h)
+        if b is None:
+            b = {
+                "hour_start": h * 3600,
+                "hour": time.strftime("%m-%d %H时", time.localtime(h * 3600)),
+                "reqs": 0, "ok": 0, "fail": 0, "inflight_now": 0,
+                "p95_t_total": None, "max_t_total": None,
+                "peak_concurrency": 0, "models": {},
+            }
+            buckets[h] = b
+        return b
+
+    with _lock:
+        for e in _entries:
+            ts = e.get("ts") or 0
+            if ts <= 0:
+                continue
+            ok = e.get("ok")
+            b = bucket(int(ts // 3600))
+            b["reqs"] += 1
+            if ok is True:
+                b["ok"] += 1
+            elif ok is False:
+                b["fail"] += 1
+            m = e.get("model")
+            if m:
+                b["models"][m] = b["models"].get(m, 0) + 1
+            tt = e.get("t_total")
+            if isinstance(tt, (int, float)) and tt >= 0:
+                b.setdefault("_tt", []).append(tt)
+            dur = max(tt or 0, 0.5)
+            if ok is None:
+                # 在飞：并发窗口一直开到当前时刻
+                events.append((ts, 1))
+                events.append((now, -1))
+                b["inflight_now"] += 1
+            else:
+                events.append((ts, 1))
+                events.append((ts + dur, -1))
+
+    for b in buckets.values():
+        tts = sorted(b.pop("_tt", []))
+        if tts:
+            b["p95_t_total"] = round(tts[min(len(tts) - 1, int(len(tts) * 0.95))], 2)
+            b["max_t_total"] = round(tts[-1], 2)
+        h0, h1 = b["hour_start"], b["hour_start"] + 3600
+        cur = peak = 0
+        for s, d in events:
+            if d == 1 and s < h1:
+                cur += 1
+                peak = max(peak, cur)
+            elif d == -1 and s > h0:
+                cur -= 1
+        # 区间裁剪简化版：对跨小时长流（开始在本小时前/结束在本小时后）低估可接受
+        b["peak_concurrency"] = peak
+        b["models"] = dict(Counter(b["models"]).most_common(3))
+    return [buckets[h] for h in sorted(buckets)]
+
+
 def clear() -> None:
     """清空内存环并删除持久化文件（含 .1 轮转件，管理端「清空」按钮语义）。
 

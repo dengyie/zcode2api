@@ -365,7 +365,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.70"  # 2.7.69（出口供给双根修 + listeners 健康探针）之上：深度 review 根修——listener 探针冷却/复活加状态所有权守卫（INVALID/DISABLED/外部 COOLING 不得被探针洗状态：enabled=True 的风控禁用号会被健康循环纳入，原实现探针连败即覆写 DISABLED→COOLING、恢复即复活=绕过人工恢复不变量；对齐 gateway「不洗」纪律）
+APP_VERSION = "2.7.71"  # 2.7.70（listener 探针状态所有权守卫）之上：高可用迭代——①领取链 billing GET 瞬态重试 2→3 次（2s/4s 阶梯退避，19 点轮实证两连败要等下一窗口 3600s 才补上）②reqlog 逐小时聚合（reqs/成败/p95 t_total/峰值并发/在飞/模型 TOP3）挂 /admin/api/monitoring 的 hourly 字段 ③tebi 侧告警守护 zcode-hub-alert（supervisor 常驻：/meta 失联 2 轮 + opslog 关键模式【人工介入/风控升级禁用/listener 冷却/领取预算耗尽/全池耗尽】→ TG @mangoqwqbot，6h 键控去重，socks5h 10822→11030 双路），详见 vault 告警条目  # 2.7.69（出口供给双根修 + listeners 健康探针）之上：深度 review 根修——listener 探针冷却/复活加状态所有权守卫（INVALID/DISABLED/外部 COOLING 不得被探针洗状态：enabled=True 的风控禁用号会被健康循环纳入，原实现探针连败即覆写 DISABLED→COOLING、恢复即复活=绕过人工恢复不变量；对齐 gateway「不洗」纪律）
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。
