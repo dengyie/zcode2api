@@ -1436,3 +1436,53 @@ async def test_health_loop_dispatches_by_supply_mode(listeners_mode, monkeypatch
         await egress_pool.egress_pool.stop()
     assert calls["listener"] >= 1
     assert calls["tp"] == 0
+
+
+@pytest.mark.asyncio
+async def test_listener_health_respects_external_states(listeners_mode, monkeypatch, tmp_path):
+    """2.7.70 根修：探针连败不得洗外部状态——
+    ① DISABLED（风控禁用，enabled 仍 True 会被循环纳入）：不覆写、不进 _listener_cooled；
+    ② 外部 COOLING（风控指数退避中）：不得被探针冷却缩短；
+    ③ INVALID（废 JWT）：同 ①。streak 照常累计供观测。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_path / "test-accounts.db")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+
+    async def fail_probe(account):
+        return False
+
+    monkeypatch.setattr(egress_pool.egress_pool, "health_once", fail_probe)
+
+    for status_val in (Status.DISABLED, Status.INVALID):
+        acc = store.add_account("zai", f"ext-{status_val}", "h.eyJzdWIiOiJ1In0.sig")
+        acc.enabled = True
+        acc.egress = "http://127.0.0.1:11031"
+        acc.status = status_val
+        for _ in range(3):
+            await egress_pool.egress_pool._check_listener(acc)
+        assert acc.status == status_val, f"{status_val} 不得被洗"
+        assert acc.id not in egress_pool.egress_pool._listener_cooled
+        assert egress_pool.egress_pool._probe_fail_streak.get(acc.id, 0) >= 2
+
+    # 外部 COOLING（风控退避 1500s）：探针连败不得缩短其冷却
+    acc = store.add_account("zai", "ext-cool", "h.eyJzdWIiOiJ1In0.sig")
+    acc.enabled = True
+    acc.egress = "http://127.0.0.1:11031"
+    acc.status = Status.COOLING
+    acc.cooling_until = time.time() + 1500
+    for _ in range(3):
+        await egress_pool.egress_pool._check_listener(acc)
+    assert acc.status == Status.COOLING
+    assert acc.cooling_until > time.time() + 1400, "外部风控冷却不得被缩短"
+    assert acc.id not in egress_pool.egress_pool._listener_cooled
+
+    # 对照：本循环自己冷却的号，探针仍败 → 续冷不受守卫影响
+    mine = store.add_account("zai", "mine-cool", "h.eyJzdWIiOiJ1In0.sig")
+    mine.enabled = True
+    mine.egress = "http://127.0.0.1:11031"
+    mine.status = Status.ACTIVE
+    egress_pool.egress_pool._listener_cooled.add(mine.id)
+    egress_pool.egress_pool._probe_fail_streak[mine.id] = 5
+    await egress_pool.egress_pool._check_listener(mine)
+    assert mine.status == Status.COOLING
+    assert mine.id in egress_pool.egress_pool._listener_cooled

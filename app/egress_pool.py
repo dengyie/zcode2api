@@ -734,7 +734,13 @@ class TetherPoolEgress:
         死出口（健康探针是死亡在先证据，好过等真实请求撞上去），探针恢复自动
         复活。冷却时长 = 一个健康周期（探针仍败则下轮续冷，死出口不再进入
         可选窗口）；口径对齐 gateway 连接失败路径（连接类失败 ≠ 账号故障，
-        不烧 EXHAUSTED/strikes）。"""
+        不烧 EXHAUSTED/strikes）。
+
+        状态所有权纪律（2.7.70 根修，对齐 gateway「不洗」纪律）：冷却/复活只对
+        **本循环下发的 COOLING**（_listener_cooled 成员）负责——INVALID/DISABLED
+        （废 JWT/风控禁用需人工恢复）与外部 COOLING（风控指数退避）不得被探针
+        冷却覆盖、也不得被探针恢复提前复活（enabled=True 的风控禁用号会进健康
+        循环，无守卫时探针连败即洗掉 DISABLED、恢复即绕过人工恢复不变量）。"""
         from . import logs
         from .store import store
         try:
@@ -756,6 +762,14 @@ class TetherPoolEgress:
                           f"[health] {account.name} listener 探针失败"
                           f"（{streak}/{settings.TP_HEALTH_FAIL_THRESHOLD}，"
                           f"待下轮复核）")
+                return
+            foreign = account.status in (Status.INVALID, Status.DISABLED) or (
+                account.status == Status.COOLING
+                and account.id not in self._listener_cooled)
+            if foreign:
+                logs.warn("egress_pool",
+                          f"[health] {account.name} listener 探针连续 {streak} 轮失败，"
+                          f"但账号处于外部状态（{account.status}）——不冷却不洗状态")
                 return
             seconds = max(settings.CONNECT_FAIL_COOLDOWN, settings.TP_HEALTH_INTERVAL)
             account.status = Status.COOLING
