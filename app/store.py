@@ -349,34 +349,46 @@ class Store:
                 for items in self._accounts.values():
                     for account in sorted(items, key=lambda x: x.created_at):
                         old = account.egress
+                        mutated = False
                         if egress.tetherpool_enabled_for(account):
                             want = egress.tetherpool_gateway_url(account)
                             if account.egress != want:
                                 account.egress = want
-                                changed.append(account)
-                        elif old and ":9101@" in old:
+                                mutated = True
+                        elif egress.is_tp_gateway_url(old):
                             account.egress = None  # 模式回退残留清理
                             account.egress_node = None  # 语义对齐：无 TP 出口即无 TP 节点
+                            mutated = True
+                        if mutated and not account.egress:
+                            # 灰度外账号：网关残留清空后同遍回落 listener
+                            # （2.7.69：原先只清不填，空窗期以 None 走共享语义）
+                            self._assign_egress(account)
+                        if mutated:
                             changed.append(account)
                 for account in changed:
                     self._persist_account(account)
             if changed:
                 logs.ok("store", f"per-account 出口补分配（tetherpool 供给）{len(changed)} 个账号")
             return
-        # listeners 供给：网关 URL 残留清空 + listener 池分配（2.7.36 行为）
+        # listeners 供给：网关 URL 残留清空 + listener 池分配（2.7.36 行为）。
+        # 清空与回填同遍完成（2.7.69 根修：原先 elif 短路——清完残留的账号
+        # 要等下一次 ensure 才能领 listener，空窗期以 None 落回共享出口语义，
+        # 违反一号一节点红线）。
         with self._lock:
             changed: list[Account] = []
             for items in self._accounts.values():
                 for account in sorted(items, key=lambda x: x.created_at):
                     old = account.egress
-                    if old and ":9101@" in old:
+                    mutated = False
+                    if egress.is_tp_gateway_url(old):
                         account.egress = None
                         account.egress_node = None  # 语义对齐（回滚不留 TP 节点）
-                        changed.append(account)
-                    elif not account.egress:
+                        mutated = True
+                    if not account.egress:
                         self._assign_egress(account)
-                        if account.egress:
-                            changed.append(account)
+                        mutated = mutated or bool(account.egress)
+                    if mutated:
+                        changed.append(account)
             for account in changed:
                 self._persist_account(account)
         if changed:

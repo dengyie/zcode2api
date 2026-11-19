@@ -168,12 +168,17 @@ class TestProbeStreakLifecycle:
             account.egress_node = "node-new"
             return {"node_name": "node-new", "exit_ip": "1.2.3.4"}
 
-        async def fake_probe(account, proxy_url, jwt):
+        async def fake_probe(self, account, proxy_url, jwt):
             return 200, '{"data":{"model":"GLM"}}'  # JSON-APP 放行
 
         monkeypatch.setattr(egress_pool_mod, "tp_ban", fake_tp_ban)
         monkeypatch.setattr(egress_pool_mod, "tp_acquire", fake_tp_acquire)
-        monkeypatch.setattr(pool, "_probe_via", fake_probe)
+        monkeypatch.setattr(type(pool), "_probe_via", fake_probe)
+
+        async def _alicdn_ok(proxy_url, *, full=False, fetch_impl=None):
+            return True, 0.1, "ok"
+
+        monkeypatch.setattr(egress_pool_mod, "probe_alicdn", _alicdn_ok)
         monkeypatch.setattr(
             "app.captcha.captcha_manager.invalidate", lambda *a, **k: None)
 

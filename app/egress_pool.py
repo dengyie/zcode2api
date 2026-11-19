@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 
 from . import egress, settings
-from .models import PROVIDERS
+from .models import PROVIDERS, Status
 
 _NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _PROBE_BODY = json.dumps({"model": "GLM-5.3-Flash", "max_tokens": 16,
@@ -309,6 +309,8 @@ class TetherPoolEgress:
                                                  #   跨账号仍可并发——互斥由
                                                  #   exclude_node 保证）
         self._probe_fail_streak: dict[str, int] = {}  # account_id → 连续探针失败轮数
+        self._listener_cooled: set[str] = set()  # 本循环因探针连败而冷却的账号
+        # （listeners 供给 2.7.69：复活只解除自己下的冷却，不碰 quota/gateway 状态）
 
     def _account_lock(self, account_id: str) -> asyncio.Lock:
         return self._locks.setdefault(account_id, asyncio.Lock())
@@ -317,6 +319,7 @@ class TetherPoolEgress:
         """清该账号的探针失败计数（换绑提交 / 账号禁用时调用——旧账不得
         背到新节点或重新启用后的账上）。"""
         self._probe_fail_streak.pop(account_id, None)
+        self._listener_cooled.discard(account_id)
 
     # ── 绑定/换节点编排 ────────────────────────────────────────────────────
     async def ensure_binding(self, account) -> bool:
@@ -723,23 +726,85 @@ class TetherPoolEgress:
         finally:
             self._inflight.discard(asyncio.current_task())
 
+    async def _check_listener(self, account) -> None:
+        """listeners 供给的单账号健康检查（2.7.69）：探针 → 连败冷却 → 转好复活。
+
+        listeners 模式没有「换节点」语义（一号一 listener 互斥绑定，池满时换绑
+        只会打破一号一节点红线）——自愈形态 = 探针连败即主动冷却，让轮询先绕开
+        死出口（健康探针是死亡在先证据，好过等真实请求撞上去），探针恢复自动
+        复活。冷却时长 = 一个健康周期（探针仍败则下轮续冷，死出口不再进入
+        可选窗口）；口径对齐 gateway 连接失败路径（连接类失败 ≠ 账号故障，
+        不烧 EXHAUSTED/strikes）。"""
+        from . import logs
+        from .store import store
+        try:
+            if await self.health_once(account):
+                self._probe_fail_streak.pop(account.id, None)
+                if account.id in self._listener_cooled:
+                    self._listener_cooled.discard(account.id)
+                    if account.status == Status.COOLING:
+                        account.status = Status.ACTIVE
+                        account.cooling_until = None
+                        store.update_account(account)
+                        logs.ok("egress_pool",
+                                f"[health] {account.name} listener 探针恢复 → 复活选号")
+                return
+            streak = self._probe_fail_streak.get(account.id, 0) + 1
+            self._probe_fail_streak[account.id] = streak
+            if streak < settings.TP_HEALTH_FAIL_THRESHOLD:
+                logs.warn("egress_pool",
+                          f"[health] {account.name} listener 探针失败"
+                          f"（{streak}/{settings.TP_HEALTH_FAIL_THRESHOLD}，"
+                          f"待下轮复核）")
+                return
+            seconds = max(settings.CONNECT_FAIL_COOLDOWN, settings.TP_HEALTH_INTERVAL)
+            account.status = Status.COOLING
+            account.last_error = "listener 健康探针连败（出口链路不可达）"
+            account.cooling_until = time.time() + seconds
+            store.update_account(account)
+            self._listener_cooled.add(account.id)
+            logs.warn("egress_pool",
+                      f"[health] {account.name} listener 探针连续 {streak} 轮失败"
+                      f" → 冷却 {seconds}s（轮询绕开，探针恢复自动复活）")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 单账号故障不夭折整轮
+            logs.warn("egress_pool",
+                      f"[health] {account.name} listener 探针异常（跳过）: {exc!r}")
+        finally:
+            self._inflight.discard(asyncio.current_task())
+
     async def _loop(self) -> None:
         from . import logs
         from .store import store
         while True:
             try:
                 await asyncio.sleep(settings.TP_HEALTH_INTERVAL)
-                if not settings.PER_ACCOUNT_EGRESS or \
-                        settings.EGRESS_SUPPLY != "tetherpool":
+                if not settings.PER_ACCOUNT_EGRESS:
                     continue
                 accounts = [a for a in store.list_accounts("zai")
-                            if a.enabled and a.provider == "zai"
-                            and egress.tetherpool_enabled_for(a)]
-                if not accounts:
+                            if a.enabled and a.provider == "zai"]
+                if settings.EGRESS_SUPPLY == "tetherpool":
+                    accounts = [a for a in accounts
+                                if egress.tetherpool_enabled_for(a)]
+                    if not accounts:
+                        continue
+                    for account in accounts:
+                        task = asyncio.create_task(self._check_account(account))
+                        self._inflight.add(task)
+                elif settings.EGRESS_SUPPLY == "listeners":
+                    # listener 出口逐账号探活（2.7.69）：TP 网关形态残留的
+                    # egress 不在此列（不是 listener，别拿 TP 探针口径误判）
+                    accounts = [a for a in accounts
+                                if a.egress
+                                and not egress.is_tp_gateway_url(a.egress)]
+                    if not accounts:
+                        continue
+                    for account in accounts:
+                        task = asyncio.create_task(self._check_listener(account))
+                        self._inflight.add(task)
+                else:
                     continue
-                for account in accounts:
-                    task = asyncio.create_task(self._check_account(account))
-                    self._inflight.add(task)
                 # 任务自持引用（_inflight + finally discard），本轮立即返回；
                 # 并发探针取代串行——7 账号 × 40s 超时串行最坏 4.6 分钟才见到死节点
                 await asyncio.sleep(0)

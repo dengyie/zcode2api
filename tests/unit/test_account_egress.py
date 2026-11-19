@@ -115,3 +115,49 @@ def test_gate_shared_tag_matches_legacy_behavior():
     g.trip_edge("shared")
     assert g.acquire("shared") == (False, "edge_hold")
     monkey.undo()
+
+
+# ── TP 网关 URL 形态判定（2.7.69 根修：":9101@" 判据永不命中）───────────────
+def test_is_tp_gateway_url_shape():
+    """网关 URL = `:tetherpool@{TP_GATEWAY}` 尾缀；listener/共享/None 不匹配。"""
+    acc = Account(id="a", name="a", provider="zai", mode="jwt")
+    url = egress.tetherpool_gateway_url(acc)
+    assert egress.is_tp_gateway_url(url) is True
+    # listener URL 与 TP 网关尾缀结构不同（无凭据段）
+    assert egress.is_tp_gateway_url("http://127.0.0.1:11031") is False
+    assert egress.is_tp_gateway_url("http://127.0.0.1:9101") is False  # 裸同端口≠网关
+    assert egress.is_tp_gateway_url(None) is False
+    assert egress.is_tp_gateway_url("") is False
+
+
+def test_is_tp_gateway_url_custom_gateway_port(monkeypatch):
+    """TP_GATEWAY 自定义端口时判据跟随 settings，不写死 9101。"""
+    monkeypatch.setattr(settings, "TP_GATEWAY", "10.0.0.8:9201")
+    acc = Account(id="a", name="a", provider="zai", mode="jwt")
+    assert egress.is_tp_gateway_url(egress.tetherpool_gateway_url(acc)) is True
+    assert egress.is_tp_gateway_url("http://u:tetherpool@127.0.0.1:9101") is False
+
+
+def test_ensure_egress_assignments_listeners_clears_tp_gateway(monkeypatch, tmp_path):
+    """listeners 供给下 TP 网关 URL 残留必须清空并领 listener（2.7.69 根修：
+    旧 ":9101@" 判据永不命中 → 回滚通道死路，账号永挂 TP 出口）。"""
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("ZCODE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(settings, "DATA_DIR", data_dir)
+    monkeypatch.setattr(settings, "DB_PATH", data_dir / "accounts.db")
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "listeners")
+    monkeypatch.setattr(settings, "EGRESS_LISTENERS",
+                        ["http://127.0.0.1:11031", "http://127.0.0.1:11032"])
+    store = Store()
+    tp_acc = Account(id="tp1", name="tp1", provider="zai", mode="jwt",
+                     egress="http://zh-tp1__type_clash_proxy__service_zcode-hub"
+                            ":tetherpool@127.0.0.1:9101")
+    listener_acc = Account(id="l1", name="l1", provider="zai", mode="jwt",
+                           egress="http://127.0.0.1:11032")
+    store._accounts["zai"] = [tp_acc, listener_acc]
+    store.ensure_egress_assignments()
+    # 网关残留被清 + 重领 listener；既有 listener 绑定不动
+    assert tp_acc.egress == "http://127.0.0.1:11031"
+    assert tp_acc.egress_node is None
+    assert listener_acc.egress == "http://127.0.0.1:11032"

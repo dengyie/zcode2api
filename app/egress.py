@@ -195,6 +195,22 @@ def tetherpool_enabled_for(account) -> bool:
     return True
 
 
+def is_tp_gateway_url(url: str | None) -> bool:
+    """URL 是否为 TP 统一网关形态（tetherpool_gateway_url 的构造尾契约）。
+
+    判据 = `:tetherpool@{TP_GATEWAY}` 尾缀精确匹配——凭据段恒以 `:tetherpool@`
+    收尾且 host:port 取自 settings.TP_GATEWAY。⚠️ 不能拿 `":9101@"` 找：URL 的
+    `@` 在 host **前**、端口收尾，该子串永不出现（2.7.69 根修：store 的模式
+    残留检测曾用它，TP→listeners 回滚通道实际失效）。listener URL（无凭据段）
+    与共享形态均不匹配。"""
+    if not url:
+        return False
+    host = settings.TP_GATEWAY
+    if "://" in host:
+        host = host.split("://", 1)[-1]
+    return url.endswith(f":tetherpool@{host}")
+
+
 def tetherpool_gateway_url(account) -> str:
     """per-account TetherPool 网关代理 URL（确定性构造，与 TP acquire 返回的
     gateway_proxy_url 同构）。

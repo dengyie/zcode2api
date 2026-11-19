@@ -365,7 +365,7 @@ OAUTH_API_BASE = os.getenv("ZCODE_OAUTH_API_BASE", constants.ZCODE_ORIGIN + "/ap
 ZAI_EXCHANGE_ORIGIN = os.getenv("ZCODE_EXCHANGE_ORIGIN", constants.ZAI_API_ORIGIN)
 
 USER_AGENT = os.getenv("UPSTREAM_USER_AGENT", constants.USER_AGENT)
-APP_VERSION = "2.7.68"  # 2.7.66-67 solver 对齐（language cn/恒定 config/plan_factory 接线/指纹加固）之上：全仓 review 根修批次——领取链预算与止损（轮级 wall-clock 预算+账号并发+claim 求解预算解耦+403 入止损集+链式超时止损+GET 瞬态重试）/ 手动 claim 端点混合 job 化（响应预算 < CF 100s + job_id 续查 + 同号互斥）/ rebalance ban 延后到确认离开+去抖按收尾时刻+网关级熔断+绑定对齐+TP 启动孤儿对账 / quota remaining=None 未知语义统一+is_selectable bonus-aware+刷新跨入口合并 / anthropic-beta 剥除 / lifespan 逐段隔离+发版偏斜自检 / opslog 首行容错
+APP_VERSION = "2.7.69"  # 2.7.68（领取链预算与止损体系化+手动 claim job 化+rebalance 收口+quota bonus-aware）之上：出口供给双根修——TP 网关 URL 形态判定端修（":9101@" 永不命中 → `:tetherpool@{TP_GATEWAY}` 尾缀契约，TP→listeners 回滚通道复活+清残留同遍回填 listener）/ listeners 供给健康探针（300s 逐号探活，连败冷却一个健康周期让轮询绕开死出口、探针恢复自动复活，复活只解除本循环冷却不越权洗状态）/ 健康循环按供给模式分派（listeners 下不再空转）/ 测试基建：monkeypatch 实例属性遮蔽类属性陷阱根除（_probe_via 补丁统一类属性）+ 存量缺 stub 测试补齐
 
 # 前后端分离（2.7.34）：frontend/version 文件仅作部署簿记（rsync 发版时人工 bump），
 # 后端不再读取——版本展示走前端 /meta 拉取，静态资源缓存走 StaticFiles etag 协商。
