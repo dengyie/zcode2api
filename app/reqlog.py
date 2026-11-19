@@ -286,7 +286,7 @@ def hourly(window_hours: int = 24) -> list[dict]:
     from collections import Counter
 
     now = time.time()
-    events: list[tuple[float, int]] = []
+    intervals: list[tuple[float, float]] = []   # (start, end) 成对区间，逐桶裁剪扫描
     buckets: dict[int, dict] = {}
 
     def bucket(h: int) -> dict:
@@ -323,27 +323,30 @@ def hourly(window_hours: int = 24) -> list[dict]:
             dur = max(tt or 0, 0.5)
             if ok is None:
                 # 在飞：并发窗口一直开到当前时刻
-                events.append((ts, 1))
-                events.append((now, -1))
+                intervals.append((ts, now))
                 b["inflight_now"] += 1
             else:
-                events.append((ts, 1))
-                events.append((ts + dur, -1))
+                intervals.append((ts, ts + dur))
 
     for b in buckets.values():
         tts = sorted(b.pop("_tt", []))
         if tts:
             b["p95_t_total"] = round(tts[min(len(tts) - 1, int(len(tts) * 0.95))], 2)
             b["max_t_total"] = round(tts[-1], 2)
+        # 并发扫描：与本小时有交集的区间裁剪到 [h0, h1) 后排序扫描
+        # （2.7.71 修正：原先 delta 事件流混入跨小时区间导致峰值虚高）
         h0, h1 = b["hour_start"], b["hour_start"] + 3600
+        segs = sorted((max(s, h0), min(e, h1)) for s, e in intervals
+                      if s < h1 and e > h0)
+        ev: list[tuple[float, int]] = []
+        for s, e in segs:
+            ev.append((s, 1))
+            ev.append((e, -1))
+        ev.sort(key=lambda x: (x[0], x[1]))
         cur = peak = 0
-        for s, d in events:
-            if d == 1 and s < h1:
-                cur += 1
-                peak = max(peak, cur)
-            elif d == -1 and s > h0:
-                cur -= 1
-        # 区间裁剪简化版：对跨小时长流（开始在本小时前/结束在本小时后）低估可接受
+        for _t, d in ev:
+            cur += d
+            peak = max(peak, cur)
         b["peak_concurrency"] = peak
         b["models"] = dict(Counter(b["models"]).most_common(3))
     return [buckets[h] for h in sorted(buckets)]

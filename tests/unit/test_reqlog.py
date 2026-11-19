@@ -344,3 +344,76 @@ class TestPersistence:
         reqlog.finish_ok("fl2")  # 第二次重试成功
         lines = [json.loads(line) for line in persist_env.read_text(encoding="utf-8").splitlines() if line.strip()]
         assert [e["req_id"] for e in lines] == ["fl2"]
+
+
+def test_hourly_buckets_aggregate():
+    """2.7.71 监控增强：逐小时桶（请求数/成败/p95/模型分布），在飞计入 inflight_now。"""
+    from app import reqlog
+
+    reqlog._entries.clear()
+    reqlog._inflight.clear()
+    now = time.time()
+    cur_h = int(now // 3600)
+    h0 = cur_h * 3600
+
+    def entry(i, ts, ok, t_total, model):
+        return {"req_id": f"r{i}", "ts": ts, "endpoint": "chat", "model": model,
+                "stream": True, "preview": "", "account": "a", "mode": "jwt",
+                "ok": ok, "status": 200 if ok else 500, "error": "" if ok else "x",
+                "t_first": 1.0, "t_total": t_total,
+                "input_tokens": 1, "output_tokens": 1}
+
+    with reqlog._lock:
+        reqlog._entries.extend([
+            entry(1, h0 + 100, True, 2.0, "GLM-5.3-Flash"),
+            entry(2, h0 + 200, True, 8.0, "GLM-5.3-Flash"),
+            entry(3, h0 + 300, False, 3.0, "GLM-5.3"),
+            # 在飞（ok=None）：计入 inflight_now，并发窗口到 now
+            entry(4, now - 30, None, None, "GLM-5.3-Flash"),
+        ])
+    out = reqlog.hourly()
+    assert out, "应有至少一个小时桶"
+    b = out[-1]
+    assert b["reqs"] == 4
+    assert b["ok"] == 2 and b["fail"] == 1
+    assert b["inflight_now"] == 1
+    assert b["p95_t_total"] is not None and b["p95_t_total"] >= 3.0
+    assert b["max_t_total"] == 8.0
+    assert b["models"]["GLM-5.3-Flash"] == 3
+    assert b["peak_concurrency"] >= 1
+    # 清场
+    reqlog._entries.clear()
+    reqlog._inflight.clear()
+
+
+def test_hourly_peak_concurrency_cross_hour_isolation():
+    """2.7.71 修正回归：峰值并发逐桶裁剪——上一小时的请求不得污染本小时峰值。"""
+    from app import reqlog
+
+    reqlog._entries.clear()
+    reqlog._inflight.clear()
+    now = time.time()
+    cur_h0 = int(now // 3600) * 3600
+
+    def entry(i, ts, ok, t_total, model="GLM-5.3-Flash"):
+        return {"req_id": f"r{i}", "ts": ts, "endpoint": "chat", "model": model,
+                "stream": True, "preview": "", "account": "a", "mode": "jwt",
+                "ok": ok, "status": 200, "error": "",
+                "t_first": 1.0, "t_total": t_total,
+                "input_tokens": 1, "output_tokens": 1}
+
+    with reqlog._lock:
+        # 上一小时：3 条完全重叠的长流（那里的峰值应为 3）
+        reqlog._entries.extend([
+            entry(1, cur_h0 - 100, True, 90.0),
+            entry(2, cur_h0 - 100, True, 90.0),
+            entry(3, cur_h0 - 100, True, 90.0),
+            # 本小时：仅 1 条短请求
+            entry(4, now - 5, True, 2.0),
+        ])
+    out = reqlog.hourly()
+    peaks = {b["hour_start"]: b["peak_concurrency"] for b in out}
+    assert peaks[cur_h0 - 3600] == 3, "上一小时峰值应为 3（三条重叠长流）"
+    assert peaks[cur_h0] == 1, f"本小时峰值应为 1，不得被上一小时污染（got {peaks[cur_h0]}）"
+    reqlog._entries.clear()
+    reqlog._inflight.clear()
