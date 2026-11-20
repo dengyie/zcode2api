@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -30,6 +31,21 @@ import yaml
 
 from . import constants, logs, settings
 from .constants import is_newer_version
+
+
+def _billing_pinned() -> bool:
+    """billing 版本是否被 env 钉死（kill-switch：官方新版 billing 链劣化时
+    设 ZCODE_BILLING_APP_VERSION 止血，设了即不自动跟随）。"""
+    return bool(
+        str(os.getenv("ZCODE_BILLING_APP_VERSION", "") or "").strip().lstrip("vV").strip()
+    )
+
+
+def _is_stable_version(ver: str) -> bool:
+    """过滤预发布版（3.19.0-beta.1 等）。parse_semver 纯数字提取会让
+    '3.19.0-beta.1' 解析成 (3,19,0,1) > (3,19,0)，billing 是唯一无正文锁
+    链路，manifest 若某天推 beta 会直接穿透——只跟随 stable 形态。"""
+    return "-" not in str(ver or "") and "+" not in str(ver or "")
 
 
 @dataclass
@@ -149,6 +165,17 @@ class VersionTracker:
             else:
                 constants.set_active_version(stored_ver)
                 logs.info("version", f"恢复已同步的 ZCode 官方版本: v{stored_ver}")
+        # billing/claim 链版本恢复不受正文锁（2026-11-21 用户定案：claim 有效性
+        # 优先）——重启后立即跟随缓存里的官方最新版，不等下一轮 manifest 轮询。
+        # ZCODE_BILLING_APP_VERSION env 钉值时接管（kill-switch，不跟随）。
+        if not _billing_pinned() and stored_ver and is_newer_version(
+            stored_ver, constants.BILLING_APP_VERSION
+        ) and _is_stable_version(stored_ver):
+            constants.BILLING_APP_VERSION = stored_ver
+            logs.info(
+                "version",
+                f"恢复 billing/claim 链版本: v{stored_ver}（无正文锁，跟随官方最新）",
+            )
 
     async def fetch_remote_manifest(self) -> VersionInfo | None:
         """向上游请求最新 manifest。
@@ -215,6 +242,7 @@ class VersionTracker:
             return {
                 "ok": False,
                 "current_version": current_ver,
+                "billing_version": constants.BILLING_APP_VERSION,
                 "latest_version": latest_ver,
                 "has_update": is_newer_version(latest_ver, current_ver),
                 "updated": False,
@@ -241,7 +269,22 @@ class VersionTracker:
         # 正文锁：新版本头必须配新版本 system 文本，否则 405/3012。
         # 文本尚未移植 → 只记录，不自动对齐（宁可滞后，不可错版）。
         prompt_port_required = is_newer_version(info.version, aligned)
-        updated = False
+        # billing 版本独立跟随（2026-11-21 用户定案）：claim/preview/激活/touch
+        # 全链无 system 正文锁，且上游按版本分流活动投放（<3.18.2 零投放，
+        # WEEKEND BUILD wk-1120 二分实锤）——claim 有效性优先级高于 messages，
+        # 官方一发版无条件跟进，不等 prompt.mjs 移植。env 钉值（kill-switch）
+        # 或预发布版（beta/rc，防 parse_semver 纯数字提取穿透）不跟随。
+        billing_updated = False
+        billing_followable = not _billing_pinned() and _is_stable_version(info.version)
+        if billing_followable and is_newer_version(info.version, constants.BILLING_APP_VERSION):
+            constants.BILLING_APP_VERSION = info.version
+            billing_updated = True
+            logs.ok(
+                "version",
+                f"billing/claim 链版本自动跟随官方发版: v{constants.BILLING_APP_VERSION}"
+                f" → v{info.version}（无正文锁，claim 有效性优先）",
+            )
+        updated = billing_updated
 
         if has_new:
             if prompt_port_required:
@@ -264,6 +307,9 @@ class VersionTracker:
         return {
             "ok": True,
             "current_version": constants.CLIENT_APP_VERSION,
+            "billing_version": constants.BILLING_APP_VERSION,
+            "billing_updated": billing_updated,
+            "billing_followable": billing_followable,
             "latest_version": info.version,
             "has_update": has_new,
             "updated": updated,

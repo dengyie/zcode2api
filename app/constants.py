@@ -94,7 +94,13 @@ MARKETING_TOUCH_URL = f"{ZCODE_ORIGIN}{MARKETING_TOUCH_PATH}"
 # zcode-v3-start-plan-wk-1120 实测：3.17.2→0 条 / 3.18.2→1 条，二分实锤）。
 # billing 族抬到 3.18.2；messages 通道（CLIENT_APP_VERSION）保持 3.17.2
 # 提示词正文锁不动（头新于正文即 405/3012，雷区勿碰）。
-BILLING_APP_VERSION = "3.18.2"
+# 2026-11-21：set_active_version 不再写 BILLING_APP_VERSION（版本双链拆分
+# 定案：claim 有效性优先于 messages 对齐）。billing 版本由 version_tracker
+# 独立自动跟随官方 manifest 发版（无正文锁），或用 ZCODE_BILLING_APP_VERSION
+# env 钉死接管（kill-switch：官方新版 billing 链劣化时止血，设了即不跟随）。
+# DEFAULT_BILLING_APP_VERSION 是测试夹具与 init 恢复的基线锚点。
+DEFAULT_BILLING_APP_VERSION = "3.18.2"
+BILLING_APP_VERSION = os.getenv("ZCODE_BILLING_APP_VERSION", "").strip().lstrip("vV").strip() or DEFAULT_BILLING_APP_VERSION
 BILLING_TITLE = "Z Code@electron"        # bundle：sourceTitle 缺省即 electron（CLI surface 才覆盖 cli）
 BILLING_RELEASE_CHANNEL = "production"   # bundle DF()：恒 production（ZCODE_ENV=test 才 test）；
                                          # 旧值 stable 系 3.11.2 时代 zcode-switch 静态对齐，已过时

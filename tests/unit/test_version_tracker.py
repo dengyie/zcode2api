@@ -158,13 +158,15 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
-    """正文锁：官方新版高于提示词对齐版本时只记录、不顶版本头。
+    """正文锁：官方新版高于提示词对齐版本时只记录、不顶 messages 版本头。
 
     头新于 system 正文 = 405/3012，宁可滞后也不自动错版；后台用
     prompt_port_required 标记「需移植 prompt.mjs」。
+    billing 链无正文锁（2026-11-21 定案：claim 有效性优先），仍独立跟随。
     """
     tracker = VersionTracker()
     orig = constants.CLIENT_APP_VERSION
+    billing_orig = constants.BILLING_APP_VERSION
     try:
         mock_info = VersionInfo(
             version="3.18.5", release_date="2026-11-05", release_name="v3.18.5"
@@ -174,17 +176,18 @@ async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
 
         res = await tracker.check_and_sync()
         assert res["has_update"] is True
-        assert res["updated"] is False
+        # updated=True 来自 billing 跟随；messages 头未被顶（正文锁拒绝）
+        assert res["billing_updated"] is True
         assert res["prompt_port_required"] is True
         assert res["prompt_aligned_version"] == constants.PROMPT_ALIGNED_VERSION
-        # 版本头没被顶上去；billing 版本独立钉常量（2026-11-20 拆分），不随
-        # messages 钳制变动
         assert constants.CLIENT_APP_VERSION == orig
-        assert constants.BILLING_APP_VERSION == "3.18.2"
+        # billing 版本被顶上去（无正文锁，claim 有效性优先）
+        assert constants.BILLING_APP_VERSION == "3.18.5"
         # 新版本仍落库（后台展示更新日志用）
         assert fresh_app.get_setting("zcode_latest_version") == "3.18.5"
     finally:
         constants.set_active_version(orig)
+        constants.BILLING_APP_VERSION = billing_orig
 
 
 @pytest.mark.asyncio
@@ -205,18 +208,25 @@ async def test_tracker_check_and_sync_manual_only(fresh_app, monkeypatch):
         res = await tracker.check_and_sync()
         assert res["ok"] is True
         assert res["has_update"] is True
-        assert res["updated"] is False
+        # auto_sync=false 只挡 messages 链；billing 链无条件跟随（2026-11-21 定案）
+        assert res["updated"] is True
+        assert res["billing_updated"] is True
         assert res["latest_version"] == "3.18.9"
-        # 伪装版本未被自动修改
+        # messages 伪装版本未被自动修改，billing 已跟随
         assert constants.CLIENT_APP_VERSION == orig
+        assert constants.BILLING_APP_VERSION == "3.18.9"
     finally:
         constants.set_active_version(orig)
 
 
 def test_tracker_init_from_store_respects_prompt_lock(fresh_app):
-    """缓存里比提示词新的版本不能直接顶上来（正文锁同样约束启动恢复）。"""
+    """缓存里比提示词新的版本不能直接顶上来（正文锁同样约束启动恢复）。
+
+    billing 链不受正文锁约束：init 恢复阶段即跟随缓存最新版（2026-11-21 定案）。
+    """
     tracker = VersionTracker()
     orig = constants.CLIENT_APP_VERSION
+    billing_orig = constants.BILLING_APP_VERSION
     try:
         fresh_app.set_setting("auto_sync_client_version", "true")
         fresh_app.set_setting("zcode_latest_version", "3.19.0")
@@ -226,11 +236,14 @@ def test_tracker_init_from_store_respects_prompt_lock(fresh_app):
         )
         tracker.init_from_store()
         assert constants.CLIENT_APP_VERSION == orig
+        # billing 无正文锁：重启即跟随缓存最新版，不等下一轮 manifest 轮询
+        assert constants.BILLING_APP_VERSION == "3.19.0"
         # 最新版本信息仍恢复（后台展示更新日志）
         assert tracker.latest_info is not None
         assert tracker.latest_info.version == "3.19.0"
     finally:
         constants.set_active_version(orig)
+        constants.BILLING_APP_VERSION = billing_orig
 
 
 def test_tracker_init_from_store_applies_aligned_version(fresh_app):
@@ -245,3 +258,45 @@ def test_tracker_init_from_store_applies_aligned_version(fresh_app):
         assert constants.CLIENT_APP_VERSION == "3.17.1"
     finally:
         constants.set_active_version(orig)
+
+
+@pytest.mark.asyncio
+async def test_billing_follow_skipped_when_pinned_by_env(fresh_app, monkeypatch):
+    """kill-switch：ZCODE_BILLING_APP_VERSION env 钉值时 billing 不自动跟随。"""
+    tracker = VersionTracker()
+    billing_orig = constants.BILLING_APP_VERSION
+    try:
+        monkeypatch.setattr(constants, "PROMPT_ALIGNED_VERSION", "3.19.0")
+        monkeypatch.setenv("ZCODE_BILLING_APP_VERSION", "3.18.2")
+        mock_info = VersionInfo(version="3.19.0", release_name="v3.19.0")
+        monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
+        fresh_app.set_setting("auto_sync_client_version", "true")
+
+        res = await tracker.check_and_sync()
+        assert res["billing_followable"] is False
+        assert res["billing_updated"] is False
+        assert res["updated"] is True  # messages 已移植，正常对齐
+        assert constants.BILLING_APP_VERSION == "3.18.2"
+    finally:
+        constants.BILLING_APP_VERSION = billing_orig
+
+
+@pytest.mark.asyncio
+async def test_billing_follow_skips_prerelease(fresh_app, monkeypatch):
+    """预发布版（beta/rc）不得穿透：parse_semver 纯数字提取会把
+    '3.19.0-beta.1' 解析成 (3,19,0,1) > (3,19,0)，billing 是唯一无正文锁
+    链路，manifest 推 beta 时必须挡住。"""
+    tracker = VersionTracker()
+    billing_orig = constants.BILLING_APP_VERSION
+    try:
+        mock_info = VersionInfo(version="3.19.0-beta.1", release_name="v3.19.0-beta.1")
+        monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
+        fresh_app.set_setting("auto_sync_client_version", "false")
+
+        res = await tracker.check_and_sync()
+        assert res["billing_followable"] is False
+        assert res["billing_updated"] is False
+        assert res["updated"] is False
+        assert constants.BILLING_APP_VERSION == billing_orig
+    finally:
+        constants.BILLING_APP_VERSION = billing_orig

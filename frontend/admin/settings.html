@@ -73,6 +73,7 @@
     <div class="settings-row">
       <div style="display:flex;gap:24px;align-items:center;margin-bottom:8px">
         <div><span class="hint">当前伪装版本:</span> <strong id="cur-zcode-ver" style="font-family:monospace;color:var(--text-1)">-</strong></div>
+        <div><span class="hint">billing/领取链:</span> <strong id="billing-zcode-ver" style="font-family:monospace;color:var(--text-1)">-</strong> <span class="hint" style="font-size:11px">（自动跟随官方发版）</span></div>
         <div><span class="hint">官方最新版本:</span> <strong id="latest-zcode-ver" style="font-family:monospace;color:var(--text-1)">-</strong> <span id="ver-status-badge" class="badge" style="display:none;margin-left:6px"></span></div>
       </div>
       <div style="margin-top:10px;display:flex;align-items:center;gap:8px">
@@ -149,6 +150,10 @@ function renderVersionInfo(d){
   document.getElementById('cur-zcode-ver').textContent = 'v' + (d.zcode_client_version || '-');
   document.getElementById('latest-zcode-ver').textContent = 'v' + (d.zcode_latest_version || d.zcode_client_version || '-');
   document.getElementById('auto-sync-version').checked = d.auto_sync_client_version !== false;
+  // billing/claim 链独立跟随官方发版（2026-11-21 定案：claim 有效性优先），
+  // 版本可与 messages 伪装版不同；老后端无此字段时回退不显示
+  const billingEl = document.getElementById('billing-zcode-ver');
+  if(billingEl) billingEl.textContent = d.zcode_billing_version ? 'v' + d.zcode_billing_version : '-';
   const badge = document.getElementById('ver-status-badge');
   if(d.zcode_prompt_port_required){
     badge.style.display = 'inline-block';
@@ -187,10 +192,14 @@ async function checkZcodeVersionNow(){
   try{
     const res = await api('POST', '/version/zcode/check');
     if(res.ok){
-      // 正文未移植时上游新版会被拒绝自动对齐（头/正文错版 → 405/3012）
-      const note = res.prompt_port_required
-        ? '（正文未移植，暂不自动对齐）'
-        : (res.updated ? '（已自动对齐）' : '');
+      // billing 链无条件跟随官方发版（无正文锁）；messages 链正文未移植时
+      // 会被拒绝自动对齐（头/正文错版 → 405/3012），两者分开提示
+      const parts = [];
+      if(res.billing_updated) parts.push('billing 链已跟随 v' + res.billing_version);
+      else if(res.billing_followable === false) parts.push('billing 链已钉死/预发布版，未跟随');
+      if(res.prompt_port_required) parts.push('messages 正文未移植，暂不对齐');
+      else if(res.updated && !res.billing_updated) parts.push('messages 已自动对齐');
+      const note = parts.length ? '（' + parts.join('；') + '）' : '';
       showToast('核验成功: 官方最新 v' + res.latest_version + note, 'success');
       load();
     } else {

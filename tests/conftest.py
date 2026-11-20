@@ -52,10 +52,16 @@ def allow_anonymous_gateway(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def reset_constants_version():
-    """每次测试前后将客户端伪装版本重置为基线版本，防止跨用例污染。"""
+    """每次测试前后将客户端伪装版本重置为基线版本，防止跨用例污染。
+
+    set_active_version 已不写 BILLING_APP_VERSION（2026-11-21 双链拆分），
+    billing 链需单独复位，否则跟随用例抬上去的版本会泄漏到后续用例。
+    """
     constants.set_active_version(constants.DEFAULT_CLIENT_APP_VERSION)
+    constants.BILLING_APP_VERSION = constants.DEFAULT_BILLING_APP_VERSION
     yield
     constants.set_active_version(constants.DEFAULT_CLIENT_APP_VERSION)
+    constants.BILLING_APP_VERSION = constants.DEFAULT_BILLING_APP_VERSION
 
 
 @pytest.fixture(scope="session")

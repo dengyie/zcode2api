@@ -733,6 +733,7 @@ async def get_settings():
         "claim_round_hours": ",".join(map(str, store.claim_round_hours())),
         "auto_sync_client_version": auto_sync,
         "zcode_client_version": constants.CLIENT_APP_VERSION,
+        "zcode_billing_version": constants.BILLING_APP_VERSION,
         "zcode_latest_version": latest_ver,
         "zcode_version_has_update": has_update,
         "zcode_prompt_aligned_version": constants.PROMPT_ALIGNED_VERSION,
