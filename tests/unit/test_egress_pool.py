@@ -903,6 +903,25 @@ async def test_delete_account_handler_releases_tp_allocation(monkeypatch, tp_mod
 
 # ── 2.7.65 review 收尾批次 ──────────────────────────────────────────────────
 @pytest.mark.asyncio
+async def test_tp_acquire_sends_tier_param(monkeypatch, tp_mode):
+    """tier 承诺必须显式上送（2026-11-21）：缺失时 IP-Pool 按 standard_first
+    默认策略把机房 standard 节点粘给 zcode 号——与 gateway URL 的 __tier_
+    username 同源（ZCODE_TP_TIER）。"""
+    calls: list[str] = []
+
+    def _fake_http(method, url, body=None, headers=None, timeout=15):
+        calls.append(url)
+        return 200, '{"node_name": "clash-301-pigeonw-01"}'
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
+    d = await egress_pool.tp_acquire(_account(acc_id="acc-tier"))
+    assert d and d["node_name"] == "clash-301-pigeonw-01"
+    assert len(calls) == 1
+    # tp_mode 夹具钉 TP_TIER=standard——断言 params 与 env 同源即可
+    assert "tier=standard" in calls[0]
+
+
+@pytest.mark.asyncio
 async def test_release_account_success_false_is_idempotent_ok(monkeypatch, tp_mode):
     """HTTP 200 + body success:false = 无分配可释（幂等成功），必须返回 True
     且不落 warn（2026-11-18 review P3：此前只看状态码）。"""
