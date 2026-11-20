@@ -55,6 +55,8 @@ code{font-family:var(--mono);font-size:.92em;background:var(--panel-2);border:1p
 .rise-in{animation:riseIn .55s cubic-bezier(.16,1,.3,1) both;animation-delay:calc(var(--ri,0)*45ms)}
 .page-fade{animation:fadeIn .35s ease both}
 .stat-num.num-pop{animation:popNum .5s cubic-bezier(.34,1.56,.64,1) both;animation-delay:calc(var(--ri,0)*45ms + 120ms)}
+/* 轮询静默重渲染时抑制入场动画（2.7.57：5s 轮询 innerHTML 重建曾导致列表每 5s 闪烁） */
+.no-anim,.no-anim .acct-row{animation:none!important}
 .page-action-btn-primary{position:relative;overflow:hidden}
 .page-action-btn-primary::after{content:"";position:absolute;top:0;left:-60%;width:36%;height:100%;transform:skewX(-22deg);
   background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);transition:left .45s ease}

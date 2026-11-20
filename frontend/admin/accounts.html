@@ -195,7 +195,7 @@
 <script src="js/toast.js?v=2.7.56"></script>
 <script src="js/header.js?v=2.7.56"></script>
 <script>
-let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null;
+let allAccounts=[], curFilter='all', _cb=null, _editId='', _timer=null, _listAnim=true, _lastTotal=-1;
 const refreshing=new Set(), claiming=new Set();
 
 const STATUS_LABEL={active:'正常',exhausted:'用完',cooling:'限流',invalid:'异常',disabled:'禁用'};
@@ -278,7 +278,9 @@ function renderStats(s){
   set('s-quota',fmtNum(totalRem));
   document.getElementById('s-quota').title='日窗口余额 + 已生效一次性活动赠送（赠送池按授权量计入，上游不提供实际剩余）';
   staggerCards();
-  popStatNumbers();
+  // 数字弹入动画只在账号数变化时重播，5s 轮询不重播（否则统计数字每 5s 闪一次）
+  const total=allAccounts.length;
+  if(total!==_lastTotal){_lastTotal=total;popStatNumbers();}
 }
 
 function renderFilters(){
@@ -289,14 +291,18 @@ function renderFilters(){
     `<button class="filter-chip${curFilter===k?' active':''}" onclick="setFilter('${k}')">${l}<span class="filter-chip-count">${counts[k]||0}</span></button>`
   ).join('');
 }
-function setFilter(k){curFilter=k;renderFilters();renderList();}
+function setFilter(k){if(k===curFilter)return;curFilter=k;_listAnim=true;renderFilters();renderList();}
 
 function renderList(){
   const items=curFilter==='all'?allAccounts:allAccounts.filter(a=>a.status===curFilter);
   document.getElementById('tbl-count').textContent=items.length;
   const el=document.getElementById('acct-list');
-  if(!items.length){el.innerHTML='<empty-state icon="inbox" title="还没有账号" description="点击右上角「新增」或「导入」开始构建你的账号池。"></empty-state>';return;}
-  el.innerHTML=`<div class="acct-scroll"><div class="acct-table">
+  if(!items.length){el.innerHTML='<empty-state icon="inbox" title="还没有账号" description="点击右上角「新增」或「导入」开始构建你的账号池。"></empty-state>';_listAnim=true;return;}
+  // 入场动画只在首次渲染、从空列表恢复、或过滤切换重置时播放；
+  // 5s 轮询静默重建不重播，否则整表每 5s 闪烁一次（2.7.57 根因）
+  const playAnim=_listAnim;
+  _listAnim=false;
+  el.innerHTML=`<div class="acct-scroll"><div class="acct-table${playAnim?'':' no-anim'}">
     <div class="acct-head"><span>凭证 / 账号</span><span>可用状态</span><span>最近请求</span><span>历史用量</span><span>额度信息</span><span class="th-actions">操作</span></div>
     ${items.map(rowHtml).join('')}
   </div></div>`;
