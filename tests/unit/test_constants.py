@@ -25,10 +25,13 @@ def test_billing_base():
 
 def test_set_active_version():
     orig = constants.CLIENT_APP_VERSION
+    billing_orig = constants.BILLING_APP_VERSION
     try:
         constants.set_active_version("3.17.0")
         assert constants.CLIENT_APP_VERSION == "3.17.0"
-        assert constants.BILLING_APP_VERSION == "3.17.0"
+        # 2026-11-20 拆分：BILLING_APP_VERSION 独立于 messages 版本钳制
+        # （billing 族无正文锁且上游按版本分流活动投放，<3.18.2 零投放）
+        assert constants.BILLING_APP_VERSION == billing_orig
         assert constants.USER_AGENT == "ZCode/3.17.0"
         assert constants.X_ZCODE_APP_VERSION == "3.17.0"
         assert constants.CLIENT_CONFIGS_QUERY == "app_version=3.17.0"
@@ -84,9 +87,10 @@ def test_client_version_single_source():
 
 
 def test_billing_version_and_activation():
-    # billing 族与 messages 指纹版本同源（官方现行版 3.17.2）；zcode-switch 的
-    # 「读注册表真实版」在 Linux hub 上收敛为钉常量，升级时改此处即可
-    assert constants.BILLING_APP_VERSION == "3.17.2"
+    # 2026-11-20 拆分：billing 族独立钉官方现行版 3.18.2（electron manifest
+    # 最新版；上游活动投放按版本分流，<3.18.2 零投放），messages 版本仍锁
+    # PROMPT_ALIGNED_VERSION（正文锁）
+    assert constants.BILLING_APP_VERSION == "3.18.2"
     assert constants.BILLING_TITLE == "Z Code@electron"
     assert constants.BILLING_RELEASE_CHANNEL == "production"
     assert constants.EVENT_REPORT_URL == "https://zcode.z.ai/api/v1/event/report"

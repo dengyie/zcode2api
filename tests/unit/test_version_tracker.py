@@ -177,9 +177,10 @@ async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
         assert res["updated"] is False
         assert res["prompt_port_required"] is True
         assert res["prompt_aligned_version"] == constants.PROMPT_ALIGNED_VERSION
-        # 版本头与 billing 版本都没有被顶上去
+        # 版本头没被顶上去；billing 版本独立钉常量（2026-11-20 拆分），不随
+        # messages 钳制变动
         assert constants.CLIENT_APP_VERSION == orig
-        assert constants.BILLING_APP_VERSION == orig
+        assert constants.BILLING_APP_VERSION == "3.18.2"
         # 新版本仍落库（后台展示更新日志用）
         assert fresh_app.get_setting("zcode_latest_version") == "3.18.5"
     finally:
