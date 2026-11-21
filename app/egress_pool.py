@@ -172,6 +172,11 @@ async def tp_acquire(account, force_rebalance: bool = False,
         "region_strict": "true",
         "avoid_banned": "true",
         "avoid_same_isp": "true",
+        # 一号一节点硬互斥（2026-11-21 根修，IP-Pool exclusive=true）：候选与本
+        # service 其它账号现占即剔除，占满回 503 而非共享节点——exclude_node
+        # 软语义在池压下被降级路径绕开（hub 侧 7 组共占实锤），硬互斥从分配
+        # 源头堵住。上游 403/503 → None → 调用方按池枯语义处理。
+        "exclusive": "true",
     }
     if force_rebalance:
         params["force_rebalance"] = "true"
@@ -545,7 +550,7 @@ class TetherPoolEgress:
                     logs.warn("egress_pool",
                               f"{account.name} 3 轮均败，第 4 轮候选 {node} 复核冲突"
                               f"（{'在期隔离' if re_banned_hit else '其它分配占用 ' + re_holders[0]}）"
-                              f"——不烧探针直接判败，TP 绑定停留在此，人工介入")
+                              f"——不烧探针直接判败，TP 绑定停留在此（下轮重试）")
                     account.egress_node = node  # hub 记录对齐 TP 实际绑定
                     store.update_account(account)
                     return False
@@ -573,7 +578,7 @@ class TetherPoolEgress:
                     logs.warn("egress_pool",
                               f"{account.name} 3 轮均败，第 4 轮仍回原节点 {node} "
                               f"且验收不过（zcode={_edge_kind(raw)} alicdn={cd_detail}）"
-                              f"——判败，人工介入")
+                              f"——判败（下轮重试）")
                     account.egress_node = node
                     store.update_account(account)
                     return False
@@ -581,7 +586,7 @@ class TetherPoolEgress:
                     logs.warn("egress_pool",
                               f"{account.name} 3 轮均败，回绑候选 {node} 仍不过"
                               f"（zcode={_edge_kind(raw)} alicdn={cd_detail}；"
-                              f"TP 绑定停留在此，人工介入）")
+                              f"TP 绑定停留在此，下轮重试）")
                     account.egress_node = node  # hub 记录对齐 TP 实际绑定
                     store.update_account(account)
                     return False
@@ -597,7 +602,7 @@ class TetherPoolEgress:
                 return True
             logs.warn("egress_pool",
                       f"{account.name} 3 轮均败且回绑 acquire 失败"
-                      f"（TP 绑定停在最后候选，人工介入）")
+                      f"（TP 绑定停在最后候选，下轮重试）")
             await self._align_binding_with_tp(account, own_aid)
             return False
         finally:
@@ -837,16 +842,22 @@ class TetherPoolEgress:
         if self._loop_task is None or self._loop_task.done():
             self._loop_task = asyncio.create_task(self._loop())
             if settings.TP_ORPHAN_RECONCILE:
-                task = asyncio.create_task(self._reconcile_orphans_once())
+                task = asyncio.create_task(self._reconcile_once())
                 self._inflight.add(task)
                 task.add_done_callback(self._inflight.discard)
 
-    async def _reconcile_orphans_once(self, initial_delay: float = 10) -> None:
-        """启动时 TP 孤儿分配对账（2.7.68）：allocs 里 zh-<id> 不在本库账号集合
-        → 逐个 release。11-17 实查 27 个分配 16 个陈旧（`-b782a0d5` 族即历史
-        删除账号）——删除释放只堵新增不清存量，孤儿永久占节点，池压下把现役
-        账号挤向软排除兜底（ban 节点/共享节点）。只跑一次，与删除路径的实时
-        释放互补；与启动期 ensure_binding 并发安全（只释放不在库的 id）。"""
+    async def _reconcile_once(self, initial_delay: float = 10) -> None:
+        """启动时 TP 分配对账（2.7.68 孤儿清理 + 2026-11-21 共占巡检/记录对齐）：
+
+        ①孤儿分配：allocs 里 zh-<id> 不在本库账号集合 → 逐个 release（11-17
+        实查 27 个分配 16 个陈旧——删除释放只堵新增不清存量，孤儿永久占节点）。
+        ②hub 记录漂移：hub egress_node ≠ TP 实际绑定 → 对齐 hub 记录（IP-Pool
+        侧 auto_rehome 会主动换绑，ashorchard21 实锤 hub 记忆 teleapisub-024 /
+        地面 clash-347——ban 目标与 exclude 集合指向已不存在的绑定）。
+        ③节点共占：TP 实际绑定与其它账号分配同节点（IP-Pool 软语义降级/auto_rehome
+        制造的存量）→ 强制 rebalance 换绑（一号一节点是风控红线，exclude_node
+        只防「主动制造」，不回收存量）。
+        与启动期 ensure_binding 并发安全：①只释放不在库的 id，②③只动本库账号。"""
         from . import logs
         from .store import store
         if initial_delay > 0:
@@ -859,12 +870,49 @@ class TetherPoolEgress:
         known_ids = {a.id for provider in PROVIDERS for a in store.list_accounts(provider)}
         orphans = [aid for aid in allocs
                    if aid.startswith("zh-") and aid[3:] not in known_ids]
-        if not orphans:
-            logs.info("egress_pool", "[reconcile] TP 分配对账通过，无孤儿")
-            return
         for aid in orphans:
             await tp_release_account(aid[3:])  # 内部自带结果日志
-        logs.ok("egress_pool", f"[reconcile] 孤儿分配清理完成: {len(orphans)} 个已释放")
+        if orphans:
+            logs.ok("egress_pool", f"[reconcile] 孤儿分配清理完成: {len(orphans)} 个已释放")
+        else:
+            logs.info("egress_pool", "[reconcile] TP 分配对账通过，无孤儿")
+
+        # ②③ 存量巡检（快照已拉好，纯本地比对）
+        node_holders: dict[str, list[str]] = {}
+        for aid, node in allocs.items():
+            if aid.startswith("zh-"):
+                node_holders.setdefault(node, []).append(aid)
+        drifted = co_occupied = 0
+        for provider in PROVIDERS:
+            for a in store.list_accounts(provider):
+                tp_node = allocs.get("zh-" + a.id)
+                if not tp_node:
+                    continue  # 无 TP 分配（灰度/listeners 语义），不巡
+                if a.egress_node and a.egress_node != tp_node:
+                    # ② 记录漂移：以地面真值为准对齐（auto_rehome/降级路径换的）
+                    logs.warn("egress_pool",
+                              f"[reconcile] {a.name} hub 记录漂移对齐: "
+                              f"{a.egress_node} → {tp_node}（TP 实际绑定）")
+                    a.egress_node = tp_node
+                    store.update_account(a)
+                    drifted += 1
+                others = [x for x in node_holders.get(tp_node, [])
+                          if x != "zh-" + a.id]
+                if others:
+                    # ③ 共占存量：强制换绑本账号（持有者少的让位语义不重要——
+                    # 双方都会被巡检各自 rebalance，互斥收敛）
+                    co_occupied += 1
+                    logs.warn("egress_pool",
+                              f"[reconcile] {a.name} 节点 {tp_node} 与其它分配共占"
+                              f"（{others[0]}）→ 强制换绑")
+                    await self.rebalance(a, reason="co_occupancy_reconcile",
+                                         ban=False)
+        if drifted or co_occupied:
+            logs.ok("egress_pool",
+                    f"[reconcile] 存量巡检完成: 记录漂移对齐 {drifted}，"
+                    f"共占换绑 {co_occupied}")
+        else:
+            logs.info("egress_pool", "[reconcile] 绑定巡检通过: 无漂移无共占")
 
     async def stop(self) -> None:
         if self._loop_task and not self._loop_task.done():

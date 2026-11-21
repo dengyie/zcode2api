@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1255,8 +1256,103 @@ async def test_reconcile_orphans_releases_stale_allocations(tp_mode, monkeypatch
                         lambda provider: [_account(acc_id="live-1")])
 
     pool = egress_pool.egress_pool
-    await pool._reconcile_orphans_once(initial_delay=0)
+    await pool._reconcile_once(initial_delay=0)
     assert released == ["stale-old"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_aligns_drifted_record(tp_mode, monkeypatch):
+    """2026-11-21 存量巡检②：hub egress_node ≠ TP 实际绑定（IP-Pool 侧
+    auto_rehome 主动换绑）→ hub 记录对齐地面真值，不做 rebalance。"""
+    updated: list[str] = []
+
+    async def fake_snapshot():
+        return {"zh-live-1": "tp-real-node"}, set()
+
+    acc = _account(acc_id="live-1")
+    acc.egress_node = "hub-stale-node"
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    monkeypatch.setattr(egress_pool, "tp_release_account", AsyncMock(return_value=True))
+    monkeypatch.setattr(egress_pool, "PROVIDERS", ("zai",))
+    monkeypatch.setattr("app.store.store.list_accounts", lambda provider: [acc])
+
+    class _SpyStore:
+        @staticmethod
+        def list_accounts(provider):
+            return [acc]
+
+        @staticmethod
+        def update_account(a):
+            updated.append(a.egress_node)
+
+    import app.store as store_mod2
+    monkeypatch.setattr(store_mod2, "store", _SpyStore)
+    # 防御：rebalance 误触发会经这里
+    rb: list = []
+
+    async def _no_rebalance(account, reason, ban=True):
+        rb.append(reason)
+        return True
+
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", _no_rebalance)
+
+    await egress_pool.egress_pool._reconcile_once(initial_delay=0)
+    assert acc.egress_node == "tp-real-node"
+    assert updated == ["tp-real-node"]
+    assert rb == []  # 记录漂移只对齐，不换绑
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rebalances_co_occupied_node(tp_mode, monkeypatch):
+    """2026-11-21 存量巡检③：TP 实际绑定与其它账号分配同节点（软语义降级/
+    auto_rehome 制造的存量共占）→ 强制 rebalance 回收互斥。"""
+    async def fake_snapshot():
+        return {"zh-live-1": "shared-node", "zh-live-2": "shared-node",
+                "zh-live-3": "own-node"}, set()
+
+    a1 = _account(acc_id="live-1", name="a1")
+    a1.egress_node = "shared-node"
+    a2 = _account(acc_id="live-2", name="a2")
+    a2.egress_node = "shared-node"
+    a3 = _account(acc_id="live-3", name="a3")
+    a3.egress_node = "own-node"
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    monkeypatch.setattr(egress_pool, "tp_release_account", AsyncMock(return_value=True))
+    monkeypatch.setattr(egress_pool, "PROVIDERS", ("zai",))
+    monkeypatch.setattr("app.store.store.list_accounts",
+                        lambda provider: [a1, a2, a3])
+
+    rebalanced: list[str] = []
+
+    async def _spy_rebalance(account, reason, ban=True):
+        rebalanced.append((account.name, reason))
+        return True
+
+    monkeypatch.setattr(egress_pool.egress_pool, "rebalance", _spy_rebalance)
+
+    await egress_pool.egress_pool._reconcile_once(initial_delay=0)
+    # 两个共占号都换绑，独占号不动
+    assert sorted(rebalanced) == [("a1", "co_occupancy_reconcile"),
+                                  ("a2", "co_occupancy_reconcile")]
+
+
+@pytest.mark.asyncio
+async def test_tp_acquire_sends_exclusive_param(tp_mode, monkeypatch):
+    """2026-11-21 硬互斥 opt-in：tp_acquire 必须带 exclusive=true（IP-Pool
+    侧据此剔除本 service 其它账号现占节点），一号一节点从分配源头成立。"""
+    captured: dict = {}
+
+    def _fake_tp_http(method, url, body=None, headers=None, timeout=15):
+        captured["url"] = url
+        return 200, json.dumps({"node_name": "node-x", "exit_ip": "9.9.9.9"})
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_tp_http)
+    acc = _account(acc_id="acc-e")
+    d = await egress_pool.tp_acquire(acc)
+    assert d and d.get("node_name") == "node-x"
+    assert "exclusive=true" in captured["url"]
 
 
 @pytest.mark.asyncio
