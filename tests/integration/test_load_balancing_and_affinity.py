@@ -103,6 +103,7 @@ class TestLoadBalancingAndAffinity:
         # S1 首轮：无绑定 + 无 assistant 轮 → 新请求。注意：此时 b 更富会先被选——
         # 先用只有 a 可用的窗口把 S1 绑到 a，再恢复 b 的余额验证粘性压过余额。
         b.status = Status.COOLING
+        b.cooling_until = time.time() + 300  # 生产形状：COOLING 必带 until（COOLING+None 现按到期防御）
         fresh_app.update_account(b)
         r1 = await client.post(
             "/v1/messages",
@@ -280,6 +281,7 @@ class TestLoadBalancingAndAffinity:
 
         # a 进入冷却
         a.status = Status.COOLING
+        a.cooling_until = time.time() + 300  # 生产形状：COOLING 必带 until
         fresh_app.update_account(a)
 
         # S1 发起请求，自动切换至 b

@@ -168,3 +168,49 @@ class TestExtractContextKey:
         # 必须依然为 False，绝不能因为相同 Prompt 就粘滞在同一账号导致无法负载均衡
         assert info2.is_continuation is False
 
+
+
+class TestCallerIdentityKey:
+    """指纹键调用方身份成分（2026-11-21 review P3）：优先网关凭证哈希，
+    NAT/共享出口下不同调用方不再因相同首句碰撞；伪造头无法污染他人亲和。"""
+
+    BODY = {
+        "messages": [
+            {"role": "user", "content": "write code"},
+            {"role": "assistant", "content": "def foo(): pass"},
+            {"role": "user", "content": "explain it"},
+        ]
+    }
+
+    def test_credential_creates_distinct_keys(self):
+        aff = SessionAffinity(ttl=10.0)
+        k1 = extract_context_key(self.BODY, {"authorization": "Bearer key-aaa"},
+                                 provider="zai", manager=aff).key
+        k2 = extract_context_key(self.BODY, {"authorization": "Bearer key-bbb"},
+                                 provider="zai", manager=aff).key
+        assert k1 != k2
+        assert k1 == extract_context_key(
+            self.BODY, {"authorization": "Bearer key-aaa"}, provider="zai", manager=aff).key
+
+    def test_bearer_prefix_normalized(self):
+        aff = SessionAffinity(ttl=10.0)
+        k1 = extract_context_key(self.BODY, {"authorization": "Bearer key-aaa"},
+                                 provider="zai", manager=aff).key
+        k2 = extract_context_key(self.BODY, {"x-api-key": "key-aaa"},
+                                 provider="zai", manager=aff).key
+        assert k1 == k2
+
+    def test_spoofed_ip_header_cannot_influence_credentialed_caller(self):
+        aff = SessionAffinity(ttl=10.0)
+        base = extract_context_key(self.BODY, {"authorization": "Bearer key-aaa"},
+                                   provider="zai", manager=aff).key
+        spoofed = extract_context_key(
+            self.BODY, {"authorization": "Bearer key-aaa", "x-forwarded-for": "1.2.3.4"},
+            provider="zai", manager=aff).key
+        assert base == spoofed
+
+    def test_no_credential_falls_back_to_ip(self):
+        aff = SessionAffinity(ttl=10.0)
+        info = extract_context_key(self.BODY, {"cf-connecting-ip": "9.9.9.9"},
+                                   provider="zai", manager=aff)
+        assert info.key.startswith("zai:conv:9.9.9.9:")

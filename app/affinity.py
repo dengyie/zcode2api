@@ -192,20 +192,33 @@ def extract_context_key(
         is_cont = has_history or manager.has(key)
         return ContextInfo(key=key, is_continuation=is_cont)
 
-    # 3. 消息指纹（首轮有效用户文本 + 客户端 IP）
+    # 3. 消息指纹（首轮有效用户文本 + 调用方身份）
     first_text = body_transform.extract_first_user_text(body)
     if not first_text:
         return ContextInfo(key=None, is_continuation=False)
 
-    client_ip = "local"
+    # 调用方身份成分（2026-11-21 review P3 根修）：优先取网关凭证前缀
+    # （authorization/x-api-key 的哈希前 16 位）——同一 NAT/共享出口下的多个
+    # 调用方（不同 gateway key）不再因相同首句（如「你好」）碰撞亲和键；
+    # 伪造头无法污染他人亲和（伪造值只影响自己的路由）。无凭证（本地开发
+    # ALLOW_NO_KEY）退化到客户端 IP；IP 也取不到用固定 "local"。
+    caller = "local"
     if headers:
         norm = {k.lower(): v for k, v in headers.items() if isinstance(k, str)}
-        raw_ip = norm.get("cf-connecting-ip") or norm.get("x-forwarded-for")
-        if isinstance(raw_ip, str) and raw_ip.strip():
-            client_ip = raw_ip.split(",")[0].strip()
+        cred = norm.get("authorization") or norm.get("x-api-key")
+        if isinstance(cred, str) and cred.strip():
+            cred = cred.strip()
+            # Bearer 前缀剥离后再哈希，避免同 key 两种写法分裂键
+            if cred.lower().startswith("bearer "):
+                cred = cred[7:].strip()
+            caller = hashlib.sha256(cred.encode("utf-8")).hexdigest()[:16]
+        else:
+            raw_ip = norm.get("cf-connecting-ip") or norm.get("x-forwarded-for")
+            if isinstance(raw_ip, str) and raw_ip.strip():
+                caller = raw_ip.split(",")[0].strip()
 
     digest = hashlib.sha256(first_text.encode("utf-8")).hexdigest()[:32]
-    key = f"{provider}:conv:{client_ip}:{digest}"
+    key = f"{provider}:conv:{caller}:{digest}"
 
     # 指纹模式：必须包含 assistant 历史轮次才视为延续上下文（is_continuation=True）；
     # 纯单轮请求（无 assistant 往返）一律按新请求对待（is_continuation=False），

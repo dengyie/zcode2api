@@ -104,7 +104,9 @@ async def add_accounts(payload: dict = Body(...)):
         _schedule_install(acc)  # 按账号安装序（含 apiKey 账号，幂等）
         if acc.mode == "jwt":
             _schedule_auto_claim(acc)  # 授权完成即激活+自动领取，入池即吃满活动
-    return {"count": len(added), "ids": added}
+    # count 只计真新增（2026-11-21 review P3）：原 len(added) 把去重命中的旧
+    # 账号也计入，响应高估新增数诱导误判；added/ids 仍回全量受理清单
+    return {"count": len(new_accounts), "ids": added}
 
 
 # ── 删除账号 ─────────────────────────────────────────────────────────────────
@@ -251,7 +253,12 @@ async def rotate_fingerprint(account_id: str):
 @router.post("/accounts/refresh")
 async def refresh(payload: dict = Body(default=None)):
     payload = payload or {}
-    if payload.get("all"):
+    # 布尔归一（2026-11-21 review P3）：payload["all"] 可能是字符串 "false"——
+    # 原 get("all") 直接判真，字符串 "false" 会误刷全池
+    all_flag = payload.get("all")
+    all_flag = all_flag is True or (
+        isinstance(all_flag, str) and all_flag.strip().lower() in ("true", "1", "yes"))
+    if all_flag:
         pool = [a for a in store.list_accounts("zai") if a.mode == "jwt"]
     else:
         ids = set(payload.get("ids") or [])

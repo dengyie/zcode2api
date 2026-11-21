@@ -196,7 +196,7 @@ class Store:
             (
                 account.id, account.provider, account.name, account.mode,
                 account.status, 1 if account.enabled else 0, account.created_at,
-                json.dumps(account.to_dict(), ensure_ascii=False),
+                    json.dumps(account.to_persist_dict(), ensure_ascii=False),
             ),
         )
         conn.commit()

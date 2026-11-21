@@ -311,3 +311,42 @@ async def test_schedule_install_dedupes_inflight(fresh_app, monkeypatch):
     install.schedule_install(acc)
     await asyncio.sleep(0.15)
     assert len(calls) == 2
+
+
+async def test_add_accounts_count_counts_only_new(fresh_app, monkeypatch):
+    """count 只计真新增（2026-11-21 review P3）：重复 token 返回旧账号，
+    count 原先把它也计入导致高估。"""
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import create_app
+    from app.store import store
+
+    fresh_app.add_account("zai", "old", "h1.eyJzdWIiOiJhIn0.sig")
+    app = create_app()
+    monkeypatch.setattr("app.routes.admin_api.store", store)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        res = await client.post("/admin/api/accounts",
+                                json={"tokens": "h1.eyJzdWIiOiJhIn0.sig\nh2.eyJzdWIiOiJiIn0.sig"},
+                                headers={"Authorization": "Bearer zcode"})
+        assert res.status_code == 200
+        data = res.json()
+        assert data["count"] == 1  # 只有第二个 token 是真新增
+        assert len(data["ids"]) == 2  # ids 回全量受理清单
+
+
+async def test_refresh_all_string_false_does_not_refresh_pool(fresh_app, monkeypatch):
+    """payload["all"]="false" 字符串判真修复（2026-11-21 review P3）：
+    字符串 "false" 不再误刷全池，只有真布尔/明确 true 字面量才触发。"""
+    from unittest.mock import patch
+
+    from app.routes import admin_api
+
+    fresh_app.add_account("zai", "t", "h1.eyJzdWIiOiJhIn0.sig")
+    with patch.object(admin_api, "refresh_accounts", return_value={"ok": 1}) as mock_rf:
+        await admin_api.refresh({"all": "false"})
+        # "false" 字符串不再触发全池刷新（走 ids 分支且 ids 为空 → 空池调用）
+        assert mock_rf.call_args[0][0] == []
+        mock_rf.reset_mock()
+        await admin_api.refresh({"all": True})
+        # 真 true 才刷全池（jwt 号入参）
+        assert len(mock_rf.call_args[0][0]) == 1

@@ -414,7 +414,13 @@ class Account:
                 return False
         if self.status == Status.COOLING:
             now = now or time.time()
-            return bool(self.cooling_until and now >= self.cooling_until)
+            if self.cooling_until is None:
+                # 防御兜底（2026-11-21 review 待确认项）：全部现行写入方都成对
+                # 设置 cooling_until，但若未来路径漏配，COOLING+None 原先恒
+                # False = 该号永久不可选且无自愈。按「冷却未知 → 立即视为到期」
+                # 处理：宁可放进池子被上游教育，也不要永久蒸发一个号。
+                return True
+            return bool(now >= self.cooling_until)
         return True
 
     def is_cooling(self, now: float | None = None) -> bool:
@@ -427,7 +433,10 @@ class Account:
         if self.status != Status.COOLING:
             return False
         now = now or time.time()
-        return bool(self.cooling_until and now < self.cooling_until)
+        if self.cooling_until is None:
+            # 与 is_selectable 同款防御：COOLING+None 视为冷却已到期
+            return False
+        return bool(now < self.cooling_until)
 
     def plan_kind(self) -> str:
         """当前套餐类型：start-plan（体验/免费档）/ coding-plan / ""（未知）。
@@ -454,7 +463,23 @@ class Account:
     @staticmethod
     def from_dict(data: dict) -> Account:
         known = {f for f in Account.__dataclass_fields__}  # type: ignore[attr-defined]
-        return Account(**{k: v for k, v in data.items() if k in known})
+        extra = {k: v for k, v in data.items() if k not in known}
+        acc = Account(**{k: v for k, v in data.items() if k in known})
+        if extra:
+            # 未知字段保留（2026-11-21 review P3）：新版写入的新字段在降级
+            # 加载时原先被静默丢弃，任何一次 update_account 落库即把新字段从
+            # blob 里永久抹掉。挂到 _extra 上，to_dict 落库时原样回写。
+            object.__setattr__(acc, "_extra", extra)
+        return acc
+
+    def to_persist_dict(self) -> dict:
+        """落库形态：to_dict + 降级保留的未知字段（_extra）回写。"""
+        d = self.to_dict()
+        extra = getattr(self, "_extra", None)
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                d.setdefault(k, v)
+        return d
 
     def fingerprint_view(self) -> dict | None:
         """指纹的对外形态（dict）；未分配/半初始化返回 None。"""
