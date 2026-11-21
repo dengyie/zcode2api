@@ -320,7 +320,7 @@ async def _tp_node_tiers() -> dict[str, str]:
 
     拉取失败/解析失败返回空 dict（fail-open：巡检跳过，不打扰）。节点清单
     是全量大响应（900+ 节点 ~650KB），只在巡检节奏调用，不进热路径。"""
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "GET", f"{settings.TP_API}/v1/nodes",
         None, _tp_headers(), 30)
     if st != 200:
