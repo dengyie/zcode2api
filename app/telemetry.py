@@ -12,6 +12,7 @@ URL、业务码判定只在本模块维护：
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import httpx
@@ -19,6 +20,12 @@ import httpx
 from . import constants, egress, settings
 
 _TIMEOUT = 10
+# 瞬态网络重试（2026-11-21 高可用迭代）：激活上报是领取资格信号（app_daily_active
+# 先于 preview 的时序铁律），单发即败 = 该号当天资格信号缺失，而白天无领取轮时
+# 要拖到 19 点才补（08:11 抖动窗 4 号实锤）。与 billing GET 同口径 3 次 2s/4s
+# 阶梯；事件端点无 Authorization、上游按 device_mid+日期去重，重发幂等安全。
+_ATTEMPTS = 3
+_RETRY_LOG_TAG = "claim"
 
 
 def build_activation_event_body(element: str, profile, user_id: str) -> dict:
@@ -59,7 +66,9 @@ async def post_activation_event(profile, user_id: str, element: str,
     """单条激活事件上报（无 Authorization，官方端点不校验登录态）。
 
     HTTP >= 400 或业务码非 0 抛 RuntimeError，文案含定位信息（"HTTP 500" /
-    "业务码异常"）；httpx.HTTPError 原样上抛 —— 容错策略（中止/继续）由调用方定。
+    "业务码异常"）；httpx.HTTPError 重试 3 次（2s/4s 阶梯）后原样上抛 ——
+    容错策略（中止/继续）由调用方定。仅重试传输层瞬态（TransportError），
+    HTTP 4xx/5xx 与业务码异常不重试（服务端明确应答 = 重发无意义）。
 
     出口跟随 settings.BILLING_EGRESS（2026-11-13 起）：激活上报是领取链路的
     资格信号，必须与 billing/claim 同出口（历史 2.7.16 实锤：不同出口 →
@@ -73,9 +82,23 @@ async def post_activation_event(profile, user_id: str, element: str,
         trust_env = settings.BILLING_EGRESS == egress.PROXY
         client_kw = {"trust_env": trust_env}
     async with httpx.AsyncClient(timeout=timeout, **client_kw) as client:
-        res = await client.post(settings.ZCODE_EVENT_REPORT_URL,
-                                headers={"Content-Type": "application/json"},
-                                json=build_activation_event_body(element, profile, user_id))
+        for attempt in range(1, _ATTEMPTS + 1):
+            try:
+                res = await client.post(
+                    settings.ZCODE_EVENT_REPORT_URL,
+                    headers={"Content-Type": "application/json"},
+                    json=build_activation_event_body(element, profile, user_id))
+                break
+            except httpx.TransportError as err:
+                if attempt >= _ATTEMPTS:
+                    raise
+                wait = 2 * attempt
+                from . import logs
+                logs.info(_RETRY_LOG_TAG,
+                          f"激活上报 {element} 瞬态网络错误（{type(err).__name__}），"
+                          f"{wait}s 后重试（{attempt}/{_ATTEMPTS - 1}）")
+                await asyncio.sleep(wait)
+        assert res is not None  # 循环必经 break/raise
     if res.status_code >= 400:
         raise RuntimeError(f"event/report {element} HTTP {res.status_code}: {res.text[:120]}")
     try:

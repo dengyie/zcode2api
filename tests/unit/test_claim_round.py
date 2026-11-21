@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+import httpx
 import pytest
 
 from app.claim import ClaimRoundManager
@@ -492,3 +493,201 @@ def test_today_key_is_beijing_anchored():
 
     expected = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
     assert _today_key() == expected
+
+
+@pytest.mark.asyncio
+async def test_activation_event_transient_retry(monkeypatch):
+    """2026-11-21 高可用迭代：激活上报瞬态网络错误 3 次 2s/4s 阶梯重试。
+
+    08:11 抖动窗 4 号实锤——单发即败 = 当天资格信号缺失（白天无轮要拖到
+    19 点才补）。事件端点无 Authorization、上游按 device_mid+日期去重，
+    重发幂等安全。仅 TransportError 重试；HTTP 4xx/业务码异常不重试。
+    """
+    import asyncio
+    import uuid
+
+    from app import telemetry
+    from app.fingerprint import DeviceProfile
+
+    profile = DeviceProfile(
+        platform="linux", arch="x64", os_version="6.8.0-45-generic",
+        language="zh-CN", timezone="Asia/Shanghai", screen="1920x1080",
+        device_mid=str(uuid.uuid4()),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(asyncio, "sleep", lambda s: sleeps.append(s) or _noop())
+    posts: list[int] = []
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.n = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, *a, **kw):
+            self.n += 1
+            posts.append(self.n)
+            if self.n < 3:
+                raise httpx.ConnectError("boom")
+            return _FakeRes()
+
+    class _FakeRes:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"code": 0}
+
+    monkeypatch.setattr(telemetry.httpx, "AsyncClient", FakeClient)
+    await telemetry.post_activation_event(profile, "u1", "app_launch")
+    assert posts == [1, 2, 3]  # 3 发：2 败 1 成
+    assert sleeps == [2, 4]  # 2s/4s 阶梯
+
+
+@pytest.mark.asyncio
+async def test_activation_event_no_retry_on_http_error(monkeypatch):
+    """HTTP 4xx / 业务码异常是服务端明确应答，不重试——重发无意义。"""
+    import asyncio
+    import uuid
+
+    from app import telemetry
+    from app.fingerprint import DeviceProfile
+
+    profile = DeviceProfile(
+        platform="linux", arch="x64", os_version="6.8.0-45-generic",
+        language="zh-CN", timezone="Asia/Shanghai", screen="1920x1080",
+        device_mid=str(uuid.uuid4()),
+    )
+    posts: list[int] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(asyncio, "sleep", lambda s: sleeps.append(s) or _noop())
+
+    class _FakeRes:
+        status_code = 500
+        text = "oops"
+
+        def json(self):
+            return {"code": -1}
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, *a, **kw):
+            posts.append(1)
+            return _FakeRes()
+
+    monkeypatch.setattr(telemetry.httpx, "AsyncClient", FakeClient)
+    try:
+        await telemetry.post_activation_event(profile, "u1", "app_launch")
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised
+    assert posts == [1]  # 单发即止
+    assert sleeps == []
+
+
+async def _noop():
+    return None
+
+
+@pytest.mark.asyncio
+async def test_billing_get_retry_ladder_five_attempts(monkeypatch):
+    """2026-11-21 高可用迭代：billing GET 瞬态重试 3→5 次，阶梯 2/4/8/15s。
+
+    08:10-08:13 出口抖动是分钟级（49 条探针失败实锤），6s 总窗全落抖动窗内
+    白烧——总窗 ~29s 吃住抖动尾部。POST 仍单发（写操作重发撞 1003）。
+    """
+    from app import claim as claim_module
+    from app.models import Account
+
+    acc = Account.create("zai", "ladder", "h1.eyJzdWIiOiJhIn0.sig")
+    sleeps: list[float] = []
+    monkeypatch.setattr(asyncio, "sleep", lambda s: sleeps.append(s) or _noop())
+    reqs: list[int] = []
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.n = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def request(self, method, url, **kw):
+            self.n += 1
+            reqs.append(self.n)
+            if self.n < 5:
+                raise httpx.ConnectError("boom")
+            return _FakeBillingRes()
+
+    class _FakeBillingRes:
+        status_code = 200
+
+        def json(self):
+            return {"code": 0, "data": {"plans": []}}
+
+    monkeypatch.setattr(claim_module.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(claim_module.egress, "account_proxy", lambda a: None)
+    monkeypatch.setattr(claim_module.settings, "BILLING_EGRESS", "direct")
+
+    plans = await claim_module.preview_plans(acc)
+    assert plans == []
+    # preview = billing/preview GET + marketing/touch GET 两条，各自
+    # 4 败 1 成（营销链每次请求独立重试）→ 10 发；阶梯 2 组 2/4/8/15
+    assert len(reqs) == 10
+    assert reqs[:5] == [1, 2, 3, 4, 5]
+    assert sleeps == [2, 4, 8, 15, 2, 4, 8, 15]
+
+
+@pytest.mark.asyncio
+async def test_billing_post_keeps_single_attempt(monkeypatch):
+    """POST claim 写操作保持单发：超时后上游可能已入账，重发撞 1003。"""
+    from app import claim as claim_module
+    from app.models import Account
+
+    acc = Account.create("zai", "post1", "h1.eyJzdWIiOiJhIn0.sig")
+    sleeps: list[float] = []
+    monkeypatch.setattr(asyncio, "sleep", lambda s: sleeps.append(s) or _noop())
+    reqs: list[int] = []
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def request(self, method, url, **kw):
+            reqs.append(1)
+            raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(claim_module.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(claim_module.egress, "account_proxy", lambda a: None)
+    monkeypatch.setattr(claim_module.settings, "BILLING_EGRESS", "direct")
+
+    try:
+        await claim_module._billing_request(acc, "POST", "/billing/claim",
+                                            headers={"x": "y"}, json={})
+        raised = False
+    except claim_module.ClaimError:
+        raised = True
+    assert raised
+    assert reqs == [1]  # 单发即止
+    assert sleeps == []
