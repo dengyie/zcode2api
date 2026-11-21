@@ -1339,6 +1339,40 @@ async def test_reconcile_rebalances_co_occupied_node(tp_mode, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_loop_sweeps_periodically(tp_mode, monkeypatch):
+    """2026-11-21 迭代 review P2：巡检周期化——IP-Pool 数据面 auto_rehome /
+    gateway persist 随时制造新共占，reconcile 不再是启动单次。loop 按
+    TP_RECONCILE_INTERVAL 周期跑 sweep；异常只 warn 不退出。"""
+    sweeps = []
+
+    async def fake_sweep():
+        sweeps.append(1)
+
+    monkeypatch.setattr(settings, "TP_RECONCILE_INTERVAL", 0)  # 最短周期
+    monkeypatch.setattr(egress_pool.egress_pool, "_reconcile_sweep", fake_sweep)
+
+    async def _boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "tetherpool")
+    loop_task = asyncio.create_task(egress_pool.egress_pool._reconcile_loop())
+    # sweep 失败也不退出：前几轮正常计数，然后 monkeypatch 换成抛异常版本
+    await asyncio.sleep(0.1)
+    assert len(sweeps) >= 2  # interval=0 -> 连跑多轮
+    monkeypatch.setattr(egress_pool.egress_pool, "_reconcile_sweep", _boom)
+    await asyncio.sleep(0.1)
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+    # 循环未因异常退出（sweep 数在 boom 后不再增长但 task 是被我们 cancel 的，
+    # 若循环自己死了 cancel 会抛 InvalidStateError 之外的路径——间接验证）
+    assert sweeps  # 周期 sweep 确实跑过
+
+
+@pytest.mark.asyncio
 async def test_tp_acquire_sends_exclusive_param(tp_mode, monkeypatch):
     """2026-11-21 硬互斥 opt-in：tp_acquire 必须带 exclusive=true（IP-Pool
     侧据此剔除本 service 其它账号现占节点），一号一节点从分配源头成立。"""

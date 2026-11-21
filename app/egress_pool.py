@@ -191,8 +191,14 @@ async def tp_acquire(account, force_rebalance: bool = False,
         from . import logs
         # 归因明细（2.7.68）：此前非 200 一律静默 None，401（token 过期）表现为
         # 「池枯」、与 TP 宕机不可分——状态码透传一条，排障不再盲猜
+        # 互斥占满标记（2026-11-21 迭代）：IP-Pool exclusive 路径占满回 503，
+        # 与真池枯（池容量不足）区分——前者是硬互斥正常工作，等下轮重试即可；
+        # 后者要扩池。
+        _mutex_full = "mutex exhausted" in raw or "exclusive exhausted" in raw
         logs.warn("egress_pool",
-                  f"TP acquire HTTP {st}: {raw.strip()[:120]}（account={account.name}）")
+                  f"TP acquire HTTP {st}: {raw.strip()[:120]}"
+                  f"{'【互斥占满——硬互斥生效，等下轮重试】' if _mutex_full else ''}"
+                  f"（account={account.name}）")
         return None
     try:
         return json.loads(raw)
@@ -845,19 +851,17 @@ class TetherPoolEgress:
                 task = asyncio.create_task(self._reconcile_once())
                 self._inflight.add(task)
                 task.add_done_callback(self._inflight.discard)
+                self._reconcile_loop_task = asyncio.create_task(
+                    self._reconcile_loop())
 
     async def _reconcile_once(self, initial_delay: float = 10) -> None:
         """启动时 TP 分配对账（2.7.68 孤儿清理 + 2026-11-21 共占巡检/记录对齐）：
 
         ①孤儿分配：allocs 里 zh-<id> 不在本库账号集合 → 逐个 release（11-17
         实查 27 个分配 16 个陈旧——删除释放只堵新增不清存量，孤儿永久占节点）。
-        ②hub 记录漂移：hub egress_node ≠ TP 实际绑定 → 对齐 hub 记录（IP-Pool
-        侧 auto_rehome 会主动换绑，ashorchard21 实锤 hub 记忆 teleapisub-024 /
-        地面 clash-347——ban 目标与 exclude 集合指向已不存在的绑定）。
-        ③节点共占：TP 实际绑定与其它账号分配同节点（IP-Pool 软语义降级/auto_rehome
-        制造的存量）→ 强制 rebalance 换绑（一号一节点是风控红线，exclude_node
-        只防「主动制造」，不回收存量）。
-        与启动期 ensure_binding 并发安全：①只释放不在库的 id，②③只动本库账号。"""
+        ②③ 记录漂移对齐 + 节点共占回收委托 _reconcile_sweep（与周期循环同体，
+        幂等；rebalance 自带去抖/账号锁）。与启动期 ensure_binding 并发安全：
+        ①只释放不在库的 id，②③只动本库账号。"""
         from . import logs
         from .store import store
         if initial_delay > 0:
@@ -876,8 +880,33 @@ class TetherPoolEgress:
             logs.ok("egress_pool", f"[reconcile] 孤儿分配清理完成: {len(orphans)} 个已释放")
         else:
             logs.info("egress_pool", "[reconcile] TP 分配对账通过，无孤儿")
+        # ②③ 存量巡检（周期循环同一实现）
+        await self._reconcile_sweep()
 
-        # ②③ 存量巡检（快照已拉好，纯本地比对）
+    async def _reconcile_loop(self) -> None:
+        """周期巡检循环（2026-11-21 迭代 review P2）：共占/漂移不止启动期产生
+        ——IP-Pool 数据面 auto_rehome（节点死亡风暴）与 gateway 级 persist 随时
+        改写绑定，单次启动巡检后存量要等下次重启才回收（08:35 实锤：巡检清
+        17 组后 35 分钟内数据面又造出 3 组）。巡检幂等 + rebalance 自带去抖/
+        账号锁，循环安全；异常只 warn 不退出（下轮重试）。"""
+        from . import logs
+        while True:
+            await asyncio.sleep(settings.TP_RECONCILE_INTERVAL)
+            if not settings.PER_ACCOUNT_EGRESS or settings.EGRESS_SUPPLY != "tetherpool":
+                continue
+            try:
+                await self._reconcile_sweep()
+            except Exception as exc:
+                logs.warn("egress_pool", f"[reconcile] 周期巡检异常（下轮重试）: {exc}")
+
+    async def _reconcile_sweep(self) -> None:
+        """单轮对账 sweep：②记录对齐 + ③共占回收（孤儿①只在启动期
+        _reconcile_once 清一次，周期巡检不动不在库 id）。"""
+        from . import logs
+        from .store import store
+        allocs, _banned = await _tp_live_snapshot()
+        if not allocs:
+            return  # 快照失败（空）= fail-open，不动任何分配
         node_holders: dict[str, list[str]] = {}
         for aid, node in allocs.items():
             if aid.startswith("zh-"):
@@ -922,8 +951,20 @@ class TetherPoolEgress:
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        # 周期巡检循环是 while-True 常驻任务，必须显式 cancel——只 gather
+        # 会永远等它退出（test_health_loop_bootstraps 挂死实锤）
+        loop = getattr(self, "_reconcile_loop_task", None)
+        if loop and not loop.done():
+            loop.cancel()
+            try:
+                await loop
+            except asyncio.CancelledError:
+                pass
+            self._reconcile_loop_task = None
         if self._inflight:
-            await asyncio.gather(*self._inflight, return_exceptions=True)
+            await asyncio.gather(
+                *(t for t in self._inflight if not t.done()),
+                return_exceptions=True)
 
 
 egress_pool = TetherPoolEgress()
