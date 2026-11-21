@@ -431,8 +431,11 @@ class TetherPoolEgress:
             # 都没做，直接返回 False,不触发恢复轮——否则恢复轮 pop 戳重跑
             # 一轮 acquire,去抖语义被架空（迭代二测试实证）。与
             # _rebalance_locked 入口同一判定（该入口防并发窗口保留不动）。
-            if time.monotonic() - self._rebalance_at.get(account.id, 0) \
-                    < settings.TP_REBALANCE_DEBOUNCE:
+            # last 为 None 不去抖（对齐 bd61464）：0 哨兵会被低 monotonic
+            # 环境误拦首次 rebalance——fresh runner now < 120s 恒判「窗内」。
+            last = self._rebalance_at.get(account.id)
+            if last is not None \
+                    and time.monotonic() - last < settings.TP_REBALANCE_DEBOUNCE:
                 logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")
                 return False
             ok = await self._rebalance_locked(account, reason, ban)
