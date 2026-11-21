@@ -504,7 +504,12 @@ async def count_tokens(request: Request):
     # 2026-11-17 review：_normalize_body 会原地剥离 provider 前缀/改写别名，
     # 必须改写后再取——否则 poweredBy 注入的是带前缀旧值（差一个模型名的估算偏差）
     model = str(body.get("model") or model)
-    return {"input_tokens": estimate_input_tokens_after_transform(body, model)}
+    # CPU 卸载（2026-11-22 迭代二 F2-4）：deepcopy + 全量 transform + 逐字符
+    # 计数对晚期会话 1-5MB body 是 0.3-1.5s 纯 CPU——此前同步跑在事件循环里
+    # 阻塞全部在飞 SSE 转发。Claude Code 每轮对话前都调本端点，高峰期并发
+    # count_tokens 会串行放大卡顿。
+    return {"input_tokens": await asyncio.to_thread(
+        estimate_input_tokens_after_transform, body, model)}
 
 
 def _note_stream_abort(up: _Upstream, err: Exception, req_id: str) -> None:
@@ -533,7 +538,13 @@ def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
     fail_frames：UpstreamStreamError（上游在流内下发 error 事件）时产出客户端
     可识别的失败帧——转译层各自形态；None = 无转译层的透传路径，该异常与普通
     异常同走「流传输中断」记账（与原 to_streaming 行为一致）。
-    """
+
+    传输层中断也产出失败帧（2026-11-22 迭代二 P1 根修）：此前只有流内 error
+    事件给帧，传输层异常（Server disconnected / ReadTimeout）走 else 分支吞掉
+    后生成器正常结束 = 客户端看到「干净 EOF」，宽容解析的 SDK 把半截回答当
+    完整成功——2026-11-16 事故（15 条 Server disconnected）正是此形态。现
+    fail_frames 存在时（流已开帧且属转译层）传输中断同样产出错误帧；透传路径
+    无协议错误帧可用，维持记账现状（reqlog 已记错误）。"""
     def decorate(gen_fn):
         async def guarded():
             try:
@@ -543,7 +554,7 @@ def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
                 reqlog.finish_error(req_id, "客户端断开", status=499, t_first=up.t_first)
                 raise
             except Exception as err:  # noqa: BLE001
-                if isinstance(err, UpstreamStreamError) and fail_frames is not None:
+                if fail_frames is not None and isinstance(err, UpstreamStreamError):
                     # 上游在流内下发 error 事件：必须以客户端可识别的错误帧收尾，
                     # 不能让半截回答静默变成「成功」（2.7.33）
                     logs.req_err(req_id, f"上游流式错误: {err}")
@@ -555,6 +566,11 @@ def _sse_guard(req_id: str, up: _Upstream, fail_frames=None):
                     logs.req_err(req_id, f"流传输中断: {err}")
                     reqlog.finish_error(req_id, f"流传输中断: {err}", t_first=up.t_first)
                     _note_stream_abort(up, err, req_id)
+                    if fail_frames is not None:
+                        # 传输层中断（非流内 error）：同样产出失败帧，防半截
+                        # 回答以干净 EOF 呈现成功（2026-11-22 迭代二 P1）
+                        for frame in fail_frames(err):
+                            yield frame
             finally:
                 await up.close()
         return guarded

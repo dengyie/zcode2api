@@ -127,7 +127,10 @@ def _opslog(level: str, tag: str, msg: str) -> None:
             # 2026-11-22，非 NFS，单次 flush 为 µs 级）；info/ok/req 族维持
             # 节流。进程退出仍由 shutdown_flush 收口。
             now = time.monotonic()
-            if level in ("warn", "err") or now - _last_flush >= _FLUSH_INTERVAL:
+            # req_err 也在立即冲刷集合（2026-11-22 迭代二 F8）：错误级红色行，
+            # 深夜静默期最长滞留 2s 才可见；req/req_ok 高频维持节流。
+            if level in ("warn", "err", "req_err") or \
+                    now - _last_flush >= _FLUSH_INTERVAL:
                 _fh.flush()
                 _last_flush = now
     except (OSError, ValueError):

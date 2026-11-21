@@ -191,10 +191,15 @@ def clear_account(account_id: str) -> None:
 
     billing 刷新**不要**走这里——billing 只能证明「有窗口可用」的模型恢复了，
     证明不了其它模型没耗尽（2.7.30 review 整改）。
+
+    内存与盘写同锁串行（2026-11-22 迭代二 F9 回归对齐 note/clearing 纪律）：
+    此前 2.7.76 把 _persist 移到锁外——pop 释放锁后、persist 前并发 note()
+    重新打点（锁内写内存+盘），随后锁外 _persist(k, None) 会把新写的盘行删掉
+    = 内存 cooling、盘已清，重启失忆（正是 2.7.55 本模块要根除的形态）。
+    表只有主键点写（µs 级），持锁写盘无实际竞争面。
     """
-    with _lock:  # 2026-11-22 review P3：补锁对齐 note/clear 自身锁纪律表述
+    with _lock:
         keys = [k for k in _plan_model_exhausted if k.split("\n", 1)[0] == account_id]
         for k in keys:
             _plan_model_exhausted.pop(k, None)
-    for k in keys:
-        _persist(k, None)
+            _persist(k, None)

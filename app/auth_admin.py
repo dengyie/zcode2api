@@ -34,15 +34,30 @@ def _client_ip(request: Request) -> str:
     未设/为 false）时用 socket 对端地址：直连部署（settings.HOST=0.0.0.0）上
     伪造头无法再绕过失败锁定。tebi canonical 部署（127.0.0.1 + CF Tunnel）须
     显式设 true 才能保持「按真实公网客户端 IP 锁定」语义。
+
+    连坐豁免（2026-11-22 迭代二 P1 根修；同轮测试勘误收紧）：TRUST_PROXY_HEADERS=false
+    且进程只监听回环地址（ZCODE_HOST=127.0.0.1）且 socket 对端为 127.0.0.1 时，
+    进程不可能被外部直连——请求只能来自本机隧道进程（cloudflared，必然覆写
+    cf-connecting-ip 为真实公网客户端 IP），此时按代理头锁真实来源是安全的。
+    监听 0.0.0.0 的直连部署不豁免：socket=127.0.0.1 也可能是本机 curl 直连
+    （伪造 cf-connecting-ip 即绕过锁定，回退到 2026-11-21 P1 修复前的形态）。
+    tebi canonical 部署须显式设 ZCODE_HOST=127.0.0.1（supervisor 命令本就
+    --host 127.0.0.1，与 uvicorn 直配一致）+ 不设信任头，即可同时获得
+    「按真实 IP 锁定」与「无伪造面」。
     """
     if settings.TRUST_PROXY_HEADERS:
         for header in ("cf-connecting-ip", "x-real-ip"):
             val = (request.headers.get(header) or "").strip()
             if val:
                 return val.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
+    socket_host = request.client.host if (request.client and request.client.host) else ""
+    if socket_host == "127.0.0.1" and settings.HOST == "127.0.0.1":
+        # 只监听回环 + 来自回环 = 本机隧道流量：按代理头锁真实来源
+        for header in ("cf-connecting-ip", "x-real-ip"):
+            val = (request.headers.get(header) or "").strip()
+            if val:
+                return val.split(",")[0].strip()
+    return socket_host or "unknown"
 
 
 def _is_locked(ip: str) -> bool:

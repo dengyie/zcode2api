@@ -187,7 +187,6 @@ def schedule_install(account) -> None:
     async def _job():
         from .store import store
 
-        _install_pending.discard(account.id)
         live = store.find(account.provider, account.id)
         if live is None:
             return
@@ -195,6 +194,13 @@ def schedule_install(account) -> None:
             await run_install_sequence_for_account(live)
         except Exception as err:  # noqa: BLE001 - 兜底：绝不冒泡
             logs.warn("install", f"账号 {account.name} 安装序任务异常: {err}")
+        finally:
+            # 去重窗口覆盖整个任务生命周期（2026-11-22 迭代二 F3 根修）：此前
+            # discard 在任务开头——去重窗只有首个调度 tick，真正的在途安装期
+            # （configs+激活事件 ~30s）第二个 schedule 照常并发双跑，同一
+            # device_mid 双份 configs+激活上报与官方「每号一天一次激活」节奏
+            # 矛盾，且发生在风控处置（rotate/admin 手动换发）最敏感时刻。
+            _install_pending.discard(account.id)
 
     _install_pending.add(account.id)
     task = asyncio.create_task(_job())

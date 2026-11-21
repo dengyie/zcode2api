@@ -120,6 +120,11 @@ async def delete_accounts(ids: list[str] = Body(...)):
         acc = store.find_any(aid)
         if acc and store.remove_account(acc.provider, aid):
             clear_key_no_balance(aid)  # 删除即无残留（Key-1113 冷却记忆）
+            # 网关在飞槽位残键清理（2026-11-22 迭代二 F3-1）：释放路径只减
+            # 计数不摘键，删除账号的键以 0 值永驻（随账号 churn 线性增长）。
+            # 在飞请求的 close 回调 pop 时 KeyError 面由 pop 默认值兜住。
+            from .gateway import _inflight
+            _inflight.pop(aid, None)
             # per-tag 运行态清理（2026-11-21 review P3）：gate 断路器/连接失败
             # 聚类/captcha 池按出口 tag 分键，删号不清理 = 死 tag 永久残留，
             # edge_hits 还会持续计进监控口径。仅 per-account 代理 tag 需要清
@@ -582,7 +587,7 @@ async def claim(payload: dict = Body(default=None)):
     while len(_claim_jobs) > _CLAIM_JOB_KEEP:  # 最老挤出，防无界增长
         _claim_jobs.pop(next(iter(_claim_jobs)))
 
-    task = asyncio.create_task(_run_claim_job(runnable, plan_id, rec))
+    task = asyncio.create_task(_run_claim_job_guarded(runnable, plan_id, rec))
     _claim_job_tasks.add(task)
     task.add_done_callback(_claim_job_tasks.discard)
 
@@ -690,6 +695,16 @@ async def _run_claim_job(runnable: list, plan_id: str | None, rec: dict) -> None
             rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
                                     "ok": False, "message": str(err)})
     rec["done"] = True
+
+
+async def _run_claim_job_guarded(runnable: list, plan_id: str | None, rec: dict) -> None:
+    """_run_claim_job 外壳（2026-11-22 迭代二 F3-2）：CancelledError（停机收割）
+    是 BaseException 不被内层 except Exception 捕获，原实现 rec["done"] 永不
+    置位 = GET /claim/{job_id} 永远 running。finally 收口防僵尸状态。"""
+    try:
+        await _run_claim_job(runnable, plan_id, rec)
+    finally:
+        rec["done"] = True
 
 @router.post("/claim/manual")
 async def claim_manual(payload: dict = Body(...)):
@@ -871,8 +886,13 @@ async def export_accounts():
 @router.post("/import")
 async def import_accounts(payload: dict = Body(...)):
     existing = {a.id for a in store.list_accounts()}
-    count = store.import_accounts(payload)
-    logs.warn("admin", f"导入账号池: {count} 条（含凭证）")
+    count = -1  # -1 = 形状闸前炸出（审计可辨识）
+    try:
+        count = store.import_accounts(payload)
+    finally:
+        # 审计先于回执/异常（2026-11-22 迭代二）：导入是高危动作（凭证批量
+        # 落库），中途炸出也必须留痕——对齐导出留痕纪律
+        logs.warn("admin", f"导入账号池: {count} 条（含凭证）")
     # 导入的新账号：安装序（幂等）+ JWT 账号激活+自动领取（幂等：重复 token 不新增）
     imported = [a for a in store.list_accounts("zai") if a.id not in existing]
     for acc in imported:

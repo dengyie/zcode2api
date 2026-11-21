@@ -62,7 +62,15 @@ class ZaiAuthFlow:
                 headers={"Authorization": f"Bearer {self.poll_token}"},
             )
         res.raise_for_status()
-        return res.json().get("data") or {}
+        try:
+            return res.json().get("data") or {}
+        except ValueError as err:
+            # 非 JSON 上游响应（WAF 拦截页/网关 5xx HTML）转业务文案（2026-11-22
+            # 迭代二 F7）：此前裸 ValueError → admin 登录轮询 500，人工在等的
+            # 交互流程拿不到可读回执
+            raise RuntimeError(
+                f"OAuth 轮询返回非 JSON 响应（HTTP {res.status_code}）: "
+                f"{(res.text or '')[:120]}") from err
 
     async def exchange_api_key(self, access_token: str) -> str:
         """OAuth access_token → 业务 token → 机构/项目 → API Key。"""
@@ -73,7 +81,12 @@ class ZaiAuthFlow:
                 json={"token": access_token},
             )
             login.raise_for_status()
-            biz = (login.json().get("data") or {})
+            try:
+                biz = (login.json().get("data") or {})
+            except ValueError as err:
+                raise RuntimeError(
+                    f"OAuth 登录兑换返回非 JSON 响应（HTTP {login.status_code}）: "
+                    f"{(login.text or '')[:120]}") from err
             biz_token = biz.get("access_token") or biz.get("accessToken")
             if not biz_token:
                 raise RuntimeError("返回数据中不含业务凭证")
@@ -83,7 +96,12 @@ class ZaiAuthFlow:
                 headers={"Authorization": f"Bearer {biz_token}"},
             )
             info.raise_for_status()
-            orgs = (info.json().get("data") or {}).get("organizations") or []
+            try:
+                orgs = (info.json().get("data") or {}).get("organizations") or []
+            except ValueError as err:
+                raise RuntimeError(
+                    f"机构信息查询返回非 JSON 响应（HTTP {info.status_code}）: "
+                    f"{(info.text or '')[:120]}") from err
             org = next((o for o in orgs if "默认机构" in (o.get("organizationName") or "")), None) or (orgs[0] if orgs else None)
             if not org:
                 raise RuntimeError("找不到可用的机构")

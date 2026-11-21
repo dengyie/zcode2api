@@ -137,7 +137,14 @@ async def fetch_quota(account: Account) -> dict:
         async def _get(path: str):
             try:
                 return await client.get(f"{base}{path}", headers=headers)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
+                # 传输层失败留痕（2026-11-22 迭代二 F2）：三路全 None 时 fetch_quota
+                # 走「billing 为空」分支零输出——出口/网络整夜故障 = 16 轮静默失败，
+                # opslog 告警守护永远看不到 quota 链失明。此处逐次 warn（每次刷新
+                # 每路至多一条），与业务错误留痕同口径。
+                logs.warn("quota",
+                          f"账号 {account.name} billing {path} 传输层失败: "
+                          f"{type(exc).__name__}")
                 return None
 
         billing_res, balance_res, usage_res = await asyncio.gather(
@@ -476,19 +483,21 @@ async def refresh_accounts(accounts: list[Account]) -> dict:
                 return False
         task = asyncio.create_task(_run_one(acc))
         _refresh_inflight[acc.id] = task
+        # done callback 删除（2026-11-22 迭代二 F4 根修）：此前 finally 条件
+        # 删除在「创建者被取消」路径有残余竞态——await shield 被取消立即走
+        # finally，但 task 仍在飞（shield 保证）；此刻第三调用方 miss 再建
+        # = 同账号两条并发 billing 三连 GET（该去重机制本为防风控流量放大
+        # 而建）。删除移到 task 真正收尾的回调里，在飞全程保持去重；
+        # `is task` 守卫防「误删后建的新 task」。
+        task.add_done_callback(
+            lambda t: _refresh_inflight.pop(acc.id, None)
+            if _refresh_inflight.get(acc.id) is t else None)
         try:
             return bool(await asyncio.shield(task))
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             return False
-        finally:
-            # 条件删除（2026-11-22 review P3 根修）：无条件 pop 存在「创建者
-            # 被取消 → finally 弹掉另一入口刚登记的新 task」竞态——第三个
-            # 调用方 miss 再建 = 同账号双路 billing 刷新（该去重机制本为防
-            # 风控流量放大而建）。仍是自己那个 task 才允许删除。
-            if _refresh_inflight.get(acc.id) is task:
-                _refresh_inflight.pop(acc.id, None)
 
     results = await asyncio.gather(*[_one(a) for a in accounts], return_exceptions=True)
     ok = sum(1 for r in results if r is True)
@@ -519,7 +528,19 @@ class QuotaMonitor:
                         if a.mode == "jwt" and a.allows_billing()
                     ]
                     if accounts:
-                        await refresh_accounts(accounts)
+                        res = await refresh_accounts(accounts)
+                        # 全链失败留痕（2026-11-22 迭代二 F2）：此前 monitor 丢弃
+                        # 返回值——出口/网络整体故障时额度快照静默陈旧、按过期
+                        # 数据路由，opslog 零痕迹只能靠用户报障发现。fail 全败
+                        # 级别用 err（告警守护可达），部分失败 warn。
+                        fail = res.get("fail", 0)
+                        if fail >= len(accounts):
+                            logs.err("quota",
+                                     f"后台额度刷新全链失败（{fail}/{len(accounts)}）"
+                                     f"——疑似出口/网络故障，额度快照已陈旧")
+                        elif fail:
+                            logs.warn("quota",
+                                      f"后台额度刷新部分失败（{fail}/{len(accounts)}）")
                 except Exception as err:  # noqa: BLE001 - 后台任务需吞掉异常继续运行
                     logs.err("quota", f"后台刷新出错: {err}")
             # interval<=0 视为关闭：仍周期性回看设置，便于随时启用

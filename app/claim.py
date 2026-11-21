@@ -804,9 +804,14 @@ class ClaimRoundManager:
             return {}
 
     def _persist_holds(self, holds: dict[str, dict[str, int]]) -> None:
-        """增量落库：仅写与影子不同的账号条目（每轮通常 ≤N 条小 JSON）。"""
+        """增量落库：仅写与影子不同的账号条目（每轮通常 ≤N 条小 JSON）；
+        已 pop 的账号同步清盘（2026-11-22 迭代二 F4：否则 meta 键只进不出，
+        重启回读会复活陈旧 holds、键随历史账号单调累积）。"""
         try:
             from .store import store
+            for aid in self._holds_persisted.keys() - holds.keys():
+                store.set_setting(f"{self._HOLDS_META_KEY}:{aid}", "")
+                self._holds_persisted.pop(aid, None)
             for aid, pl in holds.items():
                 if self._holds_persisted.get(aid) != pl:
                     store.set_setting(f"{self._HOLDS_META_KEY}:{aid}",
@@ -851,12 +856,15 @@ class ClaimRoundManager:
         deadline = time.monotonic() + budget if budget > 0 else None
         concurrency = max(1, int(settings.CLAIM_ROUND_CONCURRENCY))
         skipped_by_budget = 0
-        # 轮转公平起点（2026-11-22 review P2 根修）：并发槽 Semaphore(concurrency)
-        # FIFO 下排前的账号先拿槽，预算耗尽时同一批尾部账号每轮都被跳过——
-        # 缺省 19 点单小时窗口 + interval 3600s 下窗口内恰好只跑一轮 = 尾部号
-        # 结构性饥饿 23h。现把上轮预算跳过的账号排到队首（_starved_at 记轮次），
-        # 饥饿不跨轮累积。
-        accounts.sort(key=lambda a: self._starved_at.get(a.id, 0.0))
+        # 轮转公平起点（2026-11-22 review P2 根修；迭代二勘误）：并发槽
+        # Semaphore(concurrency) FIFO 下排前的账号先拿槽，预算耗尽时同一批尾部
+        # 账号每轮都被跳过——缺省 19 点单小时窗口 + interval 3600s 下窗口内恰好
+        # 只跑一轮 = 尾部号结构性饥饿 23h。分区排序把上轮预算跳过的账号排到
+        # 队首（饿号组内按被跳过时刻先后，未饿号保持原序）；账号本轮实际被
+        # 服务（含执行失败）即清除标记 = 「饿一次补一次」，饥饿不跨轮累积。
+        # 迭代二 F1 实证：原先 sort(key=_starved_at.get(a.id, 0.0)) 升序把
+        # 饿号（monotonic 恒正）排到未饿号（0.0）之后，方向恰反 = 修复无效。
+        accounts.sort(key=lambda a: (a.id not in self._starved_at,))
 
         async def _claim_one(acc: Account, acc_holds: dict[str, int]) -> bool:
             """单账号领取段：预算内执行 + 退避表更新 + 入账刷新。返回是否入账。"""
@@ -866,8 +874,11 @@ class ClaimRoundManager:
                 self._starved_at[acc.id] = time.monotonic()
                 logs.info("claim",
                           f"账号 {acc.name} 本轮预算耗尽跳过（轮级预算 "
-                          f"{int(budget)}s 已用完，下拍续领·下轮优先）")
+                          f"{int(budget)}s 已用完，下拍续领·下轮队首优先）")
                 return False
+            # 本号本轮实际被服务（无论领取成败），饥饿标记即消化（饿一次补一次，
+            # 防止历史标记让该号此后每轮永久霸占队首——2026-11-22 迭代二 F5）
+            self._starved_at.pop(acc.id, None)
             if acc_holds:
                 soon = max(0, (min(acc_holds.values()) - now_ms) / 1000)
                 logs.info("claim", f"账号 {acc.name} {len(acc_holds)} 个套餐名额等待中"
@@ -882,6 +893,8 @@ class ClaimRoundManager:
             except TimeoutError:
                 logs.warn("claim",
                           f"账号 {acc.name} 本轮领取超轮级预算被截断（下拍续领）")
+                # 超时截断同属预算饥饿（2026-11-22 迭代二 F1）：下轮同样排队首
+                self._starved_at[acc.id] = time.monotonic()
                 return False
             except Exception as err:  # noqa: BLE001 - 单账号异常不中断整轮
                 logs.warn("claim", f"轮次领取 账号 {acc.name} 异常: {err}")
@@ -930,9 +943,15 @@ class ClaimRoundManager:
                       f"（下拍续领·下轮队首优先）")
         if claimed:
             logs.ok("claim", f"自动领取轮完成: {claimed} 个账号有新套餐入账")
-        # 退避表增量落库（2026-11-22 review P2）：重启不再失忆，等待期套餐
-        # 不因发版/SIGKILL 重启白烧求解+claim 流量
-        self._persist_holds(holds)
+        # 退避表增量落库（2026-11-22 review P2；迭代二 F5 补取消路径）：
+        # 重启不再失忆，等待期套餐不因发版/SIGKILL 重启白烧求解+claim 流量。
+        # finally 收口——优雅重启落在 19 点窗口内时 gather 被 cancel，此前
+        # 本轮已更新的 1005 next_at 全部不落库 = 修复初衷恰好失效。
+        try:
+            self._persist_holds(holds)
+        except asyncio.CancelledError:
+            self._persist_holds(holds)
+            raise
 
     async def _loop(self) -> None:
         from .store import store

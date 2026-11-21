@@ -648,11 +648,18 @@ class Store:
 
     def import_accounts(self, payload: dict) -> int:
         providers = payload.get("providers", {})
+        # 形状闸（2026-11-22 迭代二 F2-3）：畸形 payload（providers 非 dict /
+        # items 含非 dict 元素）此前 AttributeError 中途炸出——已逐条 commit 的
+        # 部分导入无回滚且审计不落。现非法形状计数跳过，导入逐条继续。
+        if not isinstance(providers, dict):
+            return 0
         count = 0
         for provider, items in providers.items():
             if provider not in PROVIDERS or not isinstance(items, list):
                 continue
             for it in items:
+                if not isinstance(it, dict):
+                    continue
                 secret = it.get("secret") or it.get("token") or it.get("jwtToken") or it.get("apiKey")
                 if not secret:
                     continue

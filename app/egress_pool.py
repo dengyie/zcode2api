@@ -414,16 +414,35 @@ class TetherPoolEgress:
         失败终态恢复重试（2026-11-22 review P1 根修）：3+1 轮全败时 TP 绑定
         已遗留在「探针判死或从未探通」的候选上，下一健康轮（默认 300s）前该
         账号所有请求仍走死节点——确认的服务空窗。现失败后立即做一次绕过去抖
-        的恢复轮（短退避后重新 acquire+验收，去抖戳由恢复轮自己的收尾刷新），
-        给故障期的瞬态池抖动一个就地自愈窗口；仍失败才交还健康循环。"""
+        的恢复轮（短退避后重新 acquire+验收），给故障期的瞬态池抖动一个就地
+        自愈窗口；仍失败才交还健康循环。
+
+        绕过去抖的实现（2026-11-22 迭代二根修）：恢复轮前 pop 掉主轮收尾盖的
+        _rebalance_at 戳——本方法已持账号锁（串行点唯一），pop 无并发窗口；
+        恢复轮自身的收尾照常盖戳，成功/失败后仍安静 120s。此前实现未清戳，
+        恢复轮进 _rebalance_locked 即被 120s 去抖闸短路 return False（当日
+        review 迭代二 F1 实证：P1 修复实际失效，测试绿是因为 tp_mode fixture
+        把 DEBOUNCE patch 成 0）。"""
         # TOCTOU 收口：同账号 rebalance 串行（exclude 快照→发布窗口最长 2-3 分钟，
         # 并发触发会互不可见）；跨账号并发无妨——互斥由 exclude_node 保证
+        from . import logs
         async with self._account_lock(account.id):
+            # 去抖预检（2026-11-22 迭代二 F1 收口）：被去抖拦 = 本调用什么
+            # 都没做，直接返回 False,不触发恢复轮——否则恢复轮 pop 戳重跑
+            # 一轮 acquire,去抖语义被架空（迭代二测试实证）。与
+            # _rebalance_locked 入口同一判定（该入口防并发窗口保留不动）。
+            if time.monotonic() - self._rebalance_at.get(account.id, 0) \
+                    < settings.TP_REBALANCE_DEBOUNCE:
+                logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")
+                return False
             ok = await self._rebalance_locked(account, reason, ban)
             if ok:
                 return True
             # 恢复轮：绕过 120s 去抖（去抖防的是背靠背 churn 放大，防不了
             # 「绑定停在死候选」的服务空窗）；恢复轮同样盖收尾去抖戳。
+            # 走到这里 = 主轮真实跑过且失败（去抖拦截已在上方返回），pop 戳
+            # 安全（账号锁串行点唯一）。
+            self._rebalance_at.pop(account.id, None)
             await asyncio.sleep(settings.TP_REBALANCE_RETRY_DELAY)
             retry_ok = await self._rebalance_locked(account,
                                                     reason=reason + "_retry", ban=ban)
@@ -455,8 +474,7 @@ class TetherPoolEgress:
         # rebalance（健康探针判败后的自救）恒被「去抖窗内」吞掉。
         if last is not None and now - last < settings.TP_REBALANCE_DEBOUNCE:
             logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")
-            return False
-        # 去抖位改在函数收尾统一置位（2.7.68：旧实现取「首次 acquire 成功」的
+            return False        # 去抖位改在函数收尾统一置位（2.7.68：旧实现取「首次 acquire 成功」的
         # 入口时刻，4 轮 rebalance 实测 2-3 分钟 > 120s 去抖——首个 rebalance
         # 结束瞬间下一个触发可立即再跑一轮全量 churn）。任一真实 acquire 后
         # 都盖结束时刻戳：成功换绑安静 120s，失败/churn 同样安静 120s。
