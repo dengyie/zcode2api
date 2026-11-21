@@ -149,19 +149,41 @@ def _run_install_sequence_on_start() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _startup_precheck()
-    if settings.REQLOG_PERSIST:
-        restored = reqlog.restore()
-        if restored:
-            logs.ok("reqlog", f"请求监控日志恢复 ×{restored}（持久化开启）")
-    replaced = _backfill_fingerprints()
-    if replaced:
-        logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{len(replaced)}")
-        for acc in replaced:
-            admin_api._schedule_install(acc)
-    installed = _backfill_install_ids()
-    if installed:
-        logs.ok("install", f"存量账号补配安装身份 ×{installed}")
-    plan_guard.warm()  # 冷却表回读+过期行清理前移到启动，调度路径不承担磁盘 I/O
+    # 启动数据面容错（2026-11-22 review P1 根修）：restore/backfill/warm 是
+    # 同步关键段且处理存量落盘数据——reqlog.jsonl 坏行、单条账号畸形字段等
+    # 任意非预期异常原先直接炸 lifespan → supervisor autorestart 崩溃循环，
+    # 与 _start_component 的「单组件失败降级运行」哲学自相矛盾（越靠前的启动
+    # 代码越无保护）。数据面失败降级跳过该步并留痕，启动继续；_startup_precheck
+    # 的版本配对 fail-fast 语义不变（那是发版偏斜守卫，非数据面）。
+    try:
+        if settings.REQLOG_PERSIST:
+            restored = reqlog.restore()
+            if restored:
+                logs.ok("reqlog", f"请求监控日志恢复 ×{restored}（持久化开启）")
+    except Exception as err:  # noqa: BLE001 - 数据面降级，不阻断启动
+        logs.err("lifespan", f"reqlog.restore 失败（跳过恢复，服务继续）: "
+                             f"{type(err).__name__}: {err}")
+    try:
+        replaced = _backfill_fingerprints()
+        if replaced:
+            logs.ok("fingerprint", f"存量账号补配独立设备指纹 ×{len(replaced)}")
+            for acc in replaced:
+                admin_api._schedule_install(acc)
+    except Exception as err:  # noqa: BLE001
+        logs.err("lifespan", f"指纹回填失败（跳过，服务继续）: "
+                             f"{type(err).__name__}: {err}")
+    try:
+        installed = _backfill_install_ids()
+        if installed:
+            logs.ok("install", f"存量账号补配安装身份 ×{installed}")
+    except Exception as err:  # noqa: BLE001
+        logs.err("lifespan", f"安装身份回填失败（跳过，服务继续）: "
+                             f"{type(err).__name__}: {err}")
+    try:
+        plan_guard.warm()  # 冷却表回读+过期行清理前移到启动，调度路径不承担磁盘 I/O
+    except Exception as err:  # noqa: BLE001
+        logs.err("lifespan", f"plan_guard 预热失败（跳过，服务继续）: "
+                             f"{type(err).__name__}: {err}")
     # env 钉死告警（2.7.68 review P3）：admin_key 首启写库后 env 轮换静默失效
     # ——「以为换了锁其实没换」。启动时对账一条 warn。
     try:
@@ -199,6 +221,11 @@ async def lifespan(app: FastAPI):
         pending.update(admin_api._login_followup_tasks)
         pending.update(admin_api._claim_job_tasks)
         pending.update(install._install_tasks)
+        # gateway fire-and-forget 任务收编（2026-11-22 review P2 根修）：原先
+        # 只收 admin/install，gateway._bg_tasks（verify_then_rebalance 等，内含
+        # 分钟级 rebalance）漏出清单——停机硬砍落在「TP 已 force_rebalance、
+        # hub 未持久化」窗口，记录分叉要等 1800s reconcile 才自愈。
+        pending.update(gateway._bg_tasks)
         if _install_task is not None and not _install_task.done():
             pending.add(_install_task)
         if pending:

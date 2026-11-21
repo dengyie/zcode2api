@@ -58,6 +58,10 @@ _sleep = asyncio.sleep  # 模块级引用：测试可 patch 此名而免污染�
 router = APIRouter()
 
 MAX_CAPTCHA_RETRIES = 3
+# 单请求全局求解预算（2026-11-22 review P2）：跨账号不重置。池空现解 10-40s/
+# 枚，无全局上界时 5 账号 × 3 次 = 15 次求解可拖 5-20 分钟；取 6 = 每账号
+# 3 次的 2 倍，正常单账号内可完成，跨号滥用被砍。
+MAX_CAPTCHA_SOLVES_PER_REQUEST = 6
 MAX_ACCOUNT_ATTEMPTS = 5
 
 # 常量收口：模型表与被拒信号关键字统一在 app/constants.py
@@ -896,7 +900,17 @@ _bg_tasks: set[asyncio.Task] = set()
 def _spawn_bg(coro) -> None:
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+    # 异常留痕（2026-11-22 review P3 根修）：discard 回调不查异常，rebalance/
+    # verify_then_rebalance 内层逃逸的异常（历史 AttributeError 事故同形态）
+    # 会静默消失零归因。CancelledError 属正常停机不告警。
+    def _done(t: asyncio.Task) -> None:
+        _bg_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logs.err("gateway", f"后台任务异常退出: {exc!r}")
+    task.add_done_callback(_done)
 
 
 # 账号并发限制：account_id → 在飞请求数。asyncio 单线程事件循环下
@@ -984,6 +998,20 @@ def _note_pool_exhausted(trigger: Account | None = None) -> None:
         return  # 不可判定 → 放行，让真实请求去定生死
     if any(v == 0.0 for v in verdicts):
         return  # 任一号当前可用 → 不拦（-1.0 = 枯竭但无未来窗口，照拦）
+    # EXHAUSTED 号的恢复探查补链（2026-11-22 review P2 根修）：EXHAUSTED 号有
+    # 枯竭证据（verdict 非 None）不进上面的 stale 列表，恢复唯一来源 = quota
+    # monitor 定时刷新。monitor 被后台关闭（quota_refresh_interval=0）时刷新
+    # 链断 → EXHAUSTED 号被 select 滤掉永远等不到真实请求触发 exhaust 分支
+    # → 恢复死锁。到达本行 = 全池确认枯竭，对 EXHAUSTED 号做同款节流 spawn
+    # （与 stale 共用 _pool_probe_last 限频），任何配置下恢复链都有兜底来源。
+    now = time.time()
+    for a in accounts:
+        if a.status == Status.EXHAUSTED and a.mode == "jwt" and a.allows_billing():
+            last_probe = _pool_probe_last.get(a.id, 0.0)
+            if now - last_probe < settings.GATE_POOL_PROBE_MIN_SECONDS:
+                continue
+            _pool_probe_last[a.id] = now
+            _spawn_bg(_safe_refresh(a))
     future = [v for v in verdicts if v > 0]
     next_start = min(future) if future else -1.0
     now = time.time()
@@ -1208,6 +1236,12 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
     channel_idx = 0
     channel = ladder[0]
     captcha_retries = 0
+    # 单请求全局补码预算（2026-11-22 review P2 根修）：MAX_CAPTCHA_RETRIES 是
+    # 每账号上限，换号后从 0 起算——5 账号 × 3 次 = 单请求最多 15 次求解，
+    # 池空现解 10-40s/枚，极端形态（出口被持续要求验证码）单请求拖 5-20 分钟
+    # 白烧求解预算。进程级计数换号不重置：吃满即拒（对齐 CaptchaSolveError
+    # 的 500 兜底回执），请求侧止损优先。
+    captcha_solves_total = 0
     retries_429 = 0
     retries_5xx = 0
     model_name = str(body.get("model") or "-")
@@ -1282,6 +1316,19 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                     return _NEXT_ACCOUNT
                 _park_slot(slot_box)
                 try:
+                    # 全局求解预算闸（2026-11-22 review P2）：换号不重置，吃满
+                    # 即止——单请求对求解链的消耗有进程级上界。
+                    if captcha_solves_total >= MAX_CAPTCHA_SOLVES_PER_REQUEST:
+                        logs.warn(req_id,
+                                  f"单请求求解预算耗尽（{captcha_solves_total} 次），"
+                                  f"不再白烧——返回验证码错误")
+                        reqlog.finish_error(req_id, "人机校验求解预算耗尽", status=500)
+                        return JSONResponse(
+                            {"error": {"message": "无法完成人机校验（求解预算耗尽）",
+                                       "type": "captcha_error"}},
+                            status_code=500,
+                        )
+                    captcha_solves_total += 1
                     # 验证码必须与本次 Plan 请求同出口：token 由某出口签发后，
                     # 换出口使用会被上游判 unusual activity（3012）。per-account
                     # 模式下 = 账号绑定代理（token 出口 = 请求出口）。

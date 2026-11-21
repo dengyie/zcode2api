@@ -3,7 +3,7 @@
 设计要点：
 - 内存 deque 上限 KEEP 条为主读路径（snapshot 零锁竞争外的开销），保证实时观测
 - 可选持久化（ZCODE_REQLOG_PERSIST=1）：每条终态追加写 JSONL（write-only，
-  无跨进程锁需求，NFS /data 安全），启动时回读尾部 ≤KEEP 条恢复 —— 重启不清零
+  无跨进程锁需求，本地盘安全），启动时回读尾部 ≤KEEP 条恢复 —— 重启不清零
 - 日切：文件侧 _current_day 判据（打开/轮转时更新），启动时与运行中跨天轮转
   reqlog.jsonl.1（保留一代，轮转只发生一次，昨日数据不丢）
 - 启动恢复含 .1 尾部：跨日重启后页面仍可见昨日数据（总条数受 KEEP 约束）
@@ -221,7 +221,7 @@ def _persist(entry: dict) -> None:
         fh.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
         fh.flush()
     except OSError as err:
-        # 写失败（磁盘满/NFS 抖动）：丢弃本条，句柄作废，下次请求重试打开
+        # 写失败（磁盘满/IO 抖动）：丢弃本条，句柄作废，下次请求重试打开
         logs.err("reqlog", f"持久化写入失败（丢弃本条，下次重试）: {err}")
         try:
             fh.close()

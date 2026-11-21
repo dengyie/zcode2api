@@ -192,7 +192,9 @@ def clear_account(account_id: str) -> None:
     billing 刷新**不要**走这里——billing 只能证明「有窗口可用」的模型恢复了，
     证明不了其它模型没耗尽（2.7.30 review 整改）。
     """
-    keys = [k for k in _plan_model_exhausted if k.split("\n", 1)[0] == account_id]
+    with _lock:  # 2026-11-22 review P3：补锁对齐 note/clear 自身锁纪律表述
+        keys = [k for k in _plan_model_exhausted if k.split("\n", 1)[0] == account_id]
+        for k in keys:
+            _plan_model_exhausted.pop(k, None)
     for k in keys:
-        _plan_model_exhausted.pop(k, None)
         _persist(k, None)

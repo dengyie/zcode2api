@@ -419,6 +419,10 @@ class Account:
                 # 设置 cooling_until，但若未来路径漏配，COOLING+None 原先恒
                 # False = 该号永久不可选且无自愈。按「冷却未知 → 立即视为到期」
                 # 处理：宁可放进池子被上游教育，也不要永久蒸发一个号。
+                # 触发留痕（2026-11-22 review P3）：防御被触发 = 存在漏配写入方
+                # （该形态会同步绕过风控退避：is_cooling 也判 False → 请求成功
+                # 即清 strikes 洗回 ACTIVE），一次性 warn 让漏配可见。
+                self._warn_cooling_until_none()
                 return True
             return bool(now >= self.cooling_until)
         return True
@@ -434,9 +438,24 @@ class Account:
             return False
         now = now or time.time()
         if self.cooling_until is None:
-            # 与 is_selectable 同款防御：COOLING+None 视为冷却已到期
+            # 与 is_selectable 同款防御：COOLING+None 视为冷却已到期（留痕见上）
+            self._warn_cooling_until_none()
             return False
         return bool(now < self.cooling_until)
+
+    _COOLING_NONE_WARNED: bool = False
+
+    @classmethod
+    def _warn_cooling_until_none(cls) -> None:
+        """COOLING+cooling_until=None 防御分支被触发的进程级一次性告警
+        （对齐 logs._HOURS_WARNED 去重模式）：现行写入方全部成对设置（2026-11-22
+        复核），触发即意味着出现了新的漏配写入方。"""
+        if not cls._COOLING_NONE_WARNED:
+            cls._COOLING_NONE_WARNED = True
+            from . import logs
+            logs.warn("models",
+                      "检测到 COOLING 状态且 cooling_until=None（防御兜底触发，"
+                      "视为已到期放行/未冷却）——存在漏配冷却写入方，请排查")
 
     def plan_kind(self) -> str:
         """当前套餐类型：start-plan（体验/免费档）/ coding-plan / ""（未知）。

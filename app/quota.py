@@ -483,7 +483,12 @@ async def refresh_accounts(accounts: list[Account]) -> dict:
         except Exception:  # noqa: BLE001
             return False
         finally:
-            _refresh_inflight.pop(acc.id, None)
+            # 条件删除（2026-11-22 review P3 根修）：无条件 pop 存在「创建者
+            # 被取消 → finally 弹掉另一入口刚登记的新 task」竞态——第三个
+            # 调用方 miss 再建 = 同账号双路 billing 刷新（该去重机制本为防
+            # 风控流量放大而建）。仍是自己那个 task 才允许删除。
+            if _refresh_inflight.get(acc.id) is task:
+                _refresh_inflight.pop(acc.id, None)
 
     results = await asyncio.gather(*[_one(a) for a in accounts], return_exceptions=True)
     ok = sum(1 for r in results if r is True)
@@ -530,9 +535,17 @@ class QuotaMonitor:
             self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
+        """停止后台轮（2026-11-22 review P3 收口对齐）：事件置位 + 有界等待，
+        超时 cancel——对齐 claim_round.stop 的收口契约，_loop 卡在长刷新时
+        lifespan 收口不被拖死。"""
         self._stop.set()
         if self._task:
-            await asyncio.gather(self._task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(self._task, timeout=10.0)
+            except TimeoutError:
+                pass  # wait_for 已在截止时 cancel 并等待收尾
+            except asyncio.CancelledError:
+                pass
             self._task = None
 
 

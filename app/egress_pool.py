@@ -52,9 +52,11 @@ def _tp_http(method: str, url: str, body=None, headers=None, timeout: float = 15
                                  headers=headers or {})
     try:
         with _NOPROXY.open(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
+            # read 封顶 1MB（2026-11-22 review P3）：TP 是本机内网服务，正常
+            # 响应远小于此；异常巨型 body 不再无界占内存。
+            return r.status, r.read(1024 * 1024).decode("utf-8", "replace"), dict(r.headers)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace"), dict(e.headers or {})
+        return e.code, e.read(1024 * 1024).decode("utf-8", "replace"), dict(e.headers or {})
     except Exception as exc:
         return 0, f"{type(exc).__name__}: {exc}", {}
 
@@ -83,6 +85,11 @@ def _alicdn_fetch(proxy_url: str, timeout: float,
         req = urllib.request.Request(
             ALICDN_PROBE_URL, method="GET",
             headers={"User-Agent": "ZCode/3.17.2"})
+        # 总时长硬上限（2026-11-22 review P2 根修）：socket timeout 是 per-op
+        # 语义，慢滴流（劣化/劫持路由按 1KB/s 滴整文件）可把单次验收拉到
+        # 无界——账号锁被长期持有、放大 stop() 收口压力。deadline 取 timeout
+        # 的 2 倍（正常整文件 ~1MB 快节点 <5s，慢节点靠 deadline 兜底判死）。
+        deadline = time.monotonic() + timeout * 2
         with _opener(proxy_url).open(req, timeout=timeout) as r:
             if full:
                 # 整文件读封顶 4MB（2026-11-18 review P3）：AliyunCaptcha.js
@@ -90,6 +97,8 @@ def _alicdn_fetch(proxy_url: str, timeout: float,
                 # 超限即不合格——正常文件远小于此。
                 total = 0
                 while True:
+                    if time.monotonic() > deadline:
+                        return 0, f"probe deadline {timeout * 2:.0f}s exceeded"
                     chunk = r.read(65536)
                     if not chunk:
                         break
@@ -277,7 +286,18 @@ async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
         None, _tp_headers(), 15)
     if st == 200:
         try:
-            for a in json.loads(raw):
+            loaded = json.loads(raw)
+            # 畸形形态守卫（2026-11-22 review P2）：TP 返 200 但 body 是 dict/
+            # null/字符串时，for a in <非 list> 会抛 TypeError/AttributeError
+            # 逃逸出本函数——此前只捕 ValueError，快照层无防护 = 每次 rebalance
+            # 在快照处崩、换绑链路集体哑火。非 list 一律按「快照不可用」处理
+            # （fail-open 与拉取失败同语义）。
+            rows = loaded if isinstance(loaded, list) else None
+            if rows is None:
+                raise ValueError(f"快照形态异常: {type(loaded).__name__}")
+            for a in rows:
+                if not isinstance(a, dict):
+                    continue
                 allocs[a.get("account_id")] = a.get("node_name") or ""
         except ValueError:
             pass
@@ -287,11 +307,18 @@ async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
         None, _tp_headers(), 15)
     if st == 200:
         try:
+            loaded = json.loads(raw)
+            # 同上（2026-11-22 review P2）：非 list 一律按快照不可用处理
+            rows = loaded if isinstance(loaded, list) else None
+            if rows is None:
+                raise ValueError(f"隔离台账形态异常: {type(loaded).__name__}")
             # now 取 aware 本地时；台账时间 naive 视为本地（TP 与 hub 同机）、
             # aware astimezone 归一——避免 aware/naive 相减抛 TypeError 使整个
             # 快照崩掉（2026-11-18 review P3）。
             now = _dt.datetime.now().astimezone()
-            for b in json.loads(raw):
+            for b in rows:
+                if not isinstance(b, dict):
+                    continue
                 until = b.get("quarantined_until")
                 if not until:
                     continue
@@ -382,11 +409,30 @@ class TetherPoolEgress:
 
     async def rebalance(self, account, reason: str, ban: bool = True) -> bool:
         """换该账号的 TP 绑定节点：可选 ban 旧节点 → force_rebalance（最多
-        3 轮，每轮即时探针验证）→ 成功更新 egress_node 并持久化。"""
+        3 轮，每轮即时探针验证）→ 成功更新 egress_node 并持久化。
+
+        失败终态恢复重试（2026-11-22 review P1 根修）：3+1 轮全败时 TP 绑定
+        已遗留在「探针判死或从未探通」的候选上，下一健康轮（默认 300s）前该
+        账号所有请求仍走死节点——确认的服务空窗。现失败后立即做一次绕过去抖
+        的恢复轮（短退避后重新 acquire+验收，去抖戳由恢复轮自己的收尾刷新），
+        给故障期的瞬态池抖动一个就地自愈窗口；仍失败才交还健康循环。"""
         # TOCTOU 收口：同账号 rebalance 串行（exclude 快照→发布窗口最长 2-3 分钟，
         # 并发触发会互不可见）；跨账号并发无妨——互斥由 exclude_node 保证
         async with self._account_lock(account.id):
-            return await self._rebalance_locked(account, reason, ban)
+            ok = await self._rebalance_locked(account, reason, ban)
+            if ok:
+                return True
+            # 恢复轮：绕过 120s 去抖（去抖防的是背靠背 churn 放大，防不了
+            # 「绑定停在死候选」的服务空窗）；恢复轮同样盖收尾去抖戳。
+            await asyncio.sleep(settings.TP_REBALANCE_RETRY_DELAY)
+            retry_ok = await self._rebalance_locked(account,
+                                                    reason=reason + "_retry", ban=ban)
+            if retry_ok:
+                from . import logs
+                logs.ok("egress_pool",
+                        f"{account.name} rebalance 恢复轮换绑成功"
+                        f"（首轮失败终态已就地自愈）")
+            return retry_ok
 
     async def _rebalance_locked(self, account, reason: str, ban: bool) -> bool:
         from . import logs
@@ -464,6 +510,17 @@ class TetherPoolEgress:
                     await self._align_binding_with_tp(account, own_aid)
                     return False
                 node = d.get("node_name")
+                if not node:
+                    # node_name 缺失守卫（2026-11-22 review P2 根修）：此前仅
+                    # 第 4 轮有 `d.get("node_name")` 检查，前 3 轮 TP 返 200 但
+                    # JSON 无 node_name 时 node=None 直接落入后续分支——
+                    # `node == old_node` False、探针照跑、JSON-APP 时把
+                    # egress_node 写成 None 并 ban 掉原节点。缺失 = 分配器
+                    # 异常响应，换下一个候选（本轮已盖 exclude，不重收同一响应）。
+                    logs.warn("egress_pool",
+                              f"{account.name} rebalance#{attempt} 响应缺 node_name"
+                              f"（分配器异常）——换下一个候选")
+                    continue
                 if node and node not in exclude:
                     exclude.append(node)  # 轮内已否决的候选不再回收（防 3 轮打转）
                 exit_ip = d.get("exit_ip")
@@ -513,6 +570,12 @@ class TetherPoolEgress:
                               f"{account.name} 探针连接失败（{raw[:100]}）——换下一个候选")
                     continue
                 kind = _edge_kind(raw)
+                # JSON-APP = 探针放行，不看 status（2026-11-22 review 复核后
+                # 回退当日误修）：上游常以 405/401+JSON 承载账号级响应（3012
+                # 风控/鉴权失败），能拿到 JSON 恰恰证明请求已穿过节点抵达
+                # zcode app——链路通，节点没死。账号级问题换绑治不了，status
+                # 守卫只会把风控号逼成无谓 rebalance churn（26 处测试以
+                # 405+3012 JSON 为放行形态，是线上实证口径）。
                 if kind == "JSON-APP":
                     # alicdn 维度验收（2026-11-18 1117 全灭复盘）：zcode 探针放行
                     # ≠ 验证码 SDK 路由可用——alicdn 不合格的候选直接换下一个，
@@ -647,7 +710,12 @@ class TetherPoolEgress:
     async def _align_binding_with_tp(self, account, own_aid: str) -> None:
         """hub 记录对齐 TP 实际绑定（2.7.68）：force_rebalance 已在 TP 侧移动
         绑定而 hub 未记录（round≥2 acquire 失败/网关熔断等退出路径），分叉会让
-        exclude 集合与 ban 目标失真。快照拉取失败保持原值（fail-open）。"""
+        exclude 集合与 ban 目标失真。快照拉取失败保持原值（fail-open）。
+
+        落库异常内吞（2026-11-22 review P3 根修）：try 原先只包住快照调用，
+        store.update_account 抛（磁盘抖动/锁超时）会沿 verify_then_rebalance
+        → gateway._spawn_bg 任务静默死亡（discard 回调不记日志），且其后的
+        egress.clear_conn_fails 被跳过——聚类残留放大下次 rebalance 触发面。"""
         from . import logs
         from .store import store
         try:
@@ -661,7 +729,12 @@ class TetherPoolEgress:
                       f"{account.name} hub 记录对齐 TP 实际绑定："
                       f"{account.egress_node} → {node}")
             account.egress_node = node
-            store.update_account(account)
+            try:
+                store.update_account(account)
+            except Exception as exc:  # noqa: BLE001 - 对齐失败不炸调用链
+                logs.warn("egress_pool",
+                          f"{account.name} 绑定对齐落库失败（内存已对齐，"
+                          f"下轮巡检重试）: {exc!r}")
 
     async def verify_then_rebalance(self, account, reason: str) -> None:
         """连接失败触发器（gateway 调用）：先探针验证绑定节点，探针通 = 链路
@@ -719,7 +792,13 @@ class TetherPoolEgress:
         """轻探针：Plan 通道经该账号网关 URL（与 rebalance 同一零 strike 口径，
         3012 JSON = 节点通、边缘放行）。连接级失败/边缘 HTML/alicdn 路由超标
         （2026-11-18 新增维度，喂 _check_account 的 streak → rebalance）=
-        不健康。"""
+        不健康。
+
+        不看 HTTP status（2026-11-22 review 复核后回退当日误修）：401 JSON
+        （空 jwt/apiKey 回退）同样证明请求已抵达 zcode app——账号凭证问题
+        归 gateway/quota 管，换绑治不了；status 守卫会把凭证缺陷误归因成
+        节点故障触发 churn。链路健康的证据 = JSON 形态（非边缘 HTML）+
+        alicdn 路由合格，与 status 无关。"""
         proxy = egress.account_proxy(account)
         st, raw = await self._probe_via(account, proxy, account.jwt_token or "")
         if st == 0 or _edge_kind(raw) != "JSON-APP":
@@ -846,6 +925,26 @@ class TetherPoolEgress:
                                 if egress.tetherpool_enabled_for(a)]
                     if not accounts:
                         continue
+                    # alicdn 系统性故障熔断（2026-11-22 review P2 根修，1117
+                    # 事故同形态）：alicdn 全局劣化时全账号 streak 连败 → 全池
+                    # 每 300s 重复 churn 捶 TP 分配器。整池连败 ≥ 全账号数一半
+                    # 时判定为环境级故障，本轮降级为「只记 streak 不 rebalance」，
+                    # 并打归因告警——节点各自随机坏不会恰好同轮全败。
+                    if len(accounts) >= 2:
+                        _sample = await self.health_once(accounts[0])
+                        if not _sample:
+                            env_fail = not await self.health_once(accounts[-1])
+                        else:
+                            env_fail = False
+                        if env_fail:
+                            logs.warn("egress_pool",
+                                      "[health] 抽样首尾账号探针同轮全败——疑似"
+                                      "系统性故障（alicdn/上游全局劣化），本轮全账号"
+                                      "降级只记 streak 不 rebalance")
+                            for account in accounts:
+                                streak = self._probe_fail_streak.get(account.id, 0) + 1
+                                self._probe_fail_streak[account.id] = streak
+                            continue
                     for account in accounts:
                         task = asyncio.create_task(self._check_account(account))
                         self._inflight.add(task)
@@ -874,6 +973,11 @@ class TetherPoolEgress:
     def start(self) -> None:
         if self._loop_task is None or self._loop_task.done():
             self._loop_task = asyncio.create_task(self._loop())
+            # 常驻循环 done_callback（2026-11-22 review P3）：两循环体虽全兜，
+            # 但未预见的异常类若逃逸，无回调 = 进程内静默失去健康循环零日志；
+            # 挂回调后异常在 Task 收尾时打「Task exception was never retrieved」
+            # 到 stderr，观测面闭合。循环体 CancelledError 正常传播不受影响。
+            self._loop_task.add_done_callback(self._log_loop_crash)
             if settings.TP_ORPHAN_RECONCILE:
                 task = asyncio.create_task(self._reconcile_once())
                 self._inflight.add(task)
@@ -883,6 +987,11 @@ class TetherPoolEgress:
                 if self._reconcile_loop_task is None or self._reconcile_loop_task.done():
                     self._reconcile_loop_task = asyncio.create_task(
                         self._reconcile_loop())
+                if self._reconcile_loop_task is None or self._reconcile_loop_task.done():
+                    self._reconcile_loop_task = asyncio.create_task(
+                        self._reconcile_loop())
+                    self._reconcile_loop_task.add_done_callback(
+                        self._log_loop_crash)
         # tier 泄漏巡检（2026-11-21 P3）：启动期与孤儿对账并跑一次。
         # 运行期不循环——tp_acquire 已显式上送 tier，运行中新增分配破约
         # 只可能来自外部改绑（手工/TP 侧），每次 hub 重启巡检一次足够，
@@ -890,6 +999,21 @@ class TetherPoolEgress:
         task = asyncio.create_task(self._audit_tier_once())
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
+
+    @staticmethod
+    def _log_loop_crash(task: asyncio.Task) -> None:
+        """常驻循环意外死亡留痕（done_callback）：CancelledError 属正常停机
+        不告警；真实异常从 stop()/start() 侧 restart 视角可见，此处只留痕。"""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            try:
+                from . import logs
+                logs.err("egress_pool",
+                         f"常驻循环意外退出（需重启进程恢复）: {exc!r}")
+            except Exception:  # noqa: BLE001 - 日志通道自兜
+                pass
 
     async def _reconcile_once(self, initial_delay: float = 10) -> None:
         """启动时 TP 分配对账（2.7.68 孤儿清理 + 2026-11-21 共占巡检/记录对齐）：
@@ -960,18 +1084,34 @@ class TetherPoolEgress:
                 if not tp_node:
                     continue  # 无 TP 分配（灰度/listeners 语义），不巡
                 if a.egress_node and a.egress_node != tp_node:
-                    # ② 记录漂移：以地面真值为准对齐（auto_rehome/降级路径换的）
-                    logs.warn("egress_pool",
-                              f"[reconcile] {a.name} hub 记录漂移对齐: "
-                              f"{a.egress_node} → {tp_node}（TP 实际绑定）")
-                    a.egress_node = tp_node
-                    store.update_account(a)
-                    drifted += 1
+                    # ② 记录漂移：以地面真值为准对齐（auto_rehome/降级路径换的）。
+                    # 陈旧快照回写竞态收口（2026-11-22 review P2 根修）：快照
+                    # 拉取到遍历期间并发 rebalance 可能已提交新节点 Y，此处用
+                    # 旧快照值 X 回写会把 hub 记录倒退——对齐写持账号锁，且
+                    # 锁内重拉单账号地面真相（复用 rebalance 同款快照）以现值
+                    # 为准；重查失败/为空 fail-open 跳过本轮对齐。
+                    async with self._account_lock(a.id):
+                        fresh_allocs, _fb = await _tp_live_snapshot()
+                        fresh = fresh_allocs.get("zh-" + a.id)
+                        if not fresh:
+                            logs.warn("egress_pool",
+                                      f"[reconcile] {a.name} 漂移复核快照不可用"
+                                      f"——跳过本轮对齐（fail-open）")
+                            continue
+                        if a.egress_node and a.egress_node != fresh:
+                            logs.warn("egress_pool",
+                                      f"[reconcile] {a.name} hub 记录漂移对齐: "
+                                      f"{a.egress_node} → {fresh}（TP 实际绑定，锁内复核）")
+                            a.egress_node = fresh
+                            store.update_account(a)
+                            drifted += 1
                 others = [x for x in node_holders.get(tp_node, [])
                           if x != "zh-" + a.id]
                 if others:
                     # ③ 共占存量：强制换绑本账号（持有者少的让位语义不重要——
-                    # 双方都会被巡检各自 rebalance，互斥收敛）
+                    # 双方都会被巡检各自 rebalance，互斥收敛）。rebalance 内部
+                    # 自持账号锁 + 收货快照复核，陈旧快照触发的共占在 rebalance
+                    # 的 ground_truth_recheck 处自然消解（候选已不共占则放行）。
                     co_occupied += 1
                     logs.warn("egress_pool",
                               f"[reconcile] {a.name} 节点 {tp_node} 与其它分配共占"
@@ -1048,9 +1188,17 @@ class TetherPoolEgress:
                 pass
             self._reconcile_loop_task = None
         if self._inflight:
-            await asyncio.gather(
-                *(t for t in self._inflight if not t.done()),
-                return_exceptions=True)
+            # 收口带硬超时（2026-11-22 review P1 根修）：单只 check 任务的
+            # rebalance 链（4 轮 acquire×20s + 探针×40s + alicdn 整文件×12s）
+            # 最坏数分钟，无界 gather 会拖住整个 lifespan 收口 → supervisor
+            # 超时 SIGKILL 硬砍（恰好制造「TP 已动、hub 未落库」窗口）。先给
+            # 宽限自然完成，超时 cancel 再收尸。
+            tasks = [t for t in self._inflight if not t.done()]
+            if tasks:
+                _done, still = await asyncio.wait(tasks, timeout=10.0)
+                for t in still:
+                    t.cancel()
+                await asyncio.gather(*still, return_exceptions=True)
 
 
 egress_pool = TetherPoolEgress()

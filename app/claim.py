@@ -765,10 +765,55 @@ class ClaimRoundManager:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
-        # 账号 → {plan_id: 名额恢复时间(ms)}：1005 退避记忆（仅轮次路径使用）
-        self._claim_holds: dict[str, dict[str, int]] = {}
+        # 账号 → {plan_id: 名额恢复时间(ms)}：1005 退避记忆（仅轮次路径使用）。
+        # 落库持久化（2026-11-22 review P2 根修）：纯内存态重启即失忆——按
+        # plan_guard 2.7.55 对「重启失忆」的定性与一晚 9 次 SIGKILL 重启史，
+        # 每次重启都会对全部 1005 等待期套餐重发 claim（烧一枚验证码求解 +
+        # 一次 billing/claim POST 后重收 1005）。落 store meta，启动回读。
+        self._claim_holds: dict[str, dict[str, int]] = self._load_holds()
+        self._holds_persisted: dict[str, dict[str, int]] = {}  # 已落库影子（增量写盘）
+        # 账号 → 上次被预算跳过的 monotonic 时刻（轮转公平排序键，2026-11-22）
+        self._starved_at: dict[str, float] = {}
         # 无可服务账号的告警只在状态变化时发（持续故障期不逐轮刷屏）
         self._empty_warned = False
+
+    # ── 1005 退避表持久化（2026-11-22 review P2）───────────────────────────
+    _HOLDS_META_KEY = "claim_holds_1005"
+
+    def _load_holds(self) -> dict[str, dict[str, int]]:
+        """启动回读 1005 退避表（per-account meta 键）；损坏/缺失按空表处理
+        （幂等重探一次可接受）。"""
+        try:
+            from .store import store
+            out: dict[str, dict[str, int]] = {}
+            for key, val in store.all_settings().items():
+                if not key.startswith(f"{self._HOLDS_META_KEY}:"):
+                    continue
+                aid = key.split(":", 1)[1]
+                if not val:
+                    continue
+                try:
+                    pl = json.loads(str(val))
+                except ValueError:
+                    continue
+                if isinstance(pl, dict):
+                    out[aid] = {str(k): int(v) for k, v in pl.items()
+                                if isinstance(v, (int, float))}
+            return out
+        except Exception:  # noqa: BLE001 - 持久层故障不阻断启动
+            return {}
+
+    def _persist_holds(self, holds: dict[str, dict[str, int]]) -> None:
+        """增量落库：仅写与影子不同的账号条目（每轮通常 ≤N 条小 JSON）。"""
+        try:
+            from .store import store
+            for aid, pl in holds.items():
+                if self._holds_persisted.get(aid) != pl:
+                    store.set_setting(f"{self._HOLDS_META_KEY}:{aid}",
+                                      json.dumps(pl, separators=(",", ":")) if pl else "")
+                    self._holds_persisted[aid] = dict(pl)
+        except Exception as err:  # noqa: BLE001 - 落库失败退化为旧行为（内存态）
+            logs.warn("claim", f"1005 退避表落库失败（本轮内存态继续）: {err}")
 
     async def _round(self) -> None:
         from .quota import refresh_accounts
@@ -801,20 +846,27 @@ class ClaimRoundManager:
         self._claim_holds = holds
         # 轮级 wall-clock 预算（2.7.68）：单号最坏 ≈90 分钟（求解长尾 × 换绑链），
         # 11 号串行会把 19-23 点窗口吃穿（三晚 0 成功的结构性放大器）。预算到点
-        # 后剩余账号本轮跳过（下拍自然续领），保证轮在窗口内收尾。
+        # 后剩余账号本轮跳过（下拍续领），保证轮在窗口内收尾。
         budget = float(settings.CLAIM_ROUND_BUDGET or 0)
         deadline = time.monotonic() + budget if budget > 0 else None
         concurrency = max(1, int(settings.CLAIM_ROUND_CONCURRENCY))
         skipped_by_budget = 0
+        # 轮转公平起点（2026-11-22 review P2 根修）：并发槽 Semaphore(concurrency)
+        # FIFO 下排前的账号先拿槽，预算耗尽时同一批尾部账号每轮都被跳过——
+        # 缺省 19 点单小时窗口 + interval 3600s 下窗口内恰好只跑一轮 = 尾部号
+        # 结构性饥饿 23h。现把上轮预算跳过的账号排到队首（_starved_at 记轮次），
+        # 饥饿不跨轮累积。
+        accounts.sort(key=lambda a: self._starved_at.get(a.id, 0.0))
 
         async def _claim_one(acc: Account, acc_holds: dict[str, int]) -> bool:
             """单账号领取段：预算内执行 + 退避表更新 + 入账刷新。返回是否入账。"""
             nonlocal skipped_by_budget
             if deadline is not None and time.monotonic() >= deadline:
                 skipped_by_budget += 1
+                self._starved_at[acc.id] = time.monotonic()
                 logs.info("claim",
                           f"账号 {acc.name} 本轮预算耗尽跳过（轮级预算 "
-                          f"{int(budget)}s 已用完，下拍续领）")
+                          f"{int(budget)}s 已用完，下拍续领·下轮优先）")
                 return False
             if acc_holds:
                 soon = max(0, (min(acc_holds.values()) - now_ms) / 1000)
@@ -874,9 +926,13 @@ class ClaimRoundManager:
         await asyncio.gather(*[_worker(acc) for acc in accounts], return_exceptions=True)
         if skipped_by_budget:
             logs.info("claim",
-                      f"本轮 {skipped_by_budget} 个账号因轮级预算耗尽未执行（下拍续领）")
+                      f"本轮 {skipped_by_budget} 个账号因轮级预算耗尽未执行"
+                      f"（下拍续领·下轮队首优先）")
         if claimed:
             logs.ok("claim", f"自动领取轮完成: {claimed} 个账号有新套餐入账")
+        # 退避表增量落库（2026-11-22 review P2）：重启不再失忆，等待期套餐
+        # 不因发版/SIGKILL 重启白烧求解+claim 流量
+        self._persist_holds(holds)
 
     async def _loop(self) -> None:
         from .store import store

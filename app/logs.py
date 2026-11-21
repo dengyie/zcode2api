@@ -5,7 +5,7 @@ stdout 彩色行 = 人眼实时观测（supervisor out.log，版式 2026-11-14 �
 字段化），跨日排查不再受 out.log 10MB 轮转截断影响。
 
 落盘设计对齐 reqlog.py 成熟模式（write-only 追加、文件侧日切、.1 轮转
-保留一代、写失败降级不影响主链路、NFS /data 安全）。开关
+保留一代、写失败降级不影响主链路、本地盘安全）。开关
 ZCODE_OPSLOG_PERSIST（默认开）；关闭时零开销（一个布尔短路）。
 
 排障口径（2.7.58-61 领取失败潮实战提炼）：
@@ -69,7 +69,7 @@ def _stamp() -> str:
 def _opslog(level: str, tag: str, msg: str) -> None:
     """事件行落盘 opslog.jsonl（write-only 追加；日切 + .1 轮转保留一代）。
 
-    任何失败都静默吞掉（磁盘满/NFS 抖动 → 丢弃本条、句柄作废、下条重试）：
+    任何失败都静默吞掉（磁盘满/IO 抖动 → 丢弃本条、句柄作废、下条重试）：
     观测组件绝不影响主链路。stdout print 本身已是第一通道，这里只做增强。
     """
     global _fh, _current_day, _enabled, _path, _last_flush
@@ -118,13 +118,16 @@ def _opslog(level: str, tag: str, msg: str) -> None:
                 _fh = _path.open("a", encoding="utf-8")
                 _current_day = today
             _fh.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
-            # 批量 flush（2026-11-21 review P2）：opslog 每条事件一次 flush 在
-            # NFS /data 上是一次网络往返，且 _opslog 跑在事件循环线程——高频
-            # warn/info 时直接卡热路径。改为「行缓冲累计 + 节流落盘」：距上次
-            # flush 超过 _FLUSH_INTERVAL 秒才 flush；进程退出由 shutdown_flush
-            # 收口（对齐 reqlog 的「观测不影响主链路」承诺）。
+            # 批量 flush（2026-11-21 review P2）+ 关键行立即冲刷（2026-11-22
+            # review P2 根修）：节流 flush 只保证吞吐，但「事件驱动」存在盲区——
+            # 告警行写入后系统静默（深夜无后续事件），该行滞留用户态缓冲，
+            # TG 告警守护（grep opslog.jsonl）在 flush 前完全看不到；进程此刻
+            # 被 SIGKILL（watchdog 重启史）则告警永久丢失。warn/err 行低频且
+            # 是告警链的数据源，写后立即 flush（本地盘 overlayfs，df -T 取证
+            # 2026-11-22，非 NFS，单次 flush 为 µs 级）；info/ok/req 族维持
+            # 节流。进程退出仍由 shutdown_flush 收口。
             now = time.monotonic()
-            if now - _last_flush >= _FLUSH_INTERVAL:
+            if level in ("warn", "err") or now - _last_flush >= _FLUSH_INTERVAL:
                 _fh.flush()
                 _last_flush = now
     except (OSError, ValueError):

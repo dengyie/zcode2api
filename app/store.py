@@ -67,14 +67,39 @@ class Store:
 
     def _rw(self) -> sqlite3.Connection:
         """复用的读写长连接（2026-11-21 review P2）：每操作 sqlite3.connect 在
-        NFS 部署上是每次写路径一个新文件句柄 + 两次 PRAGMA 往返；WAL 模式下
+        本地盘部署上是每次写路径一个新文件句柄 + 两次 PRAGMA 往返；WAL 模式下
         读并发安全，写由 Store._lock（RLock，全部写路径已在锁内调用）串行化，
-        busy_timeout 兜底跨进程竞争。连接损坏（磁盘错误等）自动重建一次。"""
+        busy_timeout 兜底跨进程竞争。（2026-11-22 df -T 取证：tebi /data/zcode-hub
+        为 overlayfs 本地盘，非 NFS——原注释误述修正。）"""
         conn = self._conn
         if conn is None:
             conn = self._connect()
             self._conn = conn
         return conn
+
+    def _write(self, sql: str, params: tuple) -> None:
+        """写路径单点（execute + commit），连接级错误自愈重建一次（2026-11-22
+        review P1 根修）。此前注释声称「连接损坏自动重建一次」但全文件无任何
+        sqlite3 异常捕获、self._conn 永不复位——连接一旦进入粘性损坏态（磁盘
+        I/O error / ProgrammingError），所有写路径持续抛同一异常直到人工重启，
+        gateway 成功路径（上游已计费）也炸 500。现捕获 sqlite3.Error → 关旧
+        句柄、置 _conn=None、重建重试一次；再失败异常上抛（内存态已更新，与
+        官方语义一致），下一条写自动再试新连接。"""
+        last_exc: sqlite3.Error | None = None
+        for _attempt in (1, 2):
+            conn = self._rw()
+            try:
+                conn.execute(sql, params)
+                conn.commit()
+                return
+            except sqlite3.Error as exc:
+                last_exc = exc
+                self._conn = None
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+        raise last_exc  # type: ignore[misc]
 
     def _init_db(self) -> None:
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -188,8 +213,7 @@ class Store:
                 self._delete_account(v.id)
 
     def _persist_account(self, account: Account) -> None:
-        conn = self._rw()
-        conn.execute(
+        self._write(
             f"""INSERT OR REPLACE INTO {_TBL}
                 (id, provider, name, mode, status, enabled, created_at, data)
                 VALUES (?,?,?,?,?,?,?,?)""",
@@ -199,20 +223,15 @@ class Store:
                     json.dumps(account.to_persist_dict(), ensure_ascii=False),
             ),
         )
-        conn.commit()
 
     def _delete_account(self, account_id: str) -> None:
-        conn = self._rw()
-        conn.execute(f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
-        conn.commit()
+        self._write(f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
 
     def _set_meta(self, key: str, value: str) -> None:
-        conn = self._rw()
-        conn.execute(
+        self._write(
             f"INSERT OR REPLACE INTO {_META} (key, value) VALUES (?, ?)",
             (key, value),
         )
-        conn.commit()
 
     def save(self) -> None:
         """全量落库（兜底接口）。"""
@@ -226,6 +245,11 @@ class Store:
         with self._lock:
             return self._settings.get(key, default)
 
+    def all_settings(self) -> dict[str, str]:
+        """全部 meta 快照（只读内存拷贝；启动期 claim_holds 回读等扫描用）。"""
+        with self._lock:
+            return dict(self._settings)
+
     def set_setting(self, key: str, value) -> None:
         with self._lock:
             self._settings[key] = str(value)
@@ -237,11 +261,18 @@ class Store:
     def gateway_key(self) -> str:
         return str(self.get_setting("gateway_key", "") or "")
 
+    # 刷新/领取轮间隔下界（2026-11-22 review P2 根修）：两个轮都直打 billing
+    # 端点（注释多处自证「billing 连续查询易触发拦截」），误设 1s = 每号每秒
+    # 多条 billing GET = 风控放大器 + 403 可误标 INVALID。读取侧兜底下界，
+    # admin 写入口校验同参数——0 = 关闭语义保留，非 0 最小 60s。
+    MIN_CYCLE_INTERVAL = 60
+
     def quota_refresh_interval(self) -> int:
         try:
-            return max(0, int(self.get_setting("quota_refresh_interval", settings.QUOTA_REFRESH_INTERVAL)))
+            val = max(0, int(self.get_setting("quota_refresh_interval", settings.QUOTA_REFRESH_INTERVAL)))
         except (TypeError, ValueError):
             return settings.QUOTA_REFRESH_INTERVAL
+        return max(self.MIN_CYCLE_INTERVAL, val) if val > 0 else 0
 
     def account_concurrency(self) -> int:
         """单账号并发上限。写死 3（2→10→3 纠正：上游 ZCode 单账号并发即 3）：
@@ -251,9 +282,10 @@ class Store:
     def claim_round_interval(self) -> int:
         """套餐自动领取轮间隔（0 = 关闭）。运行时可改（meta 表），改后即生效。"""
         try:
-            return max(0, int(self.get_setting("claim_round_interval", settings.CLAIM_ROUND_INTERVAL)))
+            val = max(0, int(self.get_setting("claim_round_interval", settings.CLAIM_ROUND_INTERVAL)))
         except (TypeError, ValueError):
             return settings.CLAIM_ROUND_INTERVAL
+        return max(self.MIN_CYCLE_INTERVAL, val) if val > 0 else 0
 
     def claim_round_hours(self) -> list[int]:
         """自动领取窗口：北京时间小时升序列表；空 = 全天（不限时）。运行时可改。
