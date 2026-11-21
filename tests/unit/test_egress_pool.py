@@ -912,7 +912,7 @@ async def test_tp_acquire_sends_tier_param(monkeypatch, tp_mode):
 
     def _fake_http(method, url, body=None, headers=None, timeout=15):
         calls.append(url)
-        return 200, '{"node_name": "clash-301-pigeonw-01"}'
+        return 200, '{"node_name": "clash-301-pigeonw-01"}', {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
     d = await egress_pool.tp_acquire(_account(acc_id="acc-tier"))
@@ -930,7 +930,7 @@ async def test_release_account_success_false_is_idempotent_ok(monkeypatch, tp_mo
 
     def _fake_http(method, url, body=None, headers=None, timeout=15):
         calls.append((method, url))
-        return 200, '{"success": false, "error": "no allocation"}'
+        return 200, '{"success": false, "error": "no allocation"}', {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
     ok = await egress_pool.tp_release_account("acc-rel")
@@ -944,7 +944,7 @@ async def test_release_account_non_dict_json_is_idempotent_ok(monkeypatch, tp_mo
     按「无法判读」处理为幂等成功（调用方语义：释放尽力而为）。"""
     for raw in ('[1,2]', '"ok"', 'null'):
         def _fake_http(method, url, body=None, headers=None, timeout=15, _raw=raw):
-            return 200, _raw
+            return 200, _raw, {}
         monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
         assert await egress_pool.tp_release_account("acc-nondict") is True, raw
 
@@ -952,7 +952,7 @@ async def test_release_account_non_dict_json_is_idempotent_ok(monkeypatch, tp_mo
 @pytest.mark.asyncio
 async def test_release_account_http_500_returns_false(monkeypatch, tp_mode):
     def _fake_http(method, url, body=None, headers=None, timeout=15):
-        return 500, "boom"
+        return 500, "boom", {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
     assert await egress_pool.tp_release_account("acc-rel2") is False
@@ -979,8 +979,8 @@ async def test_snapshot_accepts_aware_and_naive_quarantine(monkeypatch, tp_mode)
 
     def _fake_http(method, url, body=None, headers=None, timeout=15):
         if "/feedback/bans" in url:
-            return 200, json.dumps(payload)
-        return 200, "[]"
+            return 200, json.dumps(payload), {}
+        return 200, "[]", {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_http)
     monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _REAL_TP_SNAPSHOT)
@@ -1344,32 +1344,86 @@ async def test_reconcile_loop_sweeps_periodically(tp_mode, monkeypatch):
     gateway persist 随时制造新共占，reconcile 不再是启动单次。loop 按
     TP_RECONCILE_INTERVAL 周期跑 sweep；异常只 warn 不退出。"""
     sweeps = []
+    booms = []
 
     async def fake_sweep():
         sweeps.append(1)
 
+    async def _boom():
+        booms.append(1)
+        raise RuntimeError("boom")
+
     monkeypatch.setattr(settings, "TP_RECONCILE_INTERVAL", 0)  # 最短周期
     monkeypatch.setattr(egress_pool.egress_pool, "_reconcile_sweep", fake_sweep)
-
-    async def _boom():
-        raise RuntimeError("boom")
 
     monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
     monkeypatch.setattr(settings, "EGRESS_SUPPLY", "tetherpool")
     loop_task = asyncio.create_task(egress_pool.egress_pool._reconcile_loop())
-    # sweep 失败也不退出：前几轮正常计数，然后 monkeypatch 换成抛异常版本
     await asyncio.sleep(0.1)
     assert len(sweeps) >= 2  # interval=0 -> 连跑多轮
+    # 异常不退出：换上抛异常版本后 boom 必须真的发生过（异常路径可达），
+    # 且循环仍在跑到下一轮——boom 计数 > 1 即证明 except 分支后继续 sleep/sweep
+    n0 = len(sweeps)
     monkeypatch.setattr(egress_pool.egress_pool, "_reconcile_sweep", _boom)
     await asyncio.sleep(0.1)
+    assert booms, "sweep 抛异常路径未被执行"
+    assert len(booms) >= 2, "异常后循环退出——except 分支未兜住（review P3 回归）"
+    assert len(sweeps) == n0, "异常轮不该计入成功 sweep"
     loop_task.cancel()
     try:
         await loop_task
     except asyncio.CancelledError:
         pass
-    # 循环未因异常退出（sweep 数在 boom 后不再增长但 task 是被我们 cancel 的，
-    # 若循环自己死了 cancel 会抛 InvalidStateError 之外的路径——间接验证）
-    assert sweeps  # 周期 sweep 确实跑过
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sweep_skips_empty_snapshot_with_warn(tp_mode, monkeypatch, caplog):
+    """review P2：周期 sweep 快照为空（TP 故障 fail-open）→ 跳过整轮但必须
+    打 warn 留痕——静默空转会让 TP 故障期的共占/漂移累积不可观测。"""
+    warned: list = []
+
+    async def fake_snapshot():
+        return {}, set()  # TP 故障/空池
+
+    def _fake_warn(src, msg):
+        warned.append(msg)
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", fake_snapshot)
+    import app.logs as logs_mod
+    monkeypatch.setattr(logs_mod, "warn", _fake_warn)
+
+    await egress_pool.egress_pool._reconcile_sweep()
+    assert any("快照为空" in m for m in warned)
+
+
+@pytest.mark.asyncio
+async def test_start_idempotent_reconcile_loop(tp_mode, monkeypatch):
+    """review P2：二次 start() 不得覆盖 _reconcile_loop_task 引用——否则
+    旧 while-True 任务泄漏成孤儿（每 30min 空转直到进程退出）。"""
+    monkeypatch.setattr(settings, "PER_ACCOUNT_EGRESS", True)
+    monkeypatch.setattr(settings, "EGRESS_SUPPLY", "tetherpool")
+    monkeypatch.setattr(settings, "TP_HEALTH_INTERVAL", 300)
+    monkeypatch.setattr(settings, "TP_RECONCILE_INTERVAL", 300)
+
+    pool = egress_pool.egress_pool
+    saved = []
+    real_loop = pool._reconcile_loop
+
+    async def _spy_loop():
+        saved.append(id(asyncio.current_task()))
+        await real_loop()
+
+    monkeypatch.setattr(pool, "_reconcile_loop", _spy_loop)
+    pool.start()
+    try:
+        first = pool._reconcile_loop_task
+        assert first is not None
+        pool.start()  # 二次调用
+        assert pool._reconcile_loop_task is first, \
+            "二次 start 覆盖了巡检循环引用——旧任务泄漏"
+    finally:
+        await pool.stop()
+    assert pool._reconcile_loop_task is None
 
 
 @pytest.mark.asyncio
@@ -1380,7 +1434,7 @@ async def test_tp_acquire_sends_exclusive_param(tp_mode, monkeypatch):
 
     def _fake_tp_http(method, url, body=None, headers=None, timeout=15):
         captured["url"] = url
-        return 200, json.dumps({"node_name": "node-x", "exit_ip": "9.9.9.9"})
+        return 200, json.dumps({"node_name": "node-x", "exit_ip": "9.9.9.9"}), {}
 
     monkeypatch.setattr(egress_pool, "_tp_http", _fake_tp_http)
     acc = _account(acc_id="acc-e")

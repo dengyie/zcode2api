@@ -246,7 +246,7 @@ def test_tp_ban_reason_slugged_to_ascii(monkeypatch, tp_mode):
 
     def fake_http(method, url, body, headers, timeout):
         captured["body"] = __import__("json").loads(body)
-        return 200, '{"ok":true}'
+        return 200, '{"ok":true}', {}
 
     monkeypatch.setattr(ep, "_tp_http", fake_http)
     _aio.run(ep.tp_ban("node-x", "claim-egress:验证码求解失败: 多次重试无结果", {}, "a1"))

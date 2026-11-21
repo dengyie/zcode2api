@@ -52,11 +52,11 @@ def _tp_http(method: str, url: str, body=None, headers=None, timeout: float = 15
                                  headers=headers or {})
     try:
         with _NOPROXY.open(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+            return r.status, r.read().decode("utf-8", "replace"), dict(r.headers)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+        return e.code, e.read().decode("utf-8", "replace"), dict(e.headers or {})
     except Exception as exc:
-        return 0, f"{type(exc).__name__}: {exc}"
+        return 0, f"{type(exc).__name__}: {exc}", {}
 
 
 def _opener(proxy: str | None):
@@ -184,7 +184,7 @@ async def tp_acquire(account, force_rebalance: bool = False,
     if exclude:
         params["exclude_node"] = ",".join(exclude)
     query = urllib.parse.urlencode(params)
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "POST", f"{settings.TP_API}/v1/allocation/acquire?{query}",
         None, _tp_headers(), 20)
     if st != 200:
@@ -193,8 +193,10 @@ async def tp_acquire(account, force_rebalance: bool = False,
         # 「池枯」、与 TP 宕机不可分——状态码透传一条，排障不再盲猜
         # 互斥占满标记（2026-11-21 迭代）：IP-Pool exclusive 路径占满回 503，
         # 与真池枯（池容量不足）区分——前者是硬互斥正常工作，等下轮重试即可；
-        # 后者要扩池。
-        _mutex_full = "mutex exhausted" in raw or "exclusive exhausted" in raw
+        # 后者要扩池。识别优先读结构化 header（X-Exhausted-Reason: mutex_exhausted，
+        # iter3 契约），detail 文案匹配保留为旧 IP-Pool 版本兜底。
+        _mutex_full = (_hdrs.get("X-Exhausted-Reason") == "mutex_exhausted"
+                       or "mutex exhausted" in raw or "exclusive exhausted" in raw)
         logs.warn("egress_pool",
                   f"TP acquire HTTP {st}: {raw.strip()[:120]}"
                   f"{'【互斥占满——硬互斥生效，等下轮重试】' if _mutex_full else ''}"
@@ -215,7 +217,7 @@ async def tp_ban(node_name: str, reason: str, evidence: dict,
     body = {"service": settings.TP_SERVICE, "account": account_name,
             "node_name": node_name, "reason": reason,
             "evidence": {k: str(v)[:120] for k, v in (evidence or {}).items()}}
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "POST", f"{settings.TP_API}/v1/feedback/ban",
         json.dumps(body), _tp_headers(), 15)
     if st in (200, 201, 202):
@@ -234,7 +236,7 @@ async def tp_release_account(account_id: str) -> bool:
     from . import logs
     q = urllib.parse.urlencode({"service": settings.TP_SERVICE,
                                 "account_id": f"zh-{account_id}"})
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "POST", f"{settings.TP_API}/v1/allocation/release?{q}",
         None, _tp_headers(), 15)
     if st == 200:
@@ -269,7 +271,7 @@ async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
 
     allocs: dict[str, str] = {}
     banned: set[str] = set()
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "GET",
         f"{settings.TP_API}/v1/allocation/accounts?service={settings.TP_SERVICE}",
         None, _tp_headers(), 15)
@@ -279,7 +281,7 @@ async def _tp_live_snapshot() -> tuple[dict[str, str], set[str]]:
                 allocs[a.get("account_id")] = a.get("node_name") or ""
         except ValueError:
             pass
-    st, raw = await asyncio.to_thread(
+    st, raw, _hdrs = await asyncio.to_thread(
         _tp_http, "GET",
         f"{settings.TP_API}/v1/feedback/bans?service={settings.TP_SERVICE}&limit=300",
         None, _tp_headers(), 15)
@@ -318,6 +320,7 @@ class TetherPoolEgress:
 
     def __init__(self) -> None:
         self._loop_task: asyncio.Task | None = None
+        self._reconcile_loop_task: asyncio.Task | None = None  # 周期巡检常驻循环
         self._rebalance_at: dict[str, float] = {}  # account_id → monotonic 去抖
         self._inflight: set[asyncio.Task] = set()  # 健康检查任务强引用（防 GC）
         self._locks: dict[str, asyncio.Lock] = {}  # account_id → rebalance 互斥
@@ -851,8 +854,11 @@ class TetherPoolEgress:
                 task = asyncio.create_task(self._reconcile_once())
                 self._inflight.add(task)
                 task.add_done_callback(self._inflight.discard)
-                self._reconcile_loop_task = asyncio.create_task(
-                    self._reconcile_loop())
+                # 防重对齐 _loop_task（review P2：二次 start 会覆盖引用泄漏
+                # 一个 while-True 孤儿任务）
+                if self._reconcile_loop_task is None or self._reconcile_loop_task.done():
+                    self._reconcile_loop_task = asyncio.create_task(
+                        self._reconcile_loop())
 
     async def _reconcile_once(self, initial_delay: float = 10) -> None:
         """启动时 TP 分配对账（2.7.68 孤儿清理 + 2026-11-21 共占巡检/记录对齐）：
@@ -906,7 +912,12 @@ class TetherPoolEgress:
         from .store import store
         allocs, _banned = await _tp_live_snapshot()
         if not allocs:
-            return  # 快照失败（空）= fail-open，不动任何分配
+            # 快照失败（空）= fail-open，不动任何分配。周期化后此守卫不再只是
+            # 「启动期 TP 未就绪」——TP 持续故障时巡检每轮静默空转零痕迹，与
+            # rebalance 主路径的快照失败 warn（本文件 :410）对齐补一条。
+            logs.warn("egress_pool",
+                      "[reconcile] TP 快照为空——本轮巡检跳过（fail-open，下轮重试）")
+            return
         node_holders: dict[str, list[str]] = {}
         for aid, node in allocs.items():
             if aid.startswith("zh-"):
@@ -953,7 +964,7 @@ class TetherPoolEgress:
             self._loop_task = None
         # 周期巡检循环是 while-True 常驻任务，必须显式 cancel——只 gather
         # 会永远等它退出（test_health_loop_bootstraps 挂死实锤）
-        loop = getattr(self, "_reconcile_loop_task", None)
+        loop = self._reconcile_loop_task
         if loop and not loop.done():
             loop.cancel()
             try:
