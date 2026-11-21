@@ -403,7 +403,11 @@ class TetherPoolEgress:
                       f"无 TP 节点可换——保持绑定 {account.egress_node or ''}")
             return False
         now = time.monotonic()
-        if now - self._rebalance_at.get(account.id, 0) < settings.TP_REBALANCE_DEBOUNCE:
+        last = self._rebalance_at.get(account.id)
+        # last 为 None（本账号从未 rebalance 过）不去抖：0 哨兵会被低 monotonic
+        # 环境误拦——fresh runner / 刚开机进程 monotonic < 120s 时，首次
+        # rebalance（健康探针判败后的自救）恒被「去抖窗内」吞掉。
+        if last is not None and now - last < settings.TP_REBALANCE_DEBOUNCE:
             logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")
             return False
         # 去抖位改在函数收尾统一置位（2.7.68：旧实现取「首次 acquire 成功」的
