@@ -315,6 +315,26 @@ def _edge_kind(raw: str) -> str:
     return "JSON-APP"
 
 
+async def _tp_node_tiers() -> dict[str, str]:
+    """IP-Pool 节点名 → tier 快照（tier 泄漏巡检用，2026-11-21 P3）。
+
+    拉取失败/解析失败返回空 dict（fail-open：巡检跳过，不打扰）。节点清单
+    是全量大响应（900+ 节点 ~650KB），只在巡检节奏调用，不进热路径。"""
+    st, raw = await asyncio.to_thread(
+        _tp_http, "GET", f"{settings.TP_API}/v1/nodes",
+        None, _tp_headers(), 30)
+    if st != 200:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, list):
+        return {}
+    return {n.get("name") or "": n.get("tier") or ""
+            for n in data if isinstance(n, dict) and n.get("name")}
+
+
 class TetherPoolEgress:
     """per-account TetherPool 出口管理器（单例 egress_pool）。"""
 
@@ -859,6 +879,13 @@ class TetherPoolEgress:
                 if self._reconcile_loop_task is None or self._reconcile_loop_task.done():
                     self._reconcile_loop_task = asyncio.create_task(
                         self._reconcile_loop())
+        # tier 泄漏巡检（2026-11-21 P3）：启动期与孤儿对账并跑一次。
+        # 运行期不循环——tp_acquire 已显式上送 tier，运行中新增分配破约
+        # 只可能来自外部改绑（手工/TP 侧），每次 hub 重启巡检一次足够，
+        # 常态循环纯属大响应拉取开销。
+        task = asyncio.create_task(self._audit_tier_once())
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
 
     async def _reconcile_once(self, initial_delay: float = 10) -> None:
         """启动时 TP 分配对账（2.7.68 孤儿清理 + 2026-11-21 共占巡检/记录对齐）：
@@ -953,6 +980,50 @@ class TetherPoolEgress:
                     f"共占换绑 {co_occupied}")
         else:
             logs.info("egress_pool", "[reconcile] 绑定巡检通过: 无漂移无共占")
+
+    async def _audit_tier_once(self, initial_delay: float = 30) -> None:
+        """启动时 tier 泄漏巡检（2026-11-21 P3，tp_acquire tier 参数固化的守护）：
+        本 service 的 zh- 分配凡绑定非 TP_TIER（premium）节点 = tier 承诺破约
+        （acquire 忘带 tier / IP-Pool standard_first 兜底 / 手工改绑），机房
+        standard 节点打 claim 是风控高危——泄漏号自动 rebalance 换回 premium
+        （rebalance 全链自带探针验收 + 互斥 exclude + 每轮 tier 显式上送）。
+
+        巡检 fail-open：节点 tier 快照拉取失败 = 跳过本轮（不 rebalance）。
+        rebalance 去抖窗内的号跳过（防与健康循环/触发器同时 churn）。"""
+        from . import logs
+        from .store import store
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
+        if not (settings.PER_ACCOUNT_EGRESS and settings.EGRESS_SUPPLY == "tetherpool"):
+            return
+        allocs, _banned = await _tp_live_snapshot()
+        if not allocs:
+            return
+        tiers = await _tp_node_tiers()
+        if not tiers:
+            logs.info("egress_pool", "[tier-audit] 节点 tier 快照不可用，跳过本轮")
+            return
+        leaked: list[tuple[str, str, str]] = []  # (aid, node, tier)
+        for aid, node in allocs.items():
+            if not aid.startswith("zh-"):
+                continue
+            node_tier = tiers.get(node, "")
+            if node_tier and node_tier != settings.TP_TIER:
+                leaked.append((aid, node, node_tier))
+        if not leaked:
+            logs.info("egress_pool",
+                      f"[tier-audit] tier 巡检通过（{sum(1 for a in allocs if a.startswith('zh-'))}"
+                      f" 个分配全部 {settings.TP_TIER}）")
+            return
+        for aid, node, node_tier in leaked:
+            account = store.find("zai", aid[3:])
+            if account is None:
+                continue  # 孤儿分配由 _reconcile_orphans_once 负责，不重复处理
+            logs.warn("egress_pool",
+                      f"[tier-audit] {account.name} 绑定 {node}（tier={node_tier}，"
+                      f"承诺 {settings.TP_TIER}）——tier 泄漏，rebalance 换回")
+            await self.rebalance(account, reason="tier_leak_audit", ban=False)
+        logs.ok("egress_pool", f"[tier-audit] 泄漏巡检完成：{len(leaked)} 个触发 rebalance")
 
     async def stop(self) -> None:
         if self._loop_task and not self._loop_task.done():

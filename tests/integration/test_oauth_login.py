@@ -107,24 +107,37 @@ class TestOAuthLoginFlow:
         assert poll2["status"] == "pending"
 
     async def test_ready_returns_before_api_key_exchange(self, gateway_client):
-        """JWT 入池必须在兑换链完成前返回 ready，避免前端下一轮 poll 误判 expired。"""
+        """JWT 入池必须在兑换链完成前返回 ready，避免前端下一轮 poll 误判 expired。
+
+        行为断言而非墙钟断言（2026-11-21 flaky 根修）：ready 判据 = 响应返回时
+        mock 尚未收到兑换链首请求（z/login）。原 elapsed<0.4 是墙钟口径，把
+        ASGI 往返 + 客户端开销一起计入了预算，CI/低配机负载一高必炸——而
+        「后台化」契约本身与墙钟无关。oauth_exchange_delay=0.6 保留作陪跑：
+        若兑换没有被后台化（同步执行），poll 会卡满 0.6s 且 z/login 已被调用，
+        两处断言都会失败。
+
+        尾部显式 drain followup：兑换任务在测试体内完成（0.6s 延迟 + billing
+        刷新），不留到 gateway_client teardown——遗留任务挂在 ASGITransport
+        的在飞请求上时，pytest-asyncio 的 runner.close() 在 Windows proactor
+        上 gather 永不返回（实测整进程卡死）。"""
         client, mock = gateway_client
         fid = (await client.post("/admin/api/login/start", json={"label": "acct-fast"},
                                  headers={"Authorization": "Bearer zcode"})).json()["flow_id"]
         mock.state.oauth_state = "ready"
         mock.state.oauth_exchange_delay = 0.6
-        t0 = asyncio.get_event_loop().time()
         poll = (await client.get(f"/admin/api/login/poll/{fid}",
                                  headers={"Authorization": "Bearer zcode"})).json()
-        elapsed = asyncio.get_event_loop().time() - t0
         assert poll["status"] == "ready"
-        assert elapsed < 0.4
+        # 兑换链尚未开跑（延迟 0.6s，而 poll 已返回）：ready 先于兑换的实证
+        z_login_calls = [c for c in mock.state.calls if c[1].endswith("/api/auth/z/login")]
+        assert not z_login_calls
         accounts = (await client.get("/admin/api/accounts",
                                      headers={"Authorization": "Bearer zcode"})).json()
         assert accounts["stats"]["total"] == 1
         poll2 = (await client.get(f"/admin/api/login/poll/{fid}",
                                   headers={"Authorization": "Bearer zcode"})).json()
         assert poll2["status"] == "expired"
+        await _drain_login_followup()
 
     async def test_exchange_failure_still_pools_jwt(self, gateway_client):
         """兑换链 5xx 不得丢掉已拿到的 JWT；账号仍入池。"""

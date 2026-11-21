@@ -1689,3 +1689,103 @@ async def test_listener_health_respects_external_states(listeners_mode, monkeypa
     await egress_pool.egress_pool._check_listener(mine)
     assert mine.status == Status.COOLING
     assert mine.id in egress_pool.egress_pool._listener_cooled
+
+
+# ── tier 泄漏巡检（2026-11-21 P3，tp_acquire tier 固化的守护）────────────────
+
+
+@pytest.mark.asyncio
+async def test_tier_audit_rebalances_leaked_accounts(tp_mode, monkeypatch):
+    """zh- 分配绑定非 TP_TIER 节点 = tier 泄漏 → 自动 rebalance（ban=False）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
+    monkeypatch.setattr(settings, "TP_TIER", "premium")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "leak-acc", "h.eyJzdWIiOiJ1In0.sig")
+    acc.egress_node = "aws-tokyo-warp-01"  # standard 机房节点（泄漏形态）
+    store.update_account(acc)
+
+    async def _snapshot():
+        return {f"zh-{acc.id}": "aws-tokyo-warp-01"}, set()
+
+    async def _tiers():
+        return {"aws-tokyo-warp-01": "standard", "clash-301-pigeonw-01": "premium"}
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _snapshot)
+    monkeypatch.setattr(egress_pool, "_tp_node_tiers", _tiers)
+
+    rebalanced = []
+
+    async def _fake_rebalance(self, account, reason, ban=True):
+        rebalanced.append((account.name, reason, ban))
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "rebalance", _fake_rebalance)
+    pool = egress_pool.TetherPoolEgress()
+    await pool._audit_tier_once(initial_delay=0)
+    assert rebalanced == [("leak-acc", "tier_leak_audit", False)]
+
+
+@pytest.mark.asyncio
+async def test_tier_audit_passes_when_all_premium(tp_mode, monkeypatch):
+    """全部分配都在承诺 tier 上 = 零动作（不 rebalance、不打扰）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
+    monkeypatch.setattr(settings, "TP_TIER", "premium")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "clean-acc", "h.eyJzdWIiOiJ1In0.sig")
+    acc.egress_node = "clash-301-pigeonw-01"
+    store.update_account(acc)
+
+    async def _snapshot():
+        return {f"zh-{acc.id}": "clash-301-pigeonw-01"}, set()
+
+    async def _tiers():
+        return {"clash-301-pigeonw-01": "premium"}
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _snapshot)
+    monkeypatch.setattr(egress_pool, "_tp_node_tiers", _tiers)
+    rebalanced = []
+
+    async def _fake_rebalance(account, reason, ban=True):
+        rebalanced.append(account.name)
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "rebalance", _fake_rebalance)
+    pool = egress_pool.TetherPoolEgress()
+    await pool._audit_tier_once(initial_delay=0)
+    assert rebalanced == []
+
+
+@pytest.mark.asyncio
+async def test_tier_audit_fail_open_on_missing_tier_snapshot(tp_mode, monkeypatch):
+    """节点 tier 快照拉取失败（空 dict）= fail-open：巡检跳过，不 rebalance。
+
+    泄漏判定只信地面快照——tier 字段未知（""）的节点同样不算泄漏（防误换）。"""
+    monkeypatch.setattr(settings, "DB_PATH", tmp_db_factory(monkeypatch))
+    monkeypatch.setattr(settings, "TP_TIER", "premium")
+    store = store_mod.Store()
+    monkeypatch.setattr(store_mod, "store", store)
+    acc = store.add_account("zai", "failopen-acc", "h.eyJzdWIiOiJ1In0.sig")
+    acc.egress_node = "aws-tokyo-warp-01"
+    store.update_account(acc)
+
+    async def _snapshot():
+        return {f"zh-{acc.id}": "aws-tokyo-warp-01"}, set()
+
+    async def _tiers():
+        return {}  # 快照失败形态
+
+    monkeypatch.setattr(egress_pool, "_tp_live_snapshot", _snapshot)
+    monkeypatch.setattr(egress_pool, "_tp_node_tiers", _tiers)
+
+    rebalanced = []
+
+    async def _fake_rebalance(account, reason, ban=True):
+        rebalanced.append(account.name)
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "rebalance", _fake_rebalance)
+    pool = egress_pool.TetherPoolEgress()
+    await pool._audit_tier_once(initial_delay=0)
+    assert rebalanced == []

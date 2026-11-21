@@ -148,6 +148,7 @@ async def test_tracker_check_and_sync_auto_sync(fresh_app, monkeypatch):
         assert res["ok"] is True
         assert res["has_update"] is True
         assert res["updated"] is True
+        assert res["messages_updated"] is True
         assert res["prompt_port_required"] is False
         assert res["latest_version"] == "3.18.5"
         assert constants.CLIENT_APP_VERSION == "3.18.5"
@@ -178,6 +179,7 @@ async def test_auto_sync_refuses_unported_newer_version(fresh_app, monkeypatch):
         assert res["has_update"] is True
         # updated=True 来自 billing 跟随；messages 头未被顶（正文锁拒绝）
         assert res["billing_updated"] is True
+        assert res["messages_updated"] is False
         assert res["prompt_port_required"] is True
         assert res["prompt_aligned_version"] == constants.PROMPT_ALIGNED_VERSION
         assert constants.CLIENT_APP_VERSION == orig
@@ -300,3 +302,103 @@ async def test_billing_follow_skips_prerelease(fresh_app, monkeypatch):
         assert constants.BILLING_APP_VERSION == billing_orig
     finally:
         constants.BILLING_APP_VERSION = billing_orig
+
+
+# ── billing 跟版实弹探针（2026-11-21 P1）─────────────────────────────────────
+
+
+def _add_billing_account(fresh_app, name: str, status=None):
+    """造一个可打 billing 的 JWT 号入池（active）。
+
+    token 必须是 JWT 形态（header.payload.sig）——Account.create 按 secret
+    形态分流 mode，裸字符串会归成 apiKey（allows_billing=False）。"""
+
+    acc = fresh_app.add_account("zai", name, "mock-header.mock-payload.sig")
+    if status is not None and acc.status != status:
+        acc.status = status
+        fresh_app.update_account(acc)
+    return acc
+
+
+@pytest.mark.asyncio
+async def test_probe_passes_when_preview_ok(fresh_app, monkeypatch):
+    """preview 全链成功 → 探针通过 → billing 版本保持抬升、不回滚。"""
+    from app import version_tracker as vt
+
+    fresh_app.set_setting("auto_sync_client_version", "false")
+    _add_billing_account(fresh_app, "probe-ok")
+    monkeypatch.setattr(
+        vt, "_billing_probe_ok", AsyncMock(return_value=True)
+    )
+    tracker = vt.VersionTracker()
+    billing_orig = constants.BILLING_APP_VERSION
+    try:
+        mock_info = VersionInfo(version="3.19.0", release_name="v3.19.0")
+        monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
+        res = await tracker.check_and_sync()
+        assert res["billing_updated"] is True
+        assert constants.BILLING_APP_VERSION == "3.19.0"
+    finally:
+        constants.BILLING_APP_VERSION = billing_orig
+
+
+@pytest.mark.asyncio
+async def test_probe_rollback_on_upstream_reject(fresh_app, monkeypatch):
+    """探针上游拒绝（ClaimError 非瞬态）→ 回滚基线 + billing_updated 归零。
+
+    kill-switch 的人工止血自动化：坏版本不会静默撑到领取全灭。"""
+    from app import version_tracker as vt
+
+    fresh_app.set_setting("auto_sync_client_version", "false")
+    _add_billing_account(fresh_app, "probe-reject")
+    monkeypatch.setattr(
+        vt, "_billing_probe_ok", AsyncMock(return_value=False)
+    )
+    tracker = vt.VersionTracker()
+    billing_orig = constants.BILLING_APP_VERSION
+    try:
+        mock_info = VersionInfo(version="3.19.0", release_name="v3.19.0")
+        monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
+        res = await tracker.check_and_sync()
+        assert res["billing_updated"] is False
+        assert constants.BILLING_APP_VERSION == billing_orig
+    finally:
+        constants.BILLING_APP_VERSION = billing_orig
+
+
+@pytest.mark.asyncio
+async def test_probe_transient_network_error_does_not_rollback(fresh_app, monkeypatch):
+    """探针网络瞬态（ConnectError/超时）不算上游拒绝——不回滚，避免出口
+    抖动误杀跟版。"""
+    from app import version_tracker as vt
+    from app.claim import ClaimError
+
+    fresh_app.set_setting("auto_sync_client_version", "false")
+    _add_billing_account(fresh_app, "probe-transient")
+    tracker = vt.VersionTracker()
+    billing_orig = constants.BILLING_APP_VERSION
+    try:
+        mock_info = VersionInfo(version="3.19.0", release_name="v3.19.0")
+        monkeypatch.setattr(tracker, "fetch_remote_manifest", AsyncMock(return_value=mock_info))
+        monkeypatch.setattr("app.claim.preview_plans",
+                            AsyncMock(side_effect=ClaimError("ConnectError 32")))
+        res = await tracker.check_and_sync()
+        assert res["billing_updated"] is True
+        assert constants.BILLING_APP_VERSION == "3.19.0"
+    finally:
+        constants.BILLING_APP_VERSION = billing_orig
+
+    # 瞬态语义本身：ConnectError 文案 → True（不回滚）；上游拒绝文案 → False
+    acc = fresh_app.find("zai", "probe-transient")
+    assert acc is not None
+    monkeypatch.setattr("app.claim.preview_plans",
+                        AsyncMock(side_effect=ClaimError("HTTP 405 unusual activity")))
+    assert await vt._billing_probe_ok() is False
+
+
+@pytest.mark.asyncio
+async def test_probe_skipped_when_no_candidate(fresh_app):
+    """无 active 可探号 → 视为通过（没有实弹面就不阻塞跟版）。"""
+    from app import version_tracker as vt
+
+    assert await vt._billing_probe_ok() is True

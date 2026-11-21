@@ -198,7 +198,7 @@ async function checkZcodeVersionNow(){
       if(res.billing_updated) parts.push('billing 链已跟随 v' + res.billing_version);
       else if(res.billing_followable === false) parts.push('billing 链已钉死/预发布版，未跟随');
       if(res.prompt_port_required) parts.push('messages 正文未移植，暂不对齐');
-      else if(res.updated && !res.billing_updated) parts.push('messages 已自动对齐');
+      else if(res.messages_updated) parts.push('messages 已自动对齐');
       const note = parts.length ? '（' + parts.join('；') + '）' : '';
       showToast('核验成功: 官方最新 v' + res.latest_version + note, 'success');
       load();

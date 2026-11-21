@@ -48,6 +48,44 @@ def _is_stable_version(ver: str) -> bool:
     return "-" not in str(ver or "") and "+" not in str(ver or "")
 
 
+async def _billing_probe_ok() -> bool:
+    """billing 跟版后的实弹验证（2026-11-21）：抬版本后打一次真实
+    billing/preview 全链（激活上报 + preview + marketing/touch），不抛
+    ClaimError 即通过——探针失败说明新版 billing 链劣化（1004/405/风控
+    形态），调用方立即回滚基线并告警。
+
+    网络瞬态（ConnectError/超时）不算上游拒绝——只对「上游明确拒绝」
+    回滚，避免出口抖动误杀跟版。探针号取 active 且 allows_billing 的
+    第一个号；无号可探 = 视为通过（没有实弹面就不阻塞跟版）。
+    """
+    from .claim import preview_plans
+    from .models import Status
+    from .store import store
+
+    candidate = None
+    for items in store._accounts.values():
+        for a in sorted(items, key=lambda x: x.created_at):
+            if a.status == Status.ACTIVE and a.allows_billing():
+                candidate = a
+                break
+        if candidate:
+            break
+    if candidate is None:
+        logs.info("version", "billing 跟版探针跳过：无 active 可用号（视为通过）")
+        return True
+    try:
+        await preview_plans(candidate)
+        return True
+    except Exception as err:  # noqa: BLE001
+        msg = str(err)
+        transient = ("ConnectError" in msg or "timed out" in msg.lower()
+                     or "timeout" in msg.lower() or "ReadError" in msg)
+        logs.warn("version",
+                  f"billing 跟版探针 v{constants.BILLING_APP_VERSION} 失败"
+                  f"（{'瞬态网络' if transient else '上游拒绝'}）: {msg[:120]}")
+        return transient
+
+
 @dataclass
 class VersionInfo:
     version: str
@@ -246,6 +284,8 @@ class VersionTracker:
                 "latest_version": latest_ver,
                 "has_update": is_newer_version(latest_ver, current_ver),
                 "updated": False,
+                "billing_updated": False,
+                "messages_updated": False,
                 "prompt_aligned_version": constants.PROMPT_ALIGNED_VERSION,
                 "prompt_port_required": is_newer_version(
                     latest_ver, constants.PROMPT_ALIGNED_VERSION
@@ -276,16 +316,30 @@ class VersionTracker:
         # 或预发布版（beta/rc，防 parse_semver 纯数字提取穿透）不跟随。
         billing_updated = False
         billing_followable = not _billing_pinned() and _is_stable_version(info.version)
+        messages_updated = False
+        # updated = 任一链实际变更（messages 对齐或 billing 跟随探针通过）
+        updated = False
         if billing_followable and is_newer_version(info.version, constants.BILLING_APP_VERSION):
+            prev_billing = constants.BILLING_APP_VERSION
             constants.BILLING_APP_VERSION = info.version
             billing_updated = True
             logs.ok(
                 "version",
-                f"billing/claim 链版本自动跟随官方发版: v{constants.BILLING_APP_VERSION}"
+                f"billing/claim 链版本自动跟随官方发版: v{prev_billing}"
                 f" → v{info.version}（无正文锁，claim 有效性优先）",
             )
-        updated = billing_updated
-
+            # 实弹验证回路（2026-11-21）：跟版后立即探针，上游拒绝即回滚基线
+            # ——kill-switch 的人工止血自动化，坏版本不会静默撑到领取全灭。
+            if not await _billing_probe_ok():
+                constants.BILLING_APP_VERSION = prev_billing
+                billing_updated = False
+                logs.warn(
+                    "version",
+                    f"<!> billing 跟版探针拒绝 v{info.version}，已回滚基线 v{prev_billing}"
+                    "（人工介入：核对上游 billing 链变化，或 env "
+                    "ZCODE_BILLING_APP_VERSION 钉其他版本）",
+                )
+            updated = billing_updated
         if has_new:
             if prompt_port_required:
                 logs.warn(
@@ -297,6 +351,7 @@ class VersionTracker:
                 )
             elif auto_sync:
                 constants.set_active_version(info.version)
+                messages_updated = True
                 updated = True
                 logs.ok("version", f"检测到 ZCode 官方发版 {info.version}（当前 {current_ver}），已自动对齐伪装指纹")
             else:
@@ -310,6 +365,7 @@ class VersionTracker:
             "billing_version": constants.BILLING_APP_VERSION,
             "billing_updated": billing_updated,
             "billing_followable": billing_followable,
+            "messages_updated": messages_updated,
             "latest_version": info.version,
             "has_update": has_new,
             "updated": updated,
