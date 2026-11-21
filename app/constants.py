@@ -73,6 +73,11 @@ CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务�
 # mitm 另见 /api/v1/agent/configs（运行时配置通道，无参数），两者并存勿混。
 CLIENT_CONFIGS_URL = f"{ZCODE_ORIGIN}/api/v1/client/configs"
 CLIENT_CONFIGS_QUERY = f"app_version={CLIENT_APP_VERSION}"
+# ⚠️ captcha.fetch_config 走同一 client/configs 端点但归属 billing/claim 链：
+# 查询串/UA 必须锚 BILLING_APP_VERSION（用内联 f-string 读当前值，禁止模块级
+# 常量——version_tracker 运行期直接重赋 BILLING_APP_VERSION，模块级快照会静默
+# 过期）。install._fetch_client_configs 同端点已用 billing 版，双版本矛盾即指纹面。
+# 2026-11-21 claim 链一致性迭代。
 
 # ── 官方更新清单端点（2026-11-03 官方桌面端逆向实证）────────────────────────────
 # 官方客户端检查更新直连端点，返回 YAML 格式的最新版本、发布时间与原生 Markdown 更新日志

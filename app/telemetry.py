@@ -86,7 +86,13 @@ async def post_activation_event(profile, user_id: str, element: str,
             try:
                 res = await client.post(
                     settings.ZCODE_EVENT_REPORT_URL,
-                    headers={"Content-Type": "application/json"},
+                    # 官方桌面端形态 UA（2026-11-21 claim 链一致性迭代）：
+                    # 激活上报是活动投放资格信号，缺省 httpx 默认 UA
+                    # （python-httpx/x.y）在 event/report 侧同样自报
+                    # 非官方身份——与 build_activation_event_body 的
+                    # app_version 字段（BILLING_APP_VERSION）同源对齐。
+                    headers={"User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}",
+                             "Content-Type": "application/json"},
                     json=build_activation_event_body(element, profile, user_id))
                 break
             except httpx.TransportError as err:

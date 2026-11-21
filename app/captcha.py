@@ -248,7 +248,16 @@ class CaptchaManager:
                         client_cm = httpx.AsyncClient(timeout=30, trust_env=use_proxy)
                     async with client_cm as client:
                         res = await client.get(
-                            f"{constants.CLIENT_CONFIGS_URL}?{constants.CLIENT_CONFIGS_QUERY}"
+                            # billing 链版本锚定（内联 f-string 读当前值，
+                            # constants.py 注释：模块级快照会随 version_tracker
+                            # 运行期重赋而过期）
+                            f"{constants.CLIENT_CONFIGS_URL}"
+                            f"?app_version={constants.BILLING_APP_VERSION}",
+                            # 官方桌面端形态 UA：缺省时 httpx 默认 UA 自报
+                            # python-httpx 身份，与 install 同端点路径（带
+                            # ZCode/<ver> UA）形状分裂（2026-11-21 claim 链
+                            # 一致性迭代）。
+                            headers={"User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}"},
                         )
                     res.raise_for_status()
                     return ((res.json().get("data") or {}).get("configs") or {}).get("captcha")

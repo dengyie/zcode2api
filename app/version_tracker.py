@@ -230,7 +230,13 @@ class VersionTracker:
                     "GET",
                     url,
                     headers={
-                        "User-Agent": settings.USER_AGENT,
+                        # UA 锚 billing 版本（2026-11-21 claim 链一致性迭代）：
+                        # 官方客户端查更新上报的是「自己当前版本」，而跟随
+                        # 逻辑让 BILLING_APP_VERSION 恒 = 官方最新版——比
+                        # messages 钉版 3.17.2（落后 2 版仍在查更新）更贴近
+                        # 真实桌面端形状。settings.USER_AGENT 挂 messages 链，
+                        # 不改；此处直拼 constants 值。
+                        "User-Agent": f"ZCode/{constants.BILLING_APP_VERSION}",
                         "Accept": "application/x-yaml,text/yaml,text/plain,*/*",
                     },
                 )
