@@ -94,6 +94,69 @@ class TestSettingsSecretMask:
 class TestAdminAuthHardening:
     """2.7.33：非 ASCII 密钥、查询串鉴权、导出方法/缓存、密钥强度。"""
 
+    async def test_spoofed_proxy_header_cannot_bypass_lockout(self, gateway_client, monkeypatch):
+        """P1 信任边界（2026-11-21 review）：TRUST_PROXY_HEADERS 缺省关时，
+        伪造 cf-connecting-ip/x-real-ip 不能让每个请求拿到独立的失败计数器
+        —— 锁定按 socket 对端地址（测试客户端同一对端）计数。"""
+        from app import auth_admin
+
+        monkeypatch.setattr(auth_admin, "ADMIN_FAIL_LIMIT", 3)
+        auth_admin.reset_failures()
+        client, _ = gateway_client
+
+        for i in range(3):
+            res = await client.get(
+                "/admin/api/verify",
+                headers={"Authorization": "Bearer wrong-password",
+                         "cf-connecting-ip": f"10.9.9.{i}",
+                         "x-real-ip": f"10.8.8.{i}"})
+            assert res.status_code == 401
+        # 同一对端已锁：换一个「新伪造 IP」也绕不过
+        locked = await client.get(
+            "/admin/api/verify",
+            headers={"Authorization": "Bearer zcode",
+                     "cf-connecting-ip": "10.9.9.99"})
+        assert locked.status_code == 429
+
+    async def test_failures_map_capacity_bounded(self, monkeypatch):
+        """P1 容量上界（2026-11-21 review）：_failures 逐出最旧条目，
+        无界 dict 撑内存的 DoS 面被封顶。"""
+        from app import auth_admin
+
+        auth_admin.reset_failures()
+        old_max = auth_admin._FAILURES_MAX
+        monkeypatch.setattr(auth_admin, "_FAILURES_MAX", 4)
+        try:
+            for i in range(10):
+                auth_admin._record_failure(f"ip-{i}")
+            assert len(auth_admin._failures) <= 4
+            # 最早插入的已被逐出
+            assert "ip-0" not in auth_admin._failures
+            assert "ip-9" in auth_admin._failures
+        finally:
+            auth_admin._FAILURES_MAX = old_max
+            auth_admin.reset_failures()
+
+    async def test_gateway_key_failure_also_locks(self, gateway_client, monkeypatch):
+        """P3（2026-11-21 review）：/v1 网关 key 暴力试 key 也有失败锁定。"""
+        from app import auth_admin
+
+        monkeypatch.setattr(auth_admin, "ADMIN_FAIL_LIMIT", 3)
+        auth_admin.reset_failures()
+        client, _ = gateway_client
+        # fresh_app 已把 store 单例重绑到用例独立实例；gateway key 走 store 设置
+        from app.store import store
+
+        store.set_setting("gateway_key", "sk-real-gateway-key-123")
+
+        for _ in range(3):
+            res = await client.post("/v1/messages", json={"model": "m", "messages": []},
+                                    headers={"Authorization": "Bearer wrong-key"})
+            assert res.status_code in (401, 403)
+        locked = await client.post("/v1/messages", json={"model": "m", "messages": []},
+                                   headers={"Authorization": "Bearer sk-real-gateway-key-123"})
+        assert locked.status_code == 429
+
     async def test_non_ascii_key_rejected_without_500(self):
         """compare_digest(str) 遇非 ASCII 会 TypeError → 500；必须稳定拒绝。
 

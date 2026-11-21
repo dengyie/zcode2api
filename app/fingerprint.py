@@ -23,6 +23,8 @@ import secrets
 import uuid
 from dataclasses import dataclass, field, replace
 
+from . import logs
+
 # 成套桌面 SKU：(weight, platform, arch, os_version, screen)
 # 分辨率只取官方桌面端常见值，并与平台绑定（Mac 逻辑分辨率不配 Windows）。
 _SKUS: tuple[tuple[int, str, str, str, str], ...] = (
@@ -170,11 +172,19 @@ def profile_for(account) -> DeviceProfile:
     if isinstance(fp, DeviceProfile):
         return fp
     if isinstance(fp, dict) and fp.get("device_mid"):
-        profile = DeviceProfile(
-            platform=fp["platform"], arch=fp["arch"], os_version=fp["os_version"],
-            language=fp["language"], timezone=fp["timezone"], screen=fp["screen"],
-            device_mid=fp["device_mid"],
-        )
+        try:
+            profile = DeviceProfile(
+                platform=fp["platform"], arch=fp["arch"], os_version=fp["os_version"],
+                language=fp["language"], timezone=fp["timezone"], screen=fp["screen"],
+                device_mid=fp["device_mid"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            # 残缺 dict（2026-11-21 review P3）：旧版本写入或手工编辑丢字段时，
+            # KeyError 会让该号每次取 profile 都 500。按「无档案」重新分配——
+            # device_mid 无法保真时指纹一致性已不可救，换新档案好过永久故障。
+            logs.warn("fingerprint",
+                      f"账号档案字段残缺（{exc}），重新分配: {getattr(account, 'name', '?')}")
+            return assign(account)
         account.fingerprint = profile
         return profile
     return assign(account)

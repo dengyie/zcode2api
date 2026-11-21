@@ -485,9 +485,18 @@ class Account:
         return url
 
     def public_view(self) -> dict:
-        """返回给前端的视图（脱敏 token）。"""
+        """返回给前端的视图（脱敏 token）。
+
+        短 secret 全掩码（2026-11-21 review P3）：≤16 字符原先整段明文回显，
+        与「脱敏 token」语义相悖——apiKey 类短凭证会整串进前端。
+        """
         secret = self.secret or ""
-        masked = secret if len(secret) <= 16 else f"{secret[:8]}…{secret[-6:]}"
+        if len(secret) < 12:
+            masked = "••••••"
+        elif len(secret) <= 16:
+            masked = f"{secret[:4]}…{secret[-4:]}"
+        else:
+            masked = f"{secret[:8]}…{secret[-6:]}"
         return {
             "id": self.id,
             "name": self.name,

@@ -13,8 +13,11 @@ from .store import store
 ADMIN_FAIL_LIMIT = 8
 ADMIN_LOCK_SECONDS = 300
 
-# ip -> {count, locked_until}
+# ip -> {count, locked_until}。上限与清扫（review 2026-11-21 P1）：键是「客户端
+# 身份」而非真实对端地址时（trust-proxy 下取自可伪造头），无上限 dict = 攻击者
+# 每请求换一个伪造头就能既绕过锁定计数又撑爆内存——容量封顶 + 逐出最旧条目。
 _failures: dict[str, dict] = {}
+_FAILURES_MAX = 1024
 
 
 def reset_failures() -> None:
@@ -23,10 +26,20 @@ def reset_failures() -> None:
 
 
 def _client_ip(request: Request) -> str:
-    for header in ("cf-connecting-ip", "x-real-ip"):
-        val = (request.headers.get(header) or "").strip()
-        if val:
-            return val.split(",")[0].strip()
+    """客户端身份（锁定键）。
+
+    信任边界（2026-11-21 review P1）：`cf-connecting-ip` / `x-real-ip` 是客户端
+    可任意伪造的请求头——只有部署明确声明处于可信反向代理之后（CF Tunnel /
+    nginx，由代理覆写真实值）才允许采信。缺省关（ZCODE_TRUST_PROXY_HEADERS
+    未设/为 false）时用 socket 对端地址：直连部署（settings.HOST=0.0.0.0）上
+    伪造头无法再绕过失败锁定。tebi canonical 部署（127.0.0.1 + CF Tunnel）须
+    显式设 true 才能保持「按真实公网客户端 IP 锁定」语义。
+    """
+    if settings.TRUST_PROXY_HEADERS:
+        for header in ("cf-connecting-ip", "x-real-ip"):
+            val = (request.headers.get(header) or "").strip()
+            if val:
+                return val.split(",")[0].strip()
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
@@ -45,6 +58,14 @@ def _is_locked(ip: str) -> bool:
 
 
 def _record_failure(ip: str) -> None:
+    if len(_failures) >= _FAILURES_MAX and ip not in _failures:
+        # 逐出最旧一条（dict 保序，首键 = 最早插入且未被刷新的）：
+        # 锁定语义宁可漏记一个陌生 IP 也不能无界增长
+        try:
+            next(iter(_failures))
+            _failures.pop(next(iter(_failures)))
+        except StopIteration:
+            pass
     rec = _failures.setdefault(ip, {"count": 0, "locked_until": 0.0})
     rec["count"] = int(rec.get("count") or 0) + 1
     if rec["count"] >= ADMIN_FAIL_LIMIT:
@@ -95,6 +116,7 @@ async def verify_admin_key(
 
 
 async def verify_gateway_key(
+    request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="x-api-key"),
 ) -> None:
@@ -103,7 +125,16 @@ async def verify_gateway_key(
     未配置密钥时放行等于把上游账号池暴露成公开代理——只要部署后忘了设置
     gateway key，任何人都能用你的额度。空密钥应当是「不可用」，而不是「无鉴权」
     （2.7.33）。后台首页会提示先设置网关密钥。
+
+    失败锁定（2026-11-21 review P3，对齐 admin 面不对称缺口）：错误 key 无节流
+    = /v1 端点可无限暴力试 key。复用 admin 的失败计数与锁定（同一把 _failures
+    表按客户端身份分键——admin 与 gateway 对同一来源共享失败记忆，语义等价于
+    「同一客户端连续乱试任何一扇门都算失败」）。
     """
+    ip = _client_ip(request)
+    if _is_locked(ip):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "失败次数过多，请稍后再试")
+
     key = store.gateway_key()
     if not key:
         # 默认 fail-closed：未配置密钥时放行等于把上游账号池暴露成公开代理。
@@ -116,6 +147,9 @@ async def verify_gateway_key(
         )
     token = _extract_bearer(authorization) or x_api_key
     if token is None:
+        _record_failure(ip)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "缺少 API Key")
     if not _key_equal(token, key):
+        _record_failure(ip)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "API Key 无效")
+    _failures.pop(ip, None)

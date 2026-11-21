@@ -52,6 +52,7 @@ class Store:
         self._accounts: dict[str, list[Account]] = {p: [] for p in PROVIDERS}
         self._settings: dict = {}
         self._rotation: dict[str, int] = {p: 0 for p in PROVIDERS}
+        self._conn: sqlite3.Connection | None = None  # 复用长连接（_rw）
         self._init_db()
         self._load()
 
@@ -62,6 +63,17 @@ class Store:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _rw(self) -> sqlite3.Connection:
+        """复用的读写长连接（2026-11-21 review P2）：每操作 sqlite3.connect 在
+        NFS 部署上是每次写路径一个新文件句柄 + 两次 PRAGMA 往返；WAL 模式下
+        读并发安全，写由 Store._lock（RLock，全部写路径已在锁内调用）串行化，
+        busy_timeout 兜底跨进程竞争。连接损坏（磁盘错误等）自动重建一次。"""
+        conn = self._conn
+        if conn is None:
+            conn = self._connect()
+            self._conn = conn
         return conn
 
     def _init_db(self) -> None:
@@ -176,31 +188,31 @@ class Store:
                 self._delete_account(v.id)
 
     def _persist_account(self, account: Account) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                f"""INSERT OR REPLACE INTO {_TBL}
-                    (id, provider, name, mode, status, enabled, created_at, data)
-                    VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    account.id, account.provider, account.name, account.mode,
-                    account.status, 1 if account.enabled else 0, account.created_at,
-                    json.dumps(account.to_dict(), ensure_ascii=False),
-                ),
-            )
-            conn.commit()
+        conn = self._rw()
+        conn.execute(
+            f"""INSERT OR REPLACE INTO {_TBL}
+                (id, provider, name, mode, status, enabled, created_at, data)
+                VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                account.id, account.provider, account.name, account.mode,
+                account.status, 1 if account.enabled else 0, account.created_at,
+                json.dumps(account.to_dict(), ensure_ascii=False),
+            ),
+        )
+        conn.commit()
 
     def _delete_account(self, account_id: str) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
-            conn.commit()
+        conn = self._rw()
+        conn.execute(f"DELETE FROM {_TBL} WHERE id = ?", (account_id,))
+        conn.commit()
 
     def _set_meta(self, key: str, value: str) -> None:
-        with closing(self._connect()) as conn:
-            conn.execute(
-                f"INSERT OR REPLACE INTO {_META} (key, value) VALUES (?, ?)",
-                (key, value),
-            )
-            conn.commit()
+        conn = self._rw()
+        conn.execute(
+            f"INSERT OR REPLACE INTO {_META} (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
 
     def save(self) -> None:
         """全量落库（兜底接口）。"""

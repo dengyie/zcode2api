@@ -187,6 +187,27 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # fire-and-forget 后台任务集收口（2026-11-21 review P2）：领取/安装/
+        # 登录跟单任务可能在「上游已扣减、本地未落库」的窗口被硬砍。先给在途
+        # 任务一个有限宽限窗口自然完成，超时才 cancel——领取结果不丢。
+        import asyncio as _aio
+
+        from . import install
+
+        pending: set = set()
+        pending.update(admin_api._auto_claim_tasks)
+        pending.update(admin_api._login_followup_tasks)
+        pending.update(admin_api._claim_job_tasks)
+        pending.update(install._install_tasks)
+        if _install_task is not None and not _install_task.done():
+            pending.add(_install_task)
+        if pending:
+            done, still = await _aio.wait(pending, timeout=10.0)
+            for t in still:
+                t.cancel()
+            if still:
+                await _aio.gather(*still, return_exceptions=True)
+            logs.info("lifespan", f"后台任务收口: {len(done)} 完成, {len(still)} 取消")
         # 停机逐段隔离（2.7.68）：首段抛异常会跳过其余收口（在途请求证据丢失、
         # 后台任务逃逸）——每段独立 try/except，停机路径绝不中断
         for name, fn in (
@@ -205,7 +226,10 @@ async def lifespan(app: FastAPI):
                 if name == "reqlog" and result:
                     logs.info("reqlog", f"停机收口在途请求 ×{result}")
             except asyncio.CancelledError:
-                raise
+                # 收口协程自身被 cancel 不能放弃剩余组件（review P3：原先
+                # 直接 raise 会让第一段之后的全部收口跳过）；吞掉并继续，
+                # 宽限窗口已过，此刻的 cancel 是 uvicorn 关循环的最后一刀
+                continue
             except Exception as err:  # noqa: BLE001 - 停机收口绝不互相牵连
                 logs.err("lifespan", f"{name} 停机收口异常（已跳过）: "
                                      f"{type(err).__name__}: {err}")

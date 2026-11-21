@@ -50,3 +50,32 @@ def test_dropped_fingerprint_families_still_dropped():
 def test_benign_headers_still_pass_through():
     headers = _build({"X-Safe-Header": "keep-me"})
     assert headers["X-Safe-Header"] == "keep-me"
+
+
+def test_captcha_headers_cannot_be_overridden():
+    """P2（2026-11-21 review）：验证码头由本服务现解现填。客户端带自己的
+    （必然过期的）验证码头透传进去会覆盖刚解出的 token → 必 3007 →
+    invalidate 清空整池 → 连环重解白烧预算。"""
+    headers = _build({
+        "x-aliyun-captcha-verify-param": "forged-token",
+        "x-aliyun-captcha-verify-region": "forged-region",
+    })
+    lowered = {k.lower(): k for k in headers}
+    # 请求不带 verify_param 时这两头根本不该出现；带了也不能是客户端值
+    for key in ("x-aliyun-captcha-verify-param", "x-aliyun-captcha-verify-region"):
+        if key in lowered:
+            assert headers[lowered[key]] not in ("forged-token", "forged-region")
+
+
+def test_openai_sdk_headers_dropped():
+    """P2/P3（2026-11-21 review）：openai-organization/project/beta 是 OpenAI
+    SDK 特征头族，官方 ZCode 桌面端永不携带，透传即指纹矛盾。"""
+    headers = _build({
+        "openai-organization": "org-evil",
+        "openai-project": "proj-evil",
+        "openai-beta": "assistants=v2",
+    })
+    lowered = {k.lower(): k for k in headers}
+    assert "openai-organization" not in lowered
+    assert "openai-project" not in lowered
+    assert "openai-beta" not in lowered

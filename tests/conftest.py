@@ -117,6 +117,13 @@ def fresh_app(tmp_path, monkeypatch):
     from app import auth_admin as auth_admin_module
     if hasattr(auth_admin_module, "reset_failures"):
         auth_admin_module.reset_failures()
+    # P1-2 admin key 强度闸后 DEFAULT_ADMIN_KEY 是随机 token（"zcode" 不再
+    # 通过 ≥12 字符校验）；大量用例依赖固定 Bearer zcode —— 夹具统一落一个
+    # 固定测试 key，并把 settings.DEFAULT_ADMIN_KEY 一并对齐（admin_key_is_
+    # default 标志按「store == DEFAULT」判定，两侧同值才保持既有断言语义；
+    # 生产语义不变：生产随机值只在真首启打印一次）。
+    monkeypatch.setattr(settings, "DEFAULT_ADMIN_KEY", "zcode")
+    fresh.set_setting("admin_key", "zcode")
     return fresh
 
 

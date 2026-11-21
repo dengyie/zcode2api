@@ -167,6 +167,10 @@ async def run_install_sequence() -> dict:
 
 # 后台安装任务集合：持有强引用防 GC，完成即自行移除
 _install_tasks: set = set()
+# 在途任务按账号 id 去重（2026-11-21 review P3）：同一账号在同一事件循环批内
+# 被多入口调度（入池 + 补配 + 换发连击）时会叠加多个并发安装任务——幂等跳过
+# 只省去重复上游调用，多个任务同时跑仍会重复打 configs/激活事件。在途即跳过。
+_install_pending: set[str] = set()
 
 
 def schedule_install(account) -> None:
@@ -177,9 +181,13 @@ def schedule_install(account) -> None:
     """
     import asyncio
 
+    if account.id in _install_pending:
+        return
+
     async def _job():
         from .store import store
 
+        _install_pending.discard(account.id)
         live = store.find(account.provider, account.id)
         if live is None:
             return
@@ -188,6 +196,7 @@ def schedule_install(account) -> None:
         except Exception as err:  # noqa: BLE001 - 兜底：绝不冒泡
             logs.warn("install", f"账号 {account.name} 安装序任务异常: {err}")
 
+    _install_pending.add(account.id)
     task = asyncio.create_task(_job())
     _install_tasks.add(task)
     task.add_done_callback(_install_tasks.discard)

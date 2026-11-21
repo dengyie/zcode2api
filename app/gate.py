@@ -226,5 +226,14 @@ class Gate:
         self._busy_until = {}
         self._pool_hold_until = 0.0
 
+    def reset_tag(self, tag: str) -> None:
+        """单 tag 运行态清理（2026-11-21 review P3）：删除账号时按其出口 tag
+        摘除断路器/忙计数，否则残留键永久占内存且 edge_hits 持续计进监控口径
+        （死账号的命中数）。不影响其它 tag 与全局窗口。"""
+        self._edge_until.pop(tag, None)
+        self.edge_hits.pop(tag, None)
+        self._busy_hits.pop(tag, None)
+        self._busy_until.pop(tag, None)
+
 
 gate = Gate()

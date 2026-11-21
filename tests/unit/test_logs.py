@@ -60,6 +60,10 @@ def _reset_logs_state(monkeypatch, target):
     monkeypatch.setattr(logs, "_current_day", "")
     monkeypatch.setattr(logs, "_enabled", None)
     monkeypatch.setattr(logs, "_path", None)
+    # 批量 flush 测试化：间隔置 0 使每条事件立即冲盘（测试断言的是落盘内容，
+    # 而不是主链路 2 秒节流窗口）
+    monkeypatch.setattr(logs, "_FLUSH_INTERVAL", 0.0)
+    monkeypatch.setattr(logs, "_last_flush", 0.0)
 
 
 @pytest.fixture()

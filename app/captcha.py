@@ -178,7 +178,10 @@ class CaptchaManager:
         self._pool_sizes: dict[str, int] = {}
         self._refill_task: asyncio.Task | None = None
         self._refilling = False
-        self._config_lock = asyncio.Lock()
+        # 配置拉取锁按出口分键（2026-11-21 review P3）：全局单锁下，A 出口的
+        # 15s 网络拉取会阻塞 B 出口的缓存命中路径（锁内含 httpx I/O）；分键后
+        # 各出口互不牵连。锁随 TTL 失效自动淘汰，防历史 tag 累积。
+        self._config_locks: dict[str, asyncio.Lock] = {}
         # 求解并发上限（进程级）：池空突发时不按请求数拉起 N 个 Chromium
         self._solve_sem = asyncio.Semaphore(settings.CAPTCHA_MAX_CONCURRENT_SOLVES)
         # 配置按出口缓存：上游按出口 IP 给不同的 captcha 配置（实测直连 region=cn、
@@ -223,7 +226,11 @@ class CaptchaManager:
         ttl = settings.CAPTCHA_CONFIG_CACHE_TTL
         if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
             return self._config_cache[tag]
-        async with self._config_lock:
+        # 按出口分键锁（双检模式不变）；锁上限裁剪防历史 tag 无界增长
+        if len(self._config_locks) > 64 and tag not in self._config_locks:
+            self._config_locks.clear()
+        config_lock = self._config_locks.setdefault(tag, asyncio.Lock())
+        async with config_lock:
             # 双检：等锁期间可能已被其他请求填充
             if self._config_cache.get(tag) and _now_ms() - self._config_cache_at.get(tag, 0) < ttl:
                 return self._config_cache[tag]
@@ -315,6 +322,15 @@ class CaptchaManager:
             except Exception:  # noqa: BLE001
                 pass
         self._refill_task = None
+        # 热路径触发的补货任务一并收口（2026-11-21 review P3）：原先只收
+        # _refill_task，池空触发的 _refill_batch 在停机后仍持引用逃逸
+        bg = list(self._bg_tasks)
+        self._bg_tasks.clear()
+        for t in bg:
+            if not t.done():
+                t.cancel()
+        if bg:
+            await asyncio.gather(*bg, return_exceptions=True)
 
     def _gate_open(self) -> bool:
         """是否允许**预热**：存在可走 Plan 对话的 jwt 账号才预热。
@@ -467,7 +483,10 @@ class CaptchaManager:
         scene = config.get("sceneId") or constants.CAPTCHA_DEFAULTS["sceneId"]
         region = config.get("region") or constants.CAPTCHA_DEFAULTS["region"]
         prefix = config.get("prefix") or constants.CAPTCHA_DEFAULTS["prefix"]
-        retries = max(1, int(max_retries or settings.CAPTCHA_SOLVE_RETRIES))
+        # 显式 0 = 「本轮禁用重试」（调用方契约），不能被 `or` 吞成默认值——
+        # claim 链传小值防长尾，0 意为 1 次尝试即止（2026-11-21 review P3）
+        retries = settings.CAPTCHA_SOLVE_RETRIES if max_retries is None \
+            else max(1, int(max_retries))
 
         attribution: str | None = None
         last_err: str | None = None

@@ -14,6 +14,8 @@ import json
 import time
 import uuid
 
+from . import body_transform
+
 # Anthropic stop_reason → OpenAI finish_reason
 _STOP_REASON_MAP = {
     "end_turn": "stop",
@@ -76,15 +78,16 @@ def image_block(url: str) -> dict | None:
 
 def _blocks_from_user_content(content: object) -> list[dict]:
     if isinstance(content, str):
-        return [{"type": "text", "text": content}] if content else [{"type": "text", "text": ""}]
+        return [{"type": "text", "text": content}] if content else []
     if not isinstance(content, list):
-        return [{"type": "text", "text": ""}]
+        return []
     blocks: list[dict] = []
     for item in content:
         if not isinstance(item, dict):
             continue
         if item.get("type") == "text" and isinstance(item.get("text"), str):
-            blocks.append({"type": "text", "text": item["text"]})
+            if item["text"]:
+                blocks.append({"type": "text", "text": item["text"]})
         elif item.get("type") == "image_url":
             url = (item.get("image_url") or {})
             if isinstance(url, dict):
@@ -92,7 +95,7 @@ def _blocks_from_user_content(content: object) -> list[dict]:
             block = image_block(str(url))
             if block:
                 blocks.append(block)
-    return blocks or [{"type": "text", "text": ""}]
+    return blocks
 
 
 def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
@@ -106,6 +109,7 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
 
     system_parts: list[str] = []
     out_msgs: list[dict] = []
+    pending_tool_results: list[dict] = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -116,15 +120,20 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
             if text:
                 system_parts.append(text)
         elif role == "tool":
-            out_msgs.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": str(msg.get("tool_call_id") or ""),
-                    "content": _text_from_content(content),
-                }],
+            # 并行 tool_calls（2026-11-21 review P2）：OpenAI 侧 N 条连续 role:"tool"
+            # 是同一次 assistant tool_calls 的 N 个结果，必须合并为**单条** user
+            # 消息的多 tool_result block——Anthropic wire 不允许连续同 role 消息，
+            # 逐条展开会生成 N 条相邻 user（官方客户端永不发这个形状）。
+            pending_tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": str(msg.get("tool_call_id") or ""),
+                "content": _text_from_content(content),
             })
         elif role == "assistant":
+            # 聚积累中断：assistant/system 等非 tool 消息先冲刷已聚的 tool_results
+            if pending_tool_results:
+                out_msgs.append({"role": "user", "content": pending_tool_results})
+                pending_tool_results = []
             blocks: list[dict] = []
             text = _text_from_content(content)
             if text:
@@ -147,12 +156,24 @@ def openai_to_anthropic(payload: dict) -> tuple[dict | None, str | None]:
                     "name": str(fn.get("name") or ""),
                     "input": args if isinstance(args, dict) else {},
                 })
-            out_msgs.append({
-                "role": "assistant",
-                "content": blocks or [{"type": "text", "text": ""}],
-            })
+            # 全空 assistant（content=None 且无 tool_calls）整体跳过：
+            # Anthropic wire 拒空 content 数组，空 block 与空数组同症
+            if blocks:
+                out_msgs.append({"role": "assistant", "content": blocks})
         else:  # user 及未知角色一律按 user 处理
-            out_msgs.append({"role": "user", "content": _blocks_from_user_content(content)})
+            if pending_tool_results:
+                out_msgs.append({"role": "user", "content": pending_tool_results})
+                pending_tool_results = []
+            user_blocks = _blocks_from_user_content(content)
+            if user_blocks:
+                out_msgs.append({"role": "user", "content": user_blocks})
+
+    # 循环结束后冲刷残余（messages 以 tool 收尾的合法序列）
+    if pending_tool_results:
+        out_msgs.append({"role": "user", "content": pending_tool_results})
+
+    if not out_msgs:
+        return None, "messages 中没有可映射的内容"
 
     # 结构化输出：anthropic wire 没有 response_format，用 system 指令逼近。
     # 只对显式要求 JSON 的调用生效；不改变普通对话的提示词。
@@ -242,11 +263,18 @@ def anthropic_to_openai(data: dict, model: str) -> dict:
         if block.get("type") == "text" and isinstance(block.get("text"), str):
             text_parts.append(block["text"])
         elif block.get("type") == "tool_use":
+            # ToolSearch 别名反向还原（2026-11-21 review P2）：请求侧把客户端的
+            # ToolSearch 改名为 ToolSearchTool 上游，模型对别名的调用在出口必须
+            # 还原回原名，否则客户端拿到一个它从未声明过的工具名（/v1/messages
+            # 直通路径在 gateway.to_streaming 已做，此处对齐补齐 compat 出口）。
+            tool_name = str(block.get("name") or "")
+            if tool_name == body_transform.TOOL_SEARCH_ALIAS:
+                tool_name = body_transform.TOOL_SEARCH
             tool_calls.append({
                 "id": str(block.get("id") or ""),
                 "type": "function",
                 "function": {
-                    "name": str(block.get("name") or ""),
+                    "name": tool_name,
                     "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
                 },
             })
@@ -328,13 +356,17 @@ class StreamConverter:
         if etype == "content_block_start":
             block = evt.get("content_block") or {}
             if block.get("type") == "tool_use":
+                # ToolSearch 别名反向还原（对齐 anthropic_to_openai 出口口径）
+                tool_name = str(block.get("name") or "")
+                if tool_name == body_transform.TOOL_SEARCH_ALIAS:
+                    tool_name = body_transform.TOOL_SEARCH
                 idx = self._tool_seq
                 self._tool_seq += 1
                 return [self._chunk_event({"tool_calls": [{
                     "index": idx,
                     "id": str(block.get("id") or ""),
                     "type": "function",
-                    "function": {"name": str(block.get("name") or ""), "arguments": ""},
+                    "function": {"name": tool_name, "arguments": ""},
                 }]})]
             return []
         if etype == "content_block_delta":
@@ -373,7 +405,14 @@ class StreamConverter:
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
         if finish_reason is not None:
-            payload["usage"] = dict(self.usage)
+            # 出口把 None（上游未上报）归一为 0：OpenAI 客户端按 int 消费 usage，
+            # null 会炸严格解析器；内部统计（self.usage）仍保留 None=未知 语义
+            # （reqlog input_tokens/output_tokens 依赖它区分「未上报」与「真零」）。
+            payload["usage"] = {
+                "prompt_tokens": self.usage["prompt_tokens"] or 0,
+                "completion_tokens": self.usage["completion_tokens"] or 0,
+                "total_tokens": self.usage["total_tokens"] or 0,
+            }
         return payload
 
 

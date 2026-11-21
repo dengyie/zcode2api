@@ -62,6 +62,10 @@ REQLOG_PATH = DATA_DIR / "reqlog.jsonl"
 # 干扰（2.7.58-61 领取失败潮跨日排查实战提炼）；关闭 = ZCODE_OPSLOG_PERSIST=0。
 OPSLOG_PERSIST = _bool("ZCODE_OPSLOG_PERSIST", True)
 OPSLOG_PATH = DATA_DIR / "opslog.jsonl"
+# 请求日志 prompt 片段开关（2026-11-21 review P2 隐私面）：req() 缺省不在
+# stdout/opslog 落用户对话内容（只落 <N chars> 占位）；本地排障显式置 1 才
+# 保留 40 字符片段。
+LOG_PROMPT_PREVIEW = _bool("ZCODE_LOG_PROMPT_PREVIEW", False)
 # 前端目录（前后端分离）：默认仓库根 frontend/，可用 ZCODE_FRONTEND_DIR 指向
 # 独立部署目录（线上 /data/zcode-hub/frontend）；包内 statics 仅作兜底
 FRONTEND_DIR = _resolve_path(
@@ -74,8 +78,39 @@ PORT = _int("ZCODE_PORT", 3000)
 HOST = os.getenv("ZCODE_HOST", "0.0.0.0")
 
 # ── 鉴权 ─────────────────────────────────────────────────────────────────────
+# 管理面失败锁定是否采信 cf-connecting-ip/x-real-ip 代理头（2026-11-21 review
+# P1 信任边界）：true 仅当部署处于可信反向代理之后（CF Tunnel / nginx，由代理
+# 覆写真实客户端 IP）；缺省 false = 用 socket 对端地址，直连部署上客户端伪造头
+# 无法绕过 admin/gateway key 的失败锁定。tebi canonical 部署（127.0.0.1 + CF
+# Tunnel）须显式设 true 才能按真实公网客户端 IP 锁定。
+TRUST_PROXY_HEADERS = _bool("ZCODE_TRUST_PROXY_HEADERS", False)
+
 # 后台管理密码默认值，首次启动写入 data/accounts.db，之后以数据库（meta 表）为准。
-DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
+# 强度闸（2026-11-21 review P1）：缺省 "zcode" 5 字符弱口令 + 失败锁定绕过面 =
+# 暴露部署上可被秒猜（export 端点明文导出全部 JWT/apiKey = 整机接管）。env 显式
+# 设置也过同款强度校验（与后台 PUT ≥12 字符口径一致）；不达标时生成随机 key
+# 打印一次（jupyter token 风格），弱口令永不落库。
+_DEFAULT_ADMIN_KEY = os.getenv("ZCODE_ADMIN_KEY", "zcode")
+
+
+def _admin_key_ok(key: str) -> bool:
+    return len(key.strip()) >= 12
+
+
+if _admin_key_ok(_DEFAULT_ADMIN_KEY):
+    DEFAULT_ADMIN_KEY = _DEFAULT_ADMIN_KEY.strip()
+else:
+    import secrets as _secrets
+
+    DEFAULT_ADMIN_KEY = _secrets.token_urlsafe(18)
+    if _DEFAULT_ADMIN_KEY.strip() and _DEFAULT_ADMIN_KEY.strip() != "zcode":
+        # 用户显式给了 env 但不达标：说明原因并拒绝采用（静默换随机值会让
+        # 运维拿着 env 里的弱 key 登录失败排查半天）
+        print(f"[zcode-hub] ZCODE_ADMIN_KEY 强度不足（需 ≥12 字符），已生成随机初始密钥："
+              f"{DEFAULT_ADMIN_KEY}", flush=True)
+    else:
+        print(f"[zcode-hub] 未设置 ZCODE_ADMIN_KEY，随机初始后台密钥（请尽快在后台修改）："
+              f"{DEFAULT_ADMIN_KEY}", flush=True)
 
 # ── 验证码 ───────────────────────────────────────────────────────────────────
 # 预解 token 池。真浏览器求解重（单枚 10–40s、Chromium 数百 MB），池收敛为 1/2
@@ -232,7 +267,9 @@ ACCOUNT_CONCURRENCY = 3
 # 9 号全在 2.83~2.96 亿档、差距 <5%，连选 8 次恒中同一号）。5% 的取值依据：
 # 快照漂移远小于此（单请求用量 ~0.001%），真实档位差远大于此（档外号 94% vs
 # 首富 100%）。env 可覆盖：档位分层过细（轮换面变小）时运维可放宽。
-SELECT_TIE_TOLERANCE = float(os.getenv("ZCODE_SELECT_TIE_TOLERANCE", "0.05"))
+# 平局容差带（2026-11-21 review P3：此前裸 float() 是全模块唯一不做容错的数值
+# env——脏值 import 期崩启动；负数还会让 store.select 的容差判定语义反转）
+SELECT_TIE_TOLERANCE = max(0.0, _float("ZCODE_SELECT_TIE_TOLERANCE", 0.05))
 # ── per-account 出口隔离（2.7.36，需求 = 每账号一个独立 IP 互相隔离）──────────
 # 依据：①上游按出口 IP 风控（magpie 实证：同 IP 同时用 3 个账号即触发边缘
 # 405 封地址，2 个不封——共享出口下 7 号远超红线）；②3008 风暴全池均匀爆发

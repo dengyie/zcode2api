@@ -53,6 +53,12 @@ _DROP_HEADERS = {
     # Claude Code / Anthropic SDK 客户端会带——透传进去 = 官方不会发的形状，
     # 本仓 3012 归因哲学（形状问题优先）下的结构性嫌疑面（2.7.68 review）
     "anthropic-beta",
+    # 验证码头由本服务现解现填（2026-11-21 review P2：此前漏在剔除表外，且透传
+    # 循环在仿真头之后执行——客户端带自己的（必然过期的）验证码头即可覆盖刚解出
+    # 的 token，请求必 3007 → invalidate 清空整池 → 连环重解白烧求解预算）。
+    # AGENTS.md 明文「验证码/身份头由本服务仿真，客户端透传不得覆盖」。
+    "x-aliyun-captcha-verify-param",
+    "x-aliyun-captcha-verify-region",
 }
 
 # 前缀剔除：本服务仿真的头族 + 客户端 SDK 特征头族。
@@ -61,8 +67,10 @@ _DROP_HEADERS = {
 # 且 zapi（Node fetch 直发、无 stainless 头）长期被上游正常接受，剔除后同为已验证形状。
 # x-forwarded-*/forwarded/x-real-ip/via/cf-*/cdn-loop 是反代与 CDN 隧道注入的
 # 基础设施头（2026-09 review）：官方客户端永不携带，透传泄露部署拓扑并构成指纹矛盾。
+# openai-*（organization/project/beta 等）是 OpenAI SDK 特征头族（2026-11-21 review
+# P2/P3）：官方 ZCode 桌面端对 z.ai 上游永不携带，透传即矛盾信号。
 _DROP_HEADER_PREFIXES = ("x-zcode", "x-stainless", "x-forwarded", "forwarded",
-                         "x-real-ip", "via", "cf-", "cdn-loop")
+                         "x-real-ip", "via", "cf-", "cdn-loop", "openai-")
 
 
 def build_request(

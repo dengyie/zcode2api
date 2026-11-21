@@ -40,6 +40,24 @@ _current_day = ""
 _lock = threading.Lock()
 _enabled: bool | None = None  # 惰性读 settings（logs 被 settings 前的模块引用）
 _path: Path | None = None
+_last_flush = 0.0
+_FLUSH_INTERVAL = 2.0  # 秒；吞吐与崩溃丢失窗口的折中（reqlog 同量级）
+
+
+_prompt_preview: bool | None = None
+
+
+def settings_prompt_preview() -> bool:
+    """惰性读 ZCODE_LOG_PROMPT_PREVIEW（缺省关），对齐 _enabled 的时序守卫。"""
+    global _prompt_preview
+    if _prompt_preview is None:
+        try:
+            from . import settings
+
+            _prompt_preview = bool(settings.LOG_PROMPT_PREVIEW)
+        except Exception:  # pragma: no cover - settings 尚未就绪的极端时序
+            _prompt_preview = False
+    return _prompt_preview
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -54,7 +72,7 @@ def _opslog(level: str, tag: str, msg: str) -> None:
     任何失败都静默吞掉（磁盘满/NFS 抖动 → 丢弃本条、句柄作废、下条重试）：
     观测组件绝不影响主链路。stdout print 本身已是第一通道，这里只做增强。
     """
-    global _fh, _current_day, _enabled, _path
+    global _fh, _current_day, _enabled, _path, _last_flush
     if _enabled is None:
         try:
             from . import settings
@@ -100,7 +118,15 @@ def _opslog(level: str, tag: str, msg: str) -> None:
                 _fh = _path.open("a", encoding="utf-8")
                 _current_day = today
             _fh.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
-            _fh.flush()
+            # 批量 flush（2026-11-21 review P2）：opslog 每条事件一次 flush 在
+            # NFS /data 上是一次网络往返，且 _opslog 跑在事件循环线程——高频
+            # warn/info 时直接卡热路径。改为「行缓冲累计 + 节流落盘」：距上次
+            # flush 超过 _FLUSH_INTERVAL 秒才 flush；进程退出由 shutdown_flush
+            # 收口（对齐 reqlog 的「观测不影响主链路」承诺）。
+            now = time.monotonic()
+            if now - _last_flush >= _FLUSH_INTERVAL:
+                _fh.flush()
+                _last_flush = now
     except (OSError, ValueError):
         try:
             if _fh is not None:
@@ -134,11 +160,23 @@ def err(module: str, msg: str):
 
 
 def req(req_id: str, model: str, stream: bool, last_msg: str):
-    """请求日志 — 一行显示关键信息"""
+    """请求日志 — 一行显示关键信息。
+
+    prompt 片段脱敏（2026-11-21 review P2/P3）：`last_msg` 是用户对话内容，
+    落 stdout（supervisor out.log）与 opslog.jsonl（长期保留、且是告警守护的
+    grep 源）构成隐私面。缺省只落长度占位；显式 ZCODE_LOG_PROMPT_PREVIEW=1
+    （本地排障）才保留 40 字符片段。
+    """
     s = "stream" if stream else "sync"
-    msg_preview = last_msg[:40] + ("..." if len(last_msg) > 40 else "")
-    print(f"  {_stamp()} {_C}>>>{_R} {_DIM}{req_id}{_R}  {_W}{model}{_R}  {_DIM}{s}{_R}  {_DIM}\"{msg_preview}\"{_R}")
-    _opslog("req", "gateway", f">>> {req_id} {model} {s} \"{msg_preview}\"")
+    if settings_prompt_preview():
+        msg_preview = last_msg[:40] + ("..." if len(last_msg) > 40 else "")
+        preview_part = f'  {_DIM}"{msg_preview}"{_R}'
+        ops_tail = f' "{msg_preview}"'
+    else:
+        preview_part = f"  {_DIM}<{len(last_msg)} chars>{_R}"
+        ops_tail = f" <{len(last_msg)} chars>"
+    print(f"  {_stamp()} {_C}>>>{_R} {_DIM}{req_id}{_R}  {_W}{model}{_R}  {_DIM}{s}{_R}{preview_part}")
+    _opslog("req", "gateway", f">>> {req_id} {model} {s}{ops_tail}")
 
 
 def req_ok(req_id: str, tokens: int = 0):
@@ -175,12 +213,19 @@ def opslog_stats() -> dict:
 
 
 def opslog_close() -> None:
-    """停机收口：关闭落盘句柄（lifespan finally 调用；防止缓冲丢失）。"""
-    global _fh
+    """停机收口：冲刷缓冲后关闭落盘句柄（lifespan finally 调用）。
+
+    批量 flush（2026-11-21 review P2）后，尾部 ≤_FLUSH_INTERVAL 秒的事件行
+    尚在 OS 页缓存之外的用户态缓冲里，停机必须显式冲刷，否则最后一批观测
+    证据丢失。
+    """
+    global _fh, _last_flush
     with _lock:
         if _fh is not None:
             try:
+                _fh.flush()
                 _fh.close()
             except OSError:
                 pass
             _fh = None
+            _last_flush = 0.0

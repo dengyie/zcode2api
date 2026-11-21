@@ -278,3 +278,36 @@ class TestConcurrencySetting:
                                    headers={"Authorization": "Bearer zcode"})
             assert res.status_code == 200
             assert res.json()["account_concurrency"] == 3
+
+
+async def test_schedule_install_dedupes_inflight(fresh_app, monkeypatch):
+    """按账号在途去重（2026-11-21 review P3）：同账号连击调度只跑一个任务，
+    防止多个安装任务并发重复打 configs/激活事件。"""
+    import asyncio
+
+    from app import install
+
+    acc = fresh_app.add_account("zai", "t", "h1.eyJzdWIiOiJhIn0.sig")
+
+    calls = []
+    started = asyncio.Event()
+
+    async def fake_seq(account):
+        calls.append(account.id)
+        started.set()
+        await asyncio.sleep(0.05)  # 保持任务在途窗口
+        return {"errors": [], "configs_fetched": True,
+                "events_reported": [], "installed": True, "skipped": False}
+
+    monkeypatch.setattr(install, "run_install_sequence_for_account", fake_seq)
+
+    install.schedule_install(acc)
+    install.schedule_install(acc)  # 连击第二次：在途应被跳过
+    await started.wait()
+    # 第二次调度发生在首任务在途期间 → 只有一个任务
+    await asyncio.sleep(0.1)
+    assert calls == [acc.id]
+    # 任务完成后再调度：允许新一轮
+    install.schedule_install(acc)
+    await asyncio.sleep(0.15)
+    assert len(calls) == 2

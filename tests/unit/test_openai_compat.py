@@ -141,6 +141,70 @@ class TestOpenaiToAnthropic:
         assert body["metadata"] == {"session_id": "meta-sess-1"}
         assert body["conversation_id"] == "conv-root-2"
 
+    def test_parallel_tool_results_merged_into_single_user_message(self):
+        """并行 tool_calls（2026-11-21 review P2）：N 条连续 role:"tool" 必须合并
+        为单条 user 多 tool_result block，不能展开成 N 条相邻 user 消息。"""
+        body, err = openai_to_anthropic({
+            "model": "glm-5.3",
+            "messages": [
+                {"role": "user", "content": "查两地天气"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "a", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{}"}},
+                    {"id": "b", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "晴"},
+                {"role": "tool", "tool_call_id": "b", "content": "雨"},
+            ],
+        })
+        assert err is None
+        roles = [m["role"] for m in body["messages"]]
+        assert roles == ["user", "assistant", "user"]
+        merged = body["messages"][2]
+        assert len(merged["content"]) == 2
+        assert merged["content"][0]["tool_use_id"] == "a"
+        assert merged["content"][1]["tool_use_id"] == "b"
+
+    def test_tool_results_flushed_on_interleaved_user(self):
+        """交错序列：tool → user → tool 各自成条，聚合在非 tool 消息处冲刷。"""
+        body, err = openai_to_anthropic({
+            "model": "glm-5.3",
+            "messages": [
+                {"role": "tool", "tool_call_id": "x", "content": "r1"},
+                {"role": "user", "content": "next"},
+                {"role": "tool", "tool_call_id": "y", "content": "r2"},
+            ],
+        })
+        assert err is None
+        assert [m["role"] for m in body["messages"]] == ["user", "user", "user"]
+        assert body["messages"][0]["content"][0]["type"] == "tool_result"
+        assert body["messages"][1]["content"][0]["text"] == "next"
+        assert body["messages"][2]["content"][0]["type"] == "tool_result"
+
+    def test_empty_text_blocks_skipped(self):
+        """空 text block（2026-11-21 review P2）：上游拒空 text block，空串
+        content 与空块数组都要跳过而非产出 {"text": ""}。"""
+        body, err = openai_to_anthropic({
+            "model": "glm-5.3",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": ""},
+                {"role": "user", "content": ""},
+            ],
+        })
+        assert err is None
+        # 空 assistant 与空 user 均整体跳过，只剩首轮
+        assert [m["role"] for m in body["messages"]] == ["user"]
+        assert body["messages"][0]["content"] == [{"type": "text", "text": "hi"}]
+
+    def test_all_empty_messages_rejected(self):
+        body, err = openai_to_anthropic({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": ""}],
+        })
+        assert body is None and err is not None
+
 
 
 class TestAnthropicToOpenai:
@@ -180,6 +244,26 @@ class TestAnthropicToOpenai:
             "stop_reason": "max_tokens", "usage": {},
         }, "GLM-5.3")
         assert out["choices"][0]["finish_reason"] == "length"
+
+    def test_tool_search_alias_reversed_in_response(self):
+        """出口别名还原（2026-11-21 review P2）：模型对 ToolSearchTool 的调用
+        必须还原回客户端声明的 ToolSearch，否则客户端收到从未声明过的工具名。"""
+        out = anthropic_to_openai({
+            "id": "m", "type": "message",
+            "content": [{"type": "tool_use", "id": "c1", "name": "ToolSearchTool",
+                         "input": {"query": "bash"}}],
+            "stop_reason": "tool_use", "usage": {},
+        }, "GLM-5.3")
+        fn = out["choices"][0]["message"]["tool_calls"][0]["function"]
+        assert fn["name"] == "ToolSearch"
+
+    def test_usage_missing_defaults_to_zero(self):
+        """usage 缺失（上游未上报）出口归一为 0，不给客户端 null。"""
+        out = anthropic_to_openai({
+            "id": "m", "type": "message", "content": [{"type": "text", "text": "x"}],
+            "stop_reason": "end_turn",
+        }, "GLM-5.3")
+        assert out["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
 def _parse_sse(s: str) -> list[dict]:
@@ -229,6 +313,29 @@ class TestStreamConverter:
         assert tcs[0]["id"] == "call_1" and tcs[0]["function"]["name"] == "f"
         assert "".join(t["function"]["arguments"] for t in tcs) == '{"a":1}'
         assert [t["index"] for t in tcs] == [0, 0, 0]
+
+    def test_stream_tool_alias_reversed(self):
+        """流式出口别名还原（2026-11-21 review P2）：对齐 anthropic_to_openai。"""
+        conv = StreamConverter("GLM-5.3")
+        conv.start()
+        outs = conv.feed({"type": "content_block_start", "index": 0,
+                          "content_block": {"type": "tool_use", "id": "c1",
+                                            "name": "ToolSearchTool"}})
+        chunks = _parse_sse("".join(outs))
+        assert chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "ToolSearch"
+
+    def test_stream_usage_null_normalized_to_zero(self):
+        """流式出口 usage 缺失归一 0（2026-11-21 review P2）：客户端按 int
+        消费，null 炸严格解析器；内部统计仍保留 None=未上报语义。"""
+        conv = StreamConverter("GLM-5.3")
+        conv.start()
+        outs = conv.feed({"type": "message_delta",
+                          "delta": {"stop_reason": "end_turn"}})
+        chunks = _parse_sse("".join(outs))
+        final = [c for c in chunks if c["choices"][0]["finish_reason"]][0]
+        assert final["usage"] == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # 内部统计保持 None 语义（reqlog 依赖区分「未上报」与「真零」）
+        assert conv.usage["prompt_tokens"] is None
 
     def test_unknown_events_ignored(self):
         conv = StreamConverter("GLM-5.3")
