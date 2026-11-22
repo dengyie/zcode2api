@@ -477,7 +477,8 @@ class TetherPoolEgress:
         # rebalance（健康探针判败后的自救）恒被「去抖窗内」吞掉。
         if last is not None and now - last < settings.TP_REBALANCE_DEBOUNCE:
             logs.info("egress_pool", f"{account.name} rebalance 去抖窗内，跳过")
-            return False        # 去抖位改在函数收尾统一置位（2.7.68：旧实现取「首次 acquire 成功」的
+            return False
+        # 去抖位改在函数收尾统一置位（2.7.68：旧实现取「首次 acquire 成功」的
         # 入口时刻，4 轮 rebalance 实测 2-3 分钟 > 120s 去抖——首个 rebalance
         # 结束瞬间下一个触发可立即再跑一轮全量 churn）。任一真实 acquire 后
         # 都盖结束时刻戳：成功换绑安静 120s，失败/churn 同样安静 120s。
@@ -963,7 +964,13 @@ class TetherPoolEgress:
                                       "系统性故障（alicdn/上游全局劣化），本轮全账号"
                                       "降级只记 streak 不 rebalance")
                             for account in accounts:
-                                streak = self._probe_fail_streak.get(account.id, 0) + 1
+                                # 封顶（2026-11-22 迭代三收口）：无界累积会让
+                                # 环境恢复后首个正常轮的偶发探针失败立即跨过
+                                # threshold——与「连续 N 轮失败才换」的单轮抖动
+                                # 容忍语义冲突。封顶 = 恢复期重新从存量数起。
+                                streak = min(
+                                    self._probe_fail_streak.get(account.id, 0) + 1,
+                                    settings.TP_HEALTH_FAIL_THRESHOLD)
                                 self._probe_fail_streak[account.id] = streak
                             continue
                     for account in accounts:
@@ -1004,10 +1011,9 @@ class TetherPoolEgress:
                 self._inflight.add(task)
                 task.add_done_callback(self._inflight.discard)
                 # 防重对齐 _loop_task（review P2：二次 start 会覆盖引用泄漏
-                # 一个 while-True 孤儿任务）
-                if self._reconcile_loop_task is None or self._reconcile_loop_task.done():
-                    self._reconcile_loop_task = asyncio.create_task(
-                        self._reconcile_loop())
+                # 一个 while-True 孤儿任务）。创建即挂崩溃回调（2026-11-22
+                # 迭代三收口：rebase 曾遗留双份创建块，第二份条件恒 False =
+                # 回调永不挂载、修复未生效——生产路径实证回调数 0）。
                 if self._reconcile_loop_task is None or self._reconcile_loop_task.done():
                     self._reconcile_loop_task = asyncio.create_task(
                         self._reconcile_loop())

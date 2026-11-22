@@ -178,6 +178,9 @@ def test_gateway_constants():
     from app.routes import gateway
     assert gateway.MAX_CAPTCHA_RETRIES == MAX_CAPTCHA_RETRIES
     assert gateway.MAX_ACCOUNT_ATTEMPTS == MAX_ACCOUNT_ATTEMPTS
+    # 单请求全局求解预算（2.7.76 review P2，2026-11-22 迭代三收口补契约锁定）：
+    # 进程级止损点——换号不重置，吃满即拒。回归下限锁死防误改回 0/超大。
+    assert gateway.MAX_CAPTCHA_SOLVES_PER_REQUEST == 6
 
 
 def test_risk_control_signals():

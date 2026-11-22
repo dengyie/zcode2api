@@ -1798,3 +1798,34 @@ async def test_tier_audit_fail_open_on_missing_tier_snapshot(tp_mode, monkeypatc
     pool = egress_pool.TetherPoolEgress()
     await pool._audit_tier_once(initial_delay=0)
     assert rebalanced == []
+
+
+@pytest.mark.asyncio
+async def test_rebalance_debounce_gate_blocks_recovery_round(tp_mode, monkeypatch):
+    """迭代二 F1 回归防线（2026-11-22 迭代三收口）：去抖窗内的 rebalance 必须在
+    预检层被拦（0 次 _rebalance_locked 调用）——若预检被删、去抖退回
+    _rebalance_locked 入口，本函数返回值同为 False，但恢复轮会 pop 戳重跑一轮
+    acquire = 去抖被架空（当日 review 实证的 P1 修复失效形态）。
+
+    断言 _rebalance_locked 调用次数 == 0 是唯一能防住该回归的观测点。"""
+    calls: list[str] = []
+
+    async def fake_locked(self, account, reason=None, ban=True):
+        calls.append(reason)
+        pool._rebalance_at[account.id] = time.monotonic()  # 收尾盖戳
+        return True
+
+    monkeypatch.setattr(egress_pool.TetherPoolEgress, "_rebalance_locked",
+                        fake_locked)
+    monkeypatch.setattr(egress_pool.settings, "TP_REBALANCE_RETRY_DELAY", 0)
+    acc = _account(acc_id="acc-d")
+    acc.egress_node = "old-node"
+
+    pool = egress_pool.TetherPoolEgress()
+    monkeypatch.setattr(settings, "TP_REBALANCE_DEBOUNCE", 120)
+    assert await pool.rebalance(acc, reason="first", ban=False) is True
+    assert calls == ["first"]
+    # 去抖窗内再触发：预检直接 False，锁内方法零调用（恢复轮不进）
+    assert await pool.rebalance(acc, reason="second", ban=False) is False
+    assert calls == ["first"], \
+        f"去抖窗内预检未拦（锁内方法被调 {calls}）——恢复轮将架空去抖语义"

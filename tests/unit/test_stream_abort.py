@@ -97,3 +97,55 @@ async def test_stream_abort_records_result_and_triggers_rebalance(tp_mode, monke
 async def test_stream_abort_without_account_is_noop(tp_mode):
     up = type("Up", (), {"account": None})()
     gw._note_stream_abort(up, RuntimeError("x"), "req9")  # 不抛即通过
+
+
+@pytest.mark.asyncio
+async def test_transport_abort_emits_fail_frames(tp_mode, monkeypatch):
+    """迭代二 P1 回归防线（2026-11-22 迭代三收口）：流已开帧后上游传输层断开
+    （ReadTimeout/Server disconnected 等普通 Exception，非 UpstreamStreamError）
+    时，带转译层的路径必须产出客户端可识别失败帧——此前半截回答以干净 EOF
+    呈现成功；且 fail_frames 在普通异常上不得炸 AttributeError（收口前
+    `err.code` 直接 AttributeError，修复在最常见触发形态下自身崩溃）。"""
+    acc = _account()
+    up = type("Up", (), {"account": acc, "t_first": None,
+                         "close": lambda *a: asyncio.sleep(0)})()
+    transport_err = TimeoutError("timed out")  # httpx.ReadTimeout 同形态
+
+    def fail_frames(err):
+        # responses 路径同款契约：读 code 属性（曾因普通异常无此属性而炸）
+        code = getattr(err, "code", None)
+        return [f"event: response.failed\ndata: {code or 'upstream_error'}\n\n"]
+
+    @gw._sse_guard("req-ttf", up, fail_frames=fail_frames)
+    async def guarded():
+        yield "event: response.created\n\n"
+        raise transport_err
+
+    frames = [f async for f in guarded()]
+    # 起始帧 + 传输中断失败帧
+    assert frames == ["event: response.created\n\n",
+                      "event: response.failed\ndata: upstream_error\n\n"], \
+        f"传输中断未产出失败帧或误炸: {frames}"
+
+
+@pytest.mark.asyncio
+async def test_transport_abort_openai_fail_frames_no_attrerror(tp_mode, monkeypatch):
+    """openai-compat 路径传输中断：error_sse(lambda 读 err.code)在普通
+    Exception 上曾 AttributeError——归一后须正常产出错误帧。"""
+    from app.openai_compat import StreamConverter
+
+    acc = _account()
+    up = type("Up", (), {"account": acc, "t_first": None,
+                         "close": lambda *a: asyncio.sleep(0)})()
+    conv = StreamConverter("claude-x")
+    req_id = "req-oai"
+
+    @gw._sse_guard(req_id, up, fail_frames=lambda err: (
+        gw.error_sse(str(err), getattr(err, "code", None)), conv.done()))
+    async def guarded():
+        yield conv.start()
+        raise TimeoutError("read timeout")
+
+    frames = [f async for f in guarded()]
+    assert any("upstream_stream_error" in f for f in frames), \
+        f"openai 路径传输中断未产出 error_sse: {frames}"

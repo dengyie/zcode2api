@@ -582,7 +582,7 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
     conv = StreamConverter(model)
 
     @_sse_guard(req_id, up, fail_frames=lambda err: (
-        error_sse(str(err), err.code), conv.done()))
+        error_sse(str(err), getattr(err, "code", None)), conv.done()))
     async def _iter():
         yield conv.start()
         async for line in up.resp.aiter_lines():
@@ -610,7 +610,9 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
     chat_conv = StreamConverter(model)
     resp_conv = ResponsesStreamConverter(model)
 
-    @_sse_guard(req_id, up, fail_frames=lambda err: resp_conv.fail(str(err), err.code))
+    @_sse_guard(req_id, up,
+                fail_frames=lambda err: resp_conv.fail(
+                    str(err), getattr(err, "code", None)))
     async def _iter():
         for out in resp_conv.start():
             yield out

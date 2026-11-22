@@ -226,3 +226,60 @@ class TestCorsSeparation:
             # 未列入的源不放行
             r2 = await c.get("/meta", headers={"Origin": "https://evil.example.com"})
             assert "access-control-allow-origin" not in r2.headers
+
+
+@pytest.mark.asyncio
+async def test_loopback_listener_adopts_proxy_headers(gateway_client, monkeypatch):
+    """迭代二 P1 豁免正例（2026-11-22 迭代三收口）：进程只监听回环
+    （settings.HOST=127.0.0.1，tebi canonical 部署形态）且 socket 对端为
+    127.0.0.1 时——外部不可直连，请求只能来自本机隧道进程（cloudflared，
+    必然覆写 cf-connecting-ip）——按代理头锁真实公网来源是安全的：不同伪造头
+    = 不同计数器，锁定按真实来源分键。"""
+    from app import auth_admin, settings
+
+    monkeypatch.setattr(auth_admin, "ADMIN_FAIL_LIMIT", 3)
+    monkeypatch.setattr(settings, "HOST", "127.0.0.1")
+    monkeypatch.delenv("ZCODE_TRUST_PROXY_HEADERS", raising=False)
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", False)
+    auth_admin.reset_failures()
+    client, _ = gateway_client
+
+    # 三个「不同来源」各失败 2 次（不达 3），互不连坐——豁免路径采信代理头
+    for real_ip in ("203.0.113.10", "203.0.113.11", "203.0.113.12"):
+        for _ in range(2):
+            res = await client.get(
+                "/admin/api/verify",
+                headers={"Authorization": "Bearer wrong",
+                         "cf-connecting-ip": real_ip})
+            assert res.status_code == 401
+    # 第四个「来源」干净可连
+    res = await client.get("/admin/api/verify",
+                           headers={"Authorization": "Bearer zcode",
+                                    "cf-connecting-ip": "203.0.113.99"})
+    assert res.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_direct_bind_listener_ignores_proxy_headers(gateway_client, monkeypatch):
+    """迭代二 P1 豁免负例：监听 0.0.0.0 的直连部署上 socket=127.0.0.1 也可能
+    是本机 curl——伪造 cf-connecting-ip 不得绕过失败锁定（对齐 2026-11-21
+    P1 修复语义，豁免双条件缺一不可）。"""
+    from app import auth_admin, settings
+
+    monkeypatch.setattr(auth_admin, "ADMIN_FAIL_LIMIT", 3)
+    monkeypatch.setattr(settings, "HOST", "0.0.0.0")
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", False)
+    auth_admin.reset_failures()
+    client, _ = gateway_client
+
+    for i in range(3):
+        res = await client.get(
+            "/admin/api/verify",
+            headers={"Authorization": "Bearer wrong",
+                     "cf-connecting-ip": f"10.9.9.{i}"})
+        assert res.status_code == 401
+    # 同一对端已锁：换伪造 IP 绕不过
+    locked = await client.get("/admin/api/verify",
+                              headers={"Authorization": "Bearer zcode",
+                                       "cf-connecting-ip": "10.9.9.99"})
+    assert locked.status_code == 429

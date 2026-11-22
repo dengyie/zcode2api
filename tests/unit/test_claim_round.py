@@ -691,3 +691,48 @@ async def test_billing_post_keeps_single_attempt(monkeypatch):
     assert raised
     assert reqs == [1]  # 单发即止
     assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_round_budget_starved_accounts_lead_next_round(monkeypatch):
+    """迭代二 F1 回归防线（2026-11-22 迭代三收口）：上轮预算耗尽被跳过的账号
+    下轮必须排到队首被服务（饿一次补一次），且实际被服务即清饥饿标记。
+
+    排序方向曾写反（sort key 反向 = 饿号永远最后被服务），原有预算测试只断言
+    visited 数量防不住该回归——本测试直接断言队首身份。"""
+    import app.claim as claim_module
+    from app import settings
+
+    accounts = [_FakeAccount(f"acc-{i}", billing=True) for i in range(3)]
+    monkeypatch.setattr("app.store.store", _fake_store(accounts))
+    monkeypatch.setattr(settings, "CLAIM_ROUND_BUDGET", 0.05)
+    monkeypatch.setattr(settings, "CLAIM_ROUND_CONCURRENCY", 1)
+
+    async def fake_auto_claim(acc, *, skip_plan_ids=None):
+        await asyncio.sleep(0.08)  # 单号 80ms > 预算 50ms：首号后预算必耗尽
+        return []
+
+    monkeypatch.setattr(claim_module, "auto_claim_all_plans", fake_auto_claim)
+    visited: list[str] = []
+
+    mgr = ClaimRoundManager()
+
+    async def spy_auto(acc, *, skip_plan_ids=None):
+        visited.append(acc.id)
+        return await fake_auto_claim(acc, skip_plan_ids=skip_plan_ids)
+
+    monkeypatch.setattr(claim_module, "auto_claim_all_plans", spy_auto)
+    await mgr._round()
+    # 第 1 轮：acc-0 被访问（80ms > 50ms 预算被截断——截断同属预算饥饿，
+    # 迭代二语义），acc-1/acc-2 直接跳过；三者都应带饿号标记
+    assert visited == ["acc-0"]
+    assert set(mgr._starved_at) == {"acc-0", "acc-1", "acc-2"}
+
+    # 第 2 轮（预算拉满让全员真实跑完）：饿号按被跳过时刻先后（acc-0 最先）
+    # 排前被服务，服务后标记即清（饿一次补一次）
+    monkeypatch.setattr(settings, "CLAIM_ROUND_BUDGET", 0)
+    visited.clear()
+    await mgr._round()
+    assert visited == ["acc-0", "acc-1", "acc-2"], \
+        f"饿号未按饥饿时刻排队首（排序方向回归）: {visited}"
+    assert mgr._starved_at == {}, "被服务的饿号标记未清（饿一次补一次失效）"
