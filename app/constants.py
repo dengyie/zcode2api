@@ -139,30 +139,46 @@ CAPTCHA_DEFAULTS = {
 # 老客户端（Claude Code 配置、第三方 SDK 默认 GLM-5.2）会固定带这些名字，若原样
 # 透传，客户端拿到的是上游 3006 而网关没有任何可用模型，等于「用一个合规请求换一个
 # 必然失败的响应」。因此退役名统一改写到当前主力型号（GLM-5.3），保留大小写别名。
+#
+# 2026-11-24 上游再改名：旗舰窗口 GLM-5.3 → GLM-5.4。线上实证（19:38 同一批
+# quota 刷新）：26 个号窗口名已是 GLM-5.4、6 个号仍是 GLM-5.3（rem=0）、5 个号
+# 只剩 Flash；5.3 与 5.4 **互斥**出现 = 同一窗口改名而非新增型号；Flash 未改名
+# （37/37 号仍是 GLM-5.3-Flash）。客户端仍在发 GLM-5.3（线上历史 122 次），
+# 原样透传有两重坏处：①上游只认新名；②账号选择按**请求模型名**精确对齐额度
+# 窗口（store 模型感知排富），5.3 请求在 26 个 5.4 号眼里等于「额度未知 = 0」，
+# 可用池被凭空削掉七成。故把 GLM-5.3 并入退役名改写链 → GLM-5.4（临时兼容，
+# 旧客户端配置零改动）。客户端全量切到 5.4 后，把 "GLM-5.3" 从两张别名表与
+# 目录里删掉即回滚本兼容。
+LIVE_FLAGSHIP_MODEL = "GLM-5.4"
 RETIRED_MODEL_ALIASES = {
-    "GLM-5.2": "GLM-5.3",
-    "GLM-5-Turbo": "GLM-5.3",
-    "GLM-5.1": "GLM-5.3",
-    "GLM-4.7": "GLM-5.3",
+    "GLM-5.3": LIVE_FLAGSHIP_MODEL,
+    "GLM-5.2": LIVE_FLAGSHIP_MODEL,
+    "GLM-5-Turbo": LIVE_FLAGSHIP_MODEL,
+    "GLM-5.1": LIVE_FLAGSHIP_MODEL,
+    "GLM-4.7": LIVE_FLAGSHIP_MODEL,
 }
 MODEL_NAME_MAP = {
+    "glm-5.4": LIVE_FLAGSHIP_MODEL,
     "glm-5.3-flash": "GLM-5.3-Flash",
-    "glm-5.3": "GLM-5.3",
-    "glm-5.2": "GLM-5.3",
-    "glm-5-turbo": "GLM-5.3",
-    "glm-turbo": "GLM-5.3",
-    "glm-5.1": "GLM-5.3",
-    "glm-4.7": "GLM-5.3",
+    "glm-5.3": LIVE_FLAGSHIP_MODEL,
+    "glm-5.2": LIVE_FLAGSHIP_MODEL,
+    "glm-5-turbo": LIVE_FLAGSHIP_MODEL,
+    "glm-turbo": LIVE_FLAGSHIP_MODEL,
+    "glm-5.1": LIVE_FLAGSHIP_MODEL,
+    "glm-4.7": LIVE_FLAGSHIP_MODEL,
 }
-# /v1/models 对外公布（按账号套餐实际窗口：2026-10-30 实测只有 5.3 系可用）
-AVAILABLE_MODELS = ["GLM-5.3-Flash", "GLM-5.3"]
-# provider 命名空间模型目录（Magpie 模式：`zai/GLM-5.3` 前缀供外部 Agent 选 provider；
-# 裸名仍向后兼容，默认路由 zai）
+# /v1/models 对外公布（按账号套餐实际窗口：2026-11-24 实测旗舰窗口 = GLM-5.4）
+AVAILABLE_MODELS = ["GLM-5.3-Flash", LIVE_FLAGSHIP_MODEL]
+# provider 命名空间模型目录（Magpie 模式：`zai/GLM-5.4` 前缀供外部 Agent 选 provider；
+# 裸名仍向后兼容，默认路由 zai）。`GLM-5.3` 条目**临时保留**：部分客户端拿目录核对
+# 自己的模型名，删掉会把「配置里写 5.3」的客户端直接挡在门外（改名兼容期，见上）。
 MODEL_CATALOG = [
-    "zai/GLM-5.3-Flash",
+    "zai/GLM-5.4",
     "zai/GLM-5.3",
-    "bigmodel/GLM-5.3-Flash",
+    "zai/GLM-5.3-Flash",
+    "bigmodel/GLM-5.4",
     "bigmodel/GLM-5.3",
+    "bigmodel/GLM-5.3-Flash",
 ]
 
 # 上游 max_tokens 合法范围（2026-09-06 实测：超限报 400 code 1210

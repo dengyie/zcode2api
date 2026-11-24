@@ -91,8 +91,10 @@ class TestLoadBalancingAndAffinity:
         # b 显著更富（带外）：无粘性时新请求必选 b。窗口名用 GLM-5.3（请求
         # model "GLM-5.2" 会被 _normalize_body 的退役别名改写成 GLM-5.3，
         # 2.7.55 起模型感知排富按改写后的名对齐窗口）。
-        b.quota = {"GLM-5.3": {"total": 300_000_000, "used": 0, "remaining": 300_000_000}}
-        a.quota = {"GLM-5.3": {"total": 10_000_000, "used": 0, "remaining": 10_000_000}}
+        # 2026-11-24 上游改名：请求 model "GLM-5.2" 被 _normalize_body 改写成
+        # GLM-5.4，模型感知排富按**改写后**的名字对齐窗口，故窗口名用 GLM-5.4。
+        b.quota = {"GLM-5.4": {"total": 300_000_000, "used": 0, "remaining": 300_000_000}}
+        a.quota = {"GLM-5.4": {"total": 10_000_000, "used": 0, "remaining": 10_000_000}}
         a.quota_verified_at = time.time()
         b.quota_verified_at = time.time()
         # a 成功后后台 _safe_refresh 会用 mock 默认余额（GLM-5.3 rem=2M）覆盖

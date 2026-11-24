@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from app import constants
 from app.models import Account, Status
 from app.routes.gateway import (
     _detect_provider,
@@ -24,14 +25,14 @@ from app.routes.gateway import (
 # ── 模型归一化 ────────────────────────────────────────────────────────────────
 class TestNormalizeBody:
     def test_lowercase_alias_mapped(self):
-        # glm-5.2 是**已退役**型号（上游 3006），别名表直接改写到 GLM-5.3
+        # glm-5.2 是**已退役**型号（上游 3006），别名表直接改写到当前主力型号
         body = {"model": "glm-5.2"}
-        assert _normalize_body(body)["model"] == "GLM-5.3"
+        assert _normalize_body(body)["model"] == constants.LIVE_FLAGSHIP_MODEL
 
     def test_provider_prefix_stripped(self):
-        # 前缀剥离后仍是退役型号 → 再改写到 GLM-5.3（两层改写都覆盖）
+        # 前缀剥离后仍是退役型号 → 再改写到当前主力型号（两层改写都覆盖）
         body = {"model": "bigmodel/GLM-5.2"}
-        assert _normalize_body(body)["model"] == "GLM-5.3"
+        assert _normalize_body(body)["model"] == constants.LIVE_FLAGSHIP_MODEL
 
     def test_provider_prefix_stripped_without_alias(self):
         # 2026-11-15：现役型号带前缀 → 无别名命中也必须回写剥离结果；
@@ -43,6 +44,23 @@ class TestNormalizeBody:
     def test_unknown_model_passed_through(self):
         body = {"model": "glm-unknown"}
         assert _normalize_body(body)["model"] == "glm-unknown"
+
+    def test_legacy_glm53_rewritten_to_live_flagship(self):
+        """2026-11-24 上游改名兼容:客户端仍发 GLM-5.3 系 → 当前主力型号。
+
+        不改写有两重坏处:上游只认新名;store 模型感知排富按**请求模型名**精确
+        对齐额度窗口,5.3 请求在 5.4 号眼里等于「额度未知 = 0」(线上 37 号里
+        26 号窗口名已是 GLM-5.4),可用池被凭空削掉七成。
+        """
+        for name in ("GLM-5.3", "glm-5.3", "zai/GLM-5.3", "bigmodel/GLM-5.3"):
+            body = {"model": name}
+            assert _normalize_body(body)["model"] == constants.LIVE_FLAGSHIP_MODEL, name
+
+    def test_flash_not_renamed(self):
+        """Flash 未改名(线上 37/37 号仍是 GLM-5.3-Flash),不得被顺手改写。"""
+        for name in ("GLM-5.3-Flash", "glm-5.3-flash", "zai/GLM-5.3-Flash"):
+            body = {"model": name}
+            assert _normalize_body(body)["model"] == "GLM-5.3-Flash", name
 
     def test_string_content_bridged_to_blocks(self):
         body = {"messages": [{"role": "user", "content": "hi"}]}
@@ -371,9 +389,11 @@ class TestGatewayHTTP:
         assert res.status_code == 200
         ids = [m["id"] for m in res.json()["data"]]
         # Magpie 命名空间前缀：`zai/` 与 `bigmodel/` 前缀供外部 Agent 选 provider
+        # 2026-11-24 上游把旗舰窗口改名 GLM-5.3 → GLM-5.4:目录以 5.4 为准,
+        # 同时**保留** 5.3 条目(改名兼容期,旧客户端拿目录核对模型名)
         assert ids == [
-            "zai/GLM-5.3-Flash", "zai/GLM-5.3",
-            "bigmodel/GLM-5.3-Flash", "bigmodel/GLM-5.3",
+            "zai/GLM-5.4", "zai/GLM-5.3", "zai/GLM-5.3-Flash",
+            "bigmodel/GLM-5.4", "bigmodel/GLM-5.3", "bigmodel/GLM-5.3-Flash",
         ]
 
     async def test_messages_ok(self, gateway_client):

@@ -19,7 +19,11 @@
 { "object": "list", "data": [ { "id": "GLM-5.3-Flash", "type": "model", "display_name": "GLM-5.3-Flash", "created_at": "…" }, ... ] }
 ```
 
-模型清单来自 `constants.AVAILABLE_MODELS`（按账号实际余额窗口公布，当前 `GLM-5.3-Flash` / `GLM-5.3`）。
+模型清单来自 `constants.AVAILABLE_MODELS`（按账号实际余额窗口公布，当前 `GLM-5.3-Flash` / `GLM-5.4`）。
+
+> 2026-11-24 上游把旗舰窗口 `GLM-5.3` 改名 `GLM-5.4`：入站仍接受 `GLM-5.3`/`zai/GLM-5.3`
+> 等旧名（`_normalize_body` 改写为 `GLM-5.4` 再打上游，`constants.RETIRED_MODEL_ALIASES`），
+> `/v1/models` 目录也保留旧名条目，故旧客户端配置无需改动。`GLM-5.3-Flash` 未改名。
 
 ### 1.3 `POST /v1/chat/completions`（OpenAI 兼容）
 

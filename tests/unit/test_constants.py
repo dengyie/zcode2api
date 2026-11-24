@@ -111,7 +111,7 @@ def test_captcha_defaults_match_zcode2api():
 
 def test_model_map():
     assert constants.MODEL_NAME_MAP["glm-5.3-flash"] == "GLM-5.3-Flash"
-    assert constants.AVAILABLE_MODELS == ["GLM-5.3-Flash", "GLM-5.3"]
+    assert constants.AVAILABLE_MODELS == ["GLM-5.3-Flash", constants.LIVE_FLAGSHIP_MODEL]
 
 
 def test_retired_models_rewritten_to_live_model():
@@ -120,14 +120,15 @@ def test_retired_models_rewritten_to_live_model():
     2026-10-30 实测：套餐只放行 GLM-5.3 系，5.2/Turbo/5.1/4.7 一律 3006。
     别名表与退役表任一处漏改，客户端就会拿到必然失败的 3006。
     """
-    retired = {"GLM-5.2", "GLM-5-Turbo", "GLM-5.1", "GLM-4.7"}
+    # 2026-11-24：GLM-5.3 也被上游改名去掉（GLM-5.4），并入退役名改写链
+    retired = {"GLM-5.3", "GLM-5.2", "GLM-5-Turbo", "GLM-5.1", "GLM-4.7"}
     assert set(constants.RETIRED_MODEL_ALIASES) == retired
     assert set(constants.RETIRED_MODEL_ALIASES.values()) <= set(constants.AVAILABLE_MODELS)
     # 小写别名同样不得映射到退役名（否则别名改写会把请求送回 3006）
     assert set(constants.MODEL_NAME_MAP.values()) <= set(constants.AVAILABLE_MODELS)
-    for lower in ("glm-5.2", "glm-5-turbo", "glm-turbo", "glm-5.1", "glm-4.7"):
+    for lower in ("glm-5.3", "glm-5.2", "glm-5-turbo", "glm-turbo", "glm-5.1", "glm-4.7"):
         mapped = constants.MODEL_NAME_MAP[lower]
-        assert mapped == "GLM-5.3", lower
+        assert mapped == constants.LIVE_FLAGSHIP_MODEL, lower
 
 
 def test_rejection_signals():
