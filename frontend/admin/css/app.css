@@ -353,3 +353,8 @@ select.input option{background:var(--panel);color:var(--ink)}
   .mon-grid-agg > :nth-child(n+6){display:none}
   .mon-search{width:100%}
 }
+
+/* PATCH(2026-11-28): body>*(app.css:40) sets #admin-header and main.admin-main to the same
+   z-index:1; main comes later in DOM order and covers the fixed top bar, blocking all nav
+   clicks. Raise the header container above main; still below toast(200)/modal(300)/tip(400). */
+#admin-header{position:relative;z-index:2}
