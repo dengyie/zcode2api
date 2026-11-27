@@ -181,6 +181,10 @@ def build_app() -> FastAPI:
                 headers={"x-mock-call-index": str(n), **extra_headers},
             )
 
+        if scenario == "empty_code_zero_200":
+            return Response(json.dumps(resp_body), status_code=200, media_type="application/json",
+                            headers={"x-mock-call-index": str(n)})
+
         if stream:
             chunks = int(headers.get("x-mock-sse-chunks", 3))
             truncate_at = headers.get("x-mock-sse-truncate-at")
@@ -265,6 +269,9 @@ def build_app() -> FastAPI:
             # 2026-10-30 实测形态：Plan 通道对额度拒绝回 **HTTP 200** +
             # {"code":1005,"msg":"exceed quota limit"}（无 type/content，非 message 形状）
             return 200, {"code": 1005, "msg": "exceed quota limit"}, {}
+        if scenario == "empty_code_zero_200":
+            # 2026-11-28 实测形态：Plan 通道回 HTTP 200 + {"code":0,"msg":"","logid":...}
+            return 200, {"code": 0, "msg": "", "logid": "20261127163425af1ce30230afbf06c676"}, {}
         if scenario == "quota_exhausted_1310":
             # 周/月使用上限：HTTP 200 + {"code":1310,"msg":"...将于 <未来> 23:59 重置"}
             # 日期动态生成：gateway 只认未来时间戳（_parse_exhaust_reset），

@@ -595,6 +595,9 @@ def _openai_stream_response(up: _Upstream, model: str, req_id: str) -> Streaming
             if isinstance(evt, dict):
                 for out in conv.feed(evt):
                     yield out
+        if conv.finish_reason is None:
+            raise UpstreamStreamError("上游 SSE 流未正常结束（缺少 message_delta）",
+                                      "upstream_stream_truncated")
         yield conv.done()
         logs.req_ok(req_id)
         reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code,
@@ -628,6 +631,9 @@ def _responses_stream_response(up: _Upstream, model: str, req_id: str) -> Stream
             for chunk in chat_conv.feed_events(evt):
                 for out in resp_conv.feed_chunk(chunk):
                     yield out
+        if chat_conv.finish_reason is None:
+            raise UpstreamStreamError("上游 SSE 流未正常结束（缺少 message_delta）",
+                                      "upstream_stream_truncated")
         for out in resp_conv.done():
             yield out
         logs.req_ok(req_id)
@@ -1148,7 +1154,10 @@ class _Upstream:
             name = body_transform.TOOL_SEARCH.encode()
             keep = len(alias) - 1  # 尾部保留窗：token 可能被分块边界截断
             tail = b""
+            saw_bytes = False
             async for chunk in up.resp.aiter_bytes():
+                if chunk:
+                    saw_bytes = True
                 buf = tail + chunk
                 if alias not in buf:
                     # 快路径：本窗无别名（含截断形态）——但 buf 末尾 keep-1 字节
@@ -1169,6 +1178,8 @@ class _Upstream:
                     yield head
             if tail:
                 yield tail.replace(alias, name)
+            if not saw_bytes:
+                raise RuntimeError("上游返回空响应流")
             logs.req_ok(req_id)
             reqlog.finish_ok(req_id, t_first=up.t_first, status=up.resp.status_code)
 
@@ -1479,9 +1490,7 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                 decoded = raw.decode("utf-8", "ignore")
                 data = _safe_json(decoded)
                 code = _business_error_code(data) if isinstance(data, dict) else None
-                if code is None:
-                    resp = _buffered_response(resp, raw)
-                else:
+                if code is not None:
                     text = decoded
                     status_code = _status_for_business_code(code)
                     logs.warn(
@@ -1489,6 +1498,20 @@ async def _try_account(req_id, account, body, incoming_headers, plan_channel,
                         f"账号 {account.name} HTTP 200 承载业务错误 code={code}"
                         f"（按 {status_code} 处置）：{' '.join(text.split())[:160]}",
                     )
+                elif not isinstance(data, dict) or ("type" not in data and "content" not in data):
+                    # 2026-11-28 线上实证：zcode-plan 返回 HTTP 200 + application/json +
+                    # {"code":0,"msg":"","logid":"..."}（无 type/content，非 Anthropic message）。
+                    # 若当正常响应放行，流式端点会跳过非 data: 行并立即发出 [DONE]，表现为
+                    # 「200 空流断流」且误记 account.record_result(True)。按 502 上游异常处置。
+                    text = decoded
+                    status_code = 502
+                    logs.warn(
+                        req_id,
+                        f"账号 {account.name} HTTP {resp.status_code} 返回非 Anthropic 响应体"
+                        f"（按 502 处置）：{' '.join(text.split())[:160]}",
+                    )
+                else:
+                    resp = _buffered_response(resp, raw)
 
             if status_code >= 400:
                 _drop_gate()  # 本趟上游尝试已结束；continue 的下一趟会重新申请

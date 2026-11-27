@@ -91,6 +91,10 @@ class TestCaptchaFetchConfigIdentity:
         """client/configs（captcha 配置路径）查询串与 UA 均锚 billing 版。"""
         from app.captcha import captcha_manager
 
+        # 清缓存：全量套件里前序测试（test_egress.py 等）会写 _config_cache，
+        # 不清则命中缓存直接 return、captured 为空（单跑不暴露）。
+        monkeypatch.setattr(captcha_manager, "_config_cache", {})
+        monkeypatch.setattr(captcha_manager, "_config_cache_at", {})
         captured = _capture_client(monkeypatch, None)
         await captcha_manager.fetch_config(egress_tag="direct", proxy="http://127.0.0.1:9")
         method, url, headers, _ = captured[0]

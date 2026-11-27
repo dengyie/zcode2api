@@ -31,10 +31,15 @@ class ClaimError(Exception):
     即名额恢复时间（zcode-switch claim.rs claim_error 同形）。
     """
 
-    def __init__(self, message: str, *, code: int = -1, next_at: int | None = None) -> None:
+    def __init__(self, message: str, *, code: int = -1, next_at: int | None = None,
+                 egress_failure: bool = False) -> None:
         super().__init__(message)
         self.code = code
         self.next_at = next_at
+        # 出口链路故障标记（2.7.80）：ProxyError/读超时等网络层失败——
+        # 与业务码 -1（套餐/参数）分开判定，避免「无投放」也触发换绑白烧。
+        # 只由 _billing_request 在 TransportError 穷尽重试后打上。
+        self.egress_failure = egress_failure
 
 
 AUTH_EXPIRED_MESSAGE = "凭证失效，请重新授权"
@@ -254,8 +259,11 @@ async def _billing_request(account: Account, method: str, path: str, **kwargs) -
                     await asyncio.sleep(wait)
         assert res is not None  # 循环必经 break/raise
     except httpx.HTTPError as err:
-        # 连接/超时等网络故障统一转业务错误：路由层只需面对 ClaimError 一种失败
-        raise ClaimError(f"上游网络错误: {err}") from err
+        # 连接/超时/代理故障统一转业务错误：路由层只需面对 ClaimError 一种失败。
+        # 2.7.80：打 egress_failure 标记（GET 已重试 5 次仍败 = 出口链本身故障，
+        # 典型 ProxyError 503 = 代理链返回、非上游业务应答）——换绑链据此判定
+        # 值得换节点重打，与业务码 -1（无投放/参数错）严格分开。
+        raise ClaimError(f"上游网络错误: {err}", egress_failure=True) from err
     if res.status_code in (401, 403):
         text = (res.text or "").lower()
         is_challenge = "captcha" in text or "verify" in text
@@ -392,11 +400,44 @@ async def _auto_claim_all_plans_locked(account: Account, *,
         except Exception as err:  # noqa: BLE001 - 激活失败不阻断领取
             logs.warn("claim", f"账号 {account.name} 激活上报异常: {err}")
 
+    # 2.7.80：preview 阶段的出口网络故障（ProxyError 503/超时）此前在 wrapper
+    # 之外被吞成「无可领套餐」，本号整轮报废且没有任何换绑动作——这正是
+    # 11-27 晚 14 个 503 号的实际路径。此处对网络型失败走同一换绑链重探，
+    # 业务型失败（无投放/参数错/凭证失效）仍按原样跳过。
     try:
         plans = await preview_plans(account)
     except ClaimError as err:
-        logs.info("claim", f"账号 {account.name} 无可领套餐（{err}）")
-        return outcomes
+        if not _is_egress_network_failure(err):
+            logs.info("claim", f"账号 {account.name} 无可领套餐（{err}）")
+            return outcomes
+        plans = []
+        for attempt in range(1, CLAIM_EGRESS_RETRIES + 2):
+            logs.warn("claim", f"账号 {account.name} 第 {attempt}/{CLAIM_EGRESS_RETRIES + 1} "
+                               f"次 preview 出口网络故障（{str(err)[:100]}）→ 换绑重试")
+            try:
+                ok = await _rebalance_for_claim(
+                    account, str(err)[:80], acceptance="billing", ban=False,
+                )
+            except Exception as rb_err:  # noqa: BLE001 - 换绑异常不掩盖原始失败
+                logs.warn("claim", f"账号 {account.name} preview 换绑调度异常: "
+                                   f"{type(rb_err).__name__}: {str(rb_err)[:120]}")
+                break
+            if not ok:
+                break
+            await asyncio.sleep(_EGRESS_RETRY_DELAY_S)
+            try:
+                plans = await preview_plans(account)
+                break
+            except ClaimError as retry_err:
+                err = retry_err
+                if not _is_egress_network_failure(retry_err):
+                    # 换绑后从网络故障变成业务应答（含「无投放」）= 出口已恢复
+                    logs.info("claim", f"账号 {account.name} 换绑后 preview 恢复: {retry_err}")
+                    return outcomes
+                err = retry_err
+        if not plans:
+            logs.info("claim", f"账号 {account.name} 无可领套餐（{err}，含换绑重试）")
+            return outcomes
     except Exception as err:  # noqa: BLE001
         logs.warn("claim", f"账号 {account.name} preview 异常: {err}")
         return outcomes
@@ -638,9 +679,24 @@ CLAIM_EGRESS_RETRIES = settings.CLAIM_EGRESS_RETRIES
 _EGRESS_RETRY_DELAY_S = settings.CLAIM_EGRESS_RETRY_DELAY
 
 
+def _is_egress_network_failure(err: Exception) -> bool:
+    """是否出口链路故障（2.7.80）：ProxyError/读超时穷尽重试后的网络层失败。
+
+    与业务码 -1（套餐不存在/参数错/无投放）严格分开——只有 _billing_request
+    在 TransportError 穷尽后打 egress_failure=True 才为真，避免「无投放」
+    也被当成出口故障触发换绑白烧。"""
+    return isinstance(err, ClaimError) and err.egress_failure
+
+
 def _is_egress_reputation_failure(err: Exception) -> bool:
-    """判定是否 IP 信誉型失败（值得换绑重试，而非套餐/参数/凭证问题）。"""
+    """判定是否值得换绑重试的出口问题（IP 信誉型 + 链路网络型）。"""
     if isinstance(err, ClaimError):
+        # 2.7.80：出口链路故障（ProxyError 503 / 连接超时穷尽重试）同样值得
+        # 换节点——同一坏代理上重试 billing GET 只会再吃 29s 退避，换绑才是
+        # 恢复连通的唯一手段。验收走 billing 探针（不烧验证码），见
+        # _rebalance_for_claim 的 acceptance 参数。
+        if err.egress_failure:
+            return True
         if err.code == 3007:
             return True
         # 403 必须「风控文案实锤」才换绑（2.7.50 review P1）：_billing_request
@@ -656,14 +712,20 @@ def _is_egress_reputation_failure(err: Exception) -> bool:
     return isinstance(err, CaptchaSolveError)
 
 
-async def _rebalance_for_claim(account: Account, reason: str) -> bool:
-    """为 claim 换绑出口节点；换绑后用验证码现解做真实验收。
+async def _rebalance_for_claim(account: Account, reason: str, *,
+                               acceptance: str = "captcha", ban: bool = True) -> bool:
+    """为 claim 换绑出口节点；换绑后用真实验收探针确认新节点可用。
 
-    Returns True = 已换到新节点且验证码求解通过（IP 信誉已恢复）；
-    False = 无 per-account 出口可换 / rebalance 失败 / 验收仍不过 /
-    换绑环节自身异常（吞掉并记日志——不掩盖原始 claim 错误上抛，2.7.50
-    review P2：本函数在 wrapper 的 except 块内被 await，穿出的异常会替换
-    原 ClaimError，归因链断裂）。"""
+    acceptance="captcha"（缺省，IP 信誉型失败）：现解一枚验证码——同时验证
+    IP 连通性与阿里云对该新 IP 的信誉评分；失败 = 新节点同样烂，不重打。
+    acceptance="billing"（2.7.80，出口网络型失败：ProxyError 503/超时）：
+    直接 GET /billing/preview 探连通性即可——这类失败根因是代理链不通而非
+    IP 信誉，烧一枚验证码求解（分钟级）毫无意义；连通恢复即重打。
+
+    Returns True = 已换到新节点且验收通过；False = 无 per-account 出口可换 /
+    rebalance 失败 / 验收仍不过 / 换绑环节自身异常（吞掉并记日志——不掩盖
+    原始 claim 错误上抛，2.7.50 review P2：本函数在 wrapper 的 except 块内
+    被 await，穿出的异常会替换原 ClaimError，归因链断裂）。"""
     from .egress_pool import egress_pool
 
     claim_proxy = egress.account_proxy(account)
@@ -684,25 +746,38 @@ async def _rebalance_for_claim(account: Account, reason: str) -> bool:
         # captcha 信誉失败（403 unusual activity / 求解 F001 / 3007）是 IP 级
         # 封禁信号，必须传唯一真隔离的 edge_405_html；细粒度归因放 evidence
         # （rebalance 自带）。
+        # 网络型失败（ProxyError 503/超时）不 ban 旧节点：代理链瞬态故障不等于
+        # 节点信誉坏，ban 会污染池子；rebalance 的 exclude 已保证本轮换到不同
+        # 节点。IP 信誉型失败（403/3007/验证码）仍 ban 旧节点（edge_405_html 是
+        # TP 唯一真隔离的 reason）。
         ok = await egress_pool.rebalance(
-            account, "edge_405_html", ban=True
+            account, "edge_405_html", ban=ban,
         )
         if not ok or account.egress_node == old_node:
             logs.warn("claim", f"账号 {account.name} 换绑未生效（{old_node or '?'}），放弃本轮重试")
             return False
 
-        # 验收：新节点上现解一枚验证码。这一步同时完成①IP 连通性②阿里云对该
-        # 新 IP 的信誉评分。失败 = 新节点同样烂，不重打。预算走领取链口径
-        # （2.7.68）：验收是决策探针不是可用性兜底，跑满 4 次只会拖长换绑链。
+        # 验收：新节点上探活，两种口径按失败类型分流（2.7.80）：
+        #  - captcha（IP 信誉型失败）：现解一枚验证码，同时验①IP 连通②阿里云
+        #    信誉评分；失败 = 新节点同样烂，不重打。
+        #  - billing（出口网络型失败：ProxyError 503/超时）：只验 billing GET
+        #    连通性即可——根因是代理链不通，烧验证码（分钟级求解）毫无意义。
+        # 预算走领取链口径（2.7.68）：验收是决策探针不是可用性兜底，跑满 4 次
+        # 只会拖长换绑链。
         new_tag = egress.egress_tag_for(account, settings.BILLING_EGRESS)
-        await captcha_manager.get_verify_param(egress_tag=new_tag,
-                                               proxy=egress.account_proxy(account),
-                                               retries=settings.CAPTCHA_CLAIM_SOLVE_RETRIES)
-        logs.ok("claim", f"账号 {account.name} 新出口 {account.egress_node} 验证码验收通过")
+        if acceptance == "billing":
+            await preview_plans(account)
+        else:
+            await captcha_manager.get_verify_param(
+                egress_tag=new_tag, proxy=egress.account_proxy(account),
+                retries=settings.CAPTCHA_CLAIM_SOLVE_RETRIES,
+            )
+        logs.ok("claim", f"账号 {account.name} 新出口 {account.egress_node} "
+                         f"{acceptance} 验收通过")
         return True
-    except CaptchaSolveError as err:
+    except (CaptchaSolveError, ClaimError) as err:
         logs.warn("claim", f"账号 {account.name} 新出口 {account.egress_node} "
-                           f"验证码验收失败: {err}——节点信誉不足，不再重打")
+                           f"{acceptance} 验收失败: {err}——节点不可用，不再重打")
         return False
     except Exception as err:  # noqa: BLE001 - 换绑环节异常不掩盖原始 claim 失败
         logs.warn("claim", f"账号 {account.name} 换绑环节异常: "
@@ -724,13 +799,20 @@ async def claim_with_egress_retry(account: Account, plan_id: str | None = None) 
             return await claim(account, plan_id)
         except Exception as err:  # noqa: BLE001 - 统一归因判定后分类处理
             last_err = err
-            if attempt >= attempts or not _is_egress_reputation_failure(err):
+            eligible = _is_egress_reputation_failure(err)
+            if attempt >= attempts or not eligible:
                 raise
+            network_failure = _is_egress_network_failure(err)
+            kind = "出口网络故障" if network_failure else "IP 信誉型失败"
             logs.warn("claim",
-                      f"账号 {account.name} 第 {attempt}/{attempts} 次 claim 遇 IP 信誉型失败"
+                      f"账号 {account.name} 第 {attempt}/{attempts} 次 claim 遇{kind}"
                       f"（{type(err).__name__}: {str(err)[:120]}）→ 换绑出口重试")
             try:
-                rebalanced = await _rebalance_for_claim(account, str(err)[:80])
+                rebalanced = await _rebalance_for_claim(
+                    account, str(err)[:80],
+                    acceptance="billing" if network_failure else "captcha",
+                    ban=not network_failure,
+                )
             except Exception as rb_err:  # noqa: BLE001 - 换绑异常不掩盖原始失败
                 logs.warn("claim", f"账号 {account.name} 换绑调度异常: "
                                    f"{type(rb_err).__name__}: {str(rb_err)[:120]}"

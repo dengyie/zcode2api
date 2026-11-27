@@ -65,7 +65,7 @@ OAUTH_CLI_POLL_PATH = "/api/v1/oauth/cli/poll"   # + /{flow_id}
 # 活跃版本永远不得越过此值——头比正文新就是 405/3012，比"落后一点"更致命。
 # 自动同步 / 手动设置统一由 set_active_version 钳制；真正升级 ZCode 版本时，
 # 先移植 Magpie prompt.mjs 文本进 zcode_system.json，再同步抬高此常量。
-PROMPT_ALIGNED_VERSION = "3.17.2"
+PROMPT_ALIGNED_VERSION = "4.0.0"
 DEFAULT_CLIENT_APP_VERSION = PROMPT_ALIGNED_VERSION
 CLIENT_APP_VERSION = DEFAULT_CLIENT_APP_VERSION
 CLIENT_PLATFORM = "darwin-arm64"  # asar TH() = process.platform-arch，服务端固定伪装

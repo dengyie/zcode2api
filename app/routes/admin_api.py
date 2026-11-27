@@ -20,14 +20,18 @@ from ..claim import (
     auto_claim_all_plans,
     billing_block_reason,
     claim_with_captcha,
+    claim_with_egress_retry,
     preview_plans,
     report_activation_events,
 )
-from ..claim import claim as do_claim
 from ..models import PROVIDERS, Status
 from ..oauth import ZaiAuthFlow
 from ..quota import fetch_coding_limits, fetch_quota, refresh_accounts
 from ..store import store
+
+# 2.7.80：do_claim 从裸 claim 切到带出口换绑的 wrapper，但保留别名——
+# 集成测试与运维脚本 monkeypatch admin_api.do_claim 做门控探针，改名会炸测试。
+do_claim = claim_with_egress_retry
 
 router = APIRouter(prefix="/admin/api", dependencies=[Depends(verify_admin_key)])
 
@@ -659,6 +663,9 @@ async def _run_claim_job(runnable: list, plan_id: str | None, rec: dict) -> None
     """后台逐号领取（无响应预算约束；同号经 account_claim_lock 与领取轮互斥）。"""
     for acc in runnable:
         try:
+            # 2.7.80：手动全量领取此前走裸 claim（无换绑链）——11-27 晚 14 个
+            # 503 号重试全灭且零换绑动作。改走带出口换绑的 wrapper，与自动轮
+            # 同口径；非出口失败（无投放/参数错）行为不变，原样上抛。
             async with account_claim_lock(acc.id):
                 result = await do_claim(acc, plan_id)
             rec["outcomes"].append(

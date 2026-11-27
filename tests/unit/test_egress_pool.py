@@ -1436,6 +1436,25 @@ async def test_start_idempotent_reconcile_loop(tp_mode, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tp_acquire_sends_egress_preference_param(tp_mode, monkeypatch):
+    """2.7.81：TP acquire 必须用 IP-Pool API 认的参数名 egress_preference，
+    不能传 type——FastAPI 对未知参数静默忽略，实际退回默认 warp_ipv6，
+    us-west warp 池仅 10 个健康节点且被占满 → 换绑恒 mutex_exhausted。"""
+    captured: dict = {}
+
+    def _fake_tp_http(method, url, body=None, headers=None, timeout=15):
+        captured["url"] = url
+        return 200, json.dumps({"node_name": "node-x", "exit_ip": "9.9.9.9"}), {}
+
+    monkeypatch.setattr(egress_pool, "_tp_http", _fake_tp_http)
+    d = await egress_pool.tp_acquire(_account(acc_id="acc-ep"))
+    assert d and d.get("node_name") == "node-x"
+    # 参数名必须是 egress_preference且与 TP_TYPE 同源
+    assert "egress_preference=clash_proxy" in captured["url"]
+    assert "type=clash_proxy" not in captured["url"]
+
+
+@pytest.mark.asyncio
 async def test_tp_acquire_sends_exclusive_param(tp_mode, monkeypatch):
     """2026-11-21 硬互斥 opt-in：tp_acquire 必须带 exclusive=true（IP-Pool
     侧据此剔除本 service 其它账号现占节点），一号一节点从分配源头成立。"""

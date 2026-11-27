@@ -106,7 +106,7 @@ def apply_start_plan_system(body: dict, model: str | None = None) -> bool:
     """
     cli_prefix = _ZCODE_PROMPT.get("cliPrefix")
     stable = _ZCODE_PROMPT.get("stableSections")
-    if not cli_prefix or not isinstance(stable, list) or len(stable) < 2:
+    if not cli_prefix or not isinstance(stable, list) or not stable:
         return False
     existing = body.get("system")
     # 幂等：首块已是 cliPrefix 则视为已注入
@@ -127,17 +127,16 @@ def apply_start_plan_system(body: dict, model: str | None = None) -> bool:
         for t in (body.get("tools") or [])
     )
 
+    # ZCode 4.0.0：desktopContext / environment / poweredBy 移入 meta_user（messages[0]），
+    # system[2] 保留 dynamicBehavior + (sessionGuidance) + contextManagement + finishingWork + memoryNotes。
     dynamic: list[str] = [str(_ZCODE_PROMPT.get("dynamicBehavior") or "")]
     if has_skill and _ZCODE_PROMPT.get("sessionGuidance"):
         dynamic.append(str(_ZCODE_PROMPT["sessionGuidance"]))
-    dynamic.append(_environment_text())
-    if isinstance(model, str) and model.strip():
-        powered = str(_ZCODE_PROMPT.get("poweredBy") or "")
-        if powered:
-            dynamic.append(
-                powered.replace("{provider}", "zai-api").replace("{model}", model.strip())
-            )
     dynamic.append(str(_ZCODE_PROMPT.get("contextManagement") or ""))
+    for key in ("finishingWork", "memoryNotes"):
+        val = _ZCODE_PROMPT.get(key)
+        if isinstance(val, str) and val.strip():
+            dynamic.append(val)
     dynamic.extend(own)
 
     body["system"] = [
@@ -153,12 +152,10 @@ def _is_date_turn_text(text: object) -> bool:
     return isinstance(text, str) and "<system-reminder>" in text and "Today's date is" in text
 
 
-def apply_current_date_turn(body: dict) -> bool:
-    """把官方「当前日期」提醒补进首条 user 轮（contextPrefix，Magpie 3.17.2 形态）。
+def apply_current_date_turn(body: dict, model: str | None = None) -> bool:
+    """把官方 meta_user 上下文（desktopContext / environment / poweredBy / 当前日期）补进首条 user 轮。
 
-    形态：`<system-reminder>Today's date is YYYY-MM-DD.</system-reminder>` 的独立
-    user 轮（无换行，逐字节对齐 dress() 的 contextPrefix）。幂等：首条消息已是
-    该形态则跳过。
+    幂等：首条消息已含 `<system-reminder>...Today's date is...` 则跳过。
     """
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -171,7 +168,20 @@ def apply_current_date_turn(body: dict) -> bool:
                 return False
     ctx = _ZCODE_PROMPT.get("context") or {}
     line = str(ctx.get("currentDateLine") or "Today's date is {date}.")
-    date_text = f"<system-reminder>{line.replace('{date}', time.strftime('%Y-%m-%d'))}</system-reminder>"
+    date_line = line.replace("{date}", time.strftime("%Y-%m-%d"))
+    parts: list[str] = []
+    desktop_ctx = _ZCODE_PROMPT.get("desktopContext")
+    if isinstance(desktop_ctx, str) and desktop_ctx.strip():
+        parts.append(desktop_ctx)
+    parts.append(_environment_text())
+    if isinstance(model, str) and model.strip():
+        powered = str(_ZCODE_PROMPT.get("poweredBy") or "")
+        if powered:
+            parts.append(
+                powered.replace("{provider}", "zai").replace("{model}", model.strip())
+            )
+    parts.append(date_line)
+    date_text = "<system-reminder>\n" + "\n\n".join(parts) + "\n</system-reminder>"
     body["messages"] = [
         {"role": "user", "content": [{"type": "text", "text": date_text}]},
         *messages,
@@ -374,7 +384,7 @@ def transform_body(
     try:
         apply_start_plan_system(body, model)
         apply_cache_control(body)
-        apply_current_date_turn(body)
+        apply_current_date_turn(body, model)
         attribution = attribution_user_id(device_mid, session_id) if (device_mid or session_id) else None
         if attribution:
             apply_user_id(body, attribution)

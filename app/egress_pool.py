@@ -172,7 +172,12 @@ async def tp_acquire(account, force_rebalance: bool = False,
         "service": settings.TP_SERVICE,
         "account_id": "zh-" + str(account.id),
         "region": settings.TP_REGION,
-        "type": settings.TP_TYPE,
+        # 2.7.81 根修：参数名必须是 IP-Pool API 认的 egress_preference（api/server.py
+        # acquire_account_allocation 的 Query 参数）。此前误传 type——FastAPI 对
+        # 未知 query 参数静默忽略，egress_preference 保持默认 warp_ipv6，而
+        # us-west warp_ipv6 健康节点仅 10 个且被占满 → 换绑恒 mutex_exhausted，
+        # 503→换绑链空转。改对参数名后 us-west clash_proxy 有 200+ 健康候选。
+        "egress_preference": settings.TP_TYPE,
         # tier 承诺必须显式上送（2026-11-21）：缺失时 IP-Pool 按 standard_first
         # 默认策略分配——机房 standard 节点会粘给 zcode 号（claim 风控高危，
         # IP-Pool 手册实锤「忘带 tier 被弹到全池随机」hub 侧翻版）。与

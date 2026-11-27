@@ -149,3 +149,49 @@ async def test_transport_abort_openai_fail_frames_no_attrerror(tp_mode, monkeypa
     frames = [f async for f in guarded()]
     assert any("upstream_stream_error" in f for f in frames), \
         f"openai 路径传输中断未产出 error_sse: {frames}"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_without_message_delta_emits_error_frame(tp_mode):
+    """上游 SSE 流无 message_delta 即结束时，不得静默发 [DONE] 充当成功。"""
+    acc = _account()
+
+    class _FakeResp:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":3}}}'
+
+    up = type("Up", (), {
+        "account": acc,
+        "resp": _FakeResp(),
+        "t_first": 0.1,
+        "close": lambda *a: asyncio.sleep(0),
+    })()
+
+    resp = gw._openai_stream_response(up, "GLM-5.3-Flash", "req-trunc")
+    chunks = [c async for c in resp.body_iterator]
+    joined = "".join(chunks)
+    assert "upstream_stream_truncated" in joined
+    assert joined.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.asyncio
+async def test_to_streaming_empty_bytes_triggers_abort(tp_mode):
+    """上游返回 0 字节空流时，to_streaming 必须触发流中断记账。"""
+    acc = _account()
+
+    class _FakeResp:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_bytes(self):
+            if False:
+                yield b""
+
+    up = gw._Upstream(_FakeResp(), None, None, t_first=0.1, account=acc)
+    resp = up.to_streaming("req-empty")
+    chunks = [c async for c in resp.body_iterator]
+    assert chunks == []
+    assert acc.recent_results and acc.recent_results[-1]["ok"] is False

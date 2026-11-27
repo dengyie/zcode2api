@@ -111,3 +111,29 @@ class TestBusinessErrorOn200:
         assert body["content"][0]["text"] == "Hello from mock upstream"
         assert acc.use_count == 1
         assert acc.recent_results[-1]["ok"] is True
+
+    async def test_empty_code_zero_on_200_treated_as_502_not_empty_200_stream(
+        self, gateway_client, fresh_app, stub_captcha, clean_mock, monkeypatch
+    ):
+        """200 + {"code":0,"msg":""}（非 Anthropic 形状）不得当 200 空流放行。"""
+        from app import settings
+        from tests.conftest import seed_account
+
+        monkeypatch.setattr(settings, "RETRY_5XX_WAIT", 0)
+        monkeypatch.setattr(settings, "RETRY_5XX_TIMES", 1)
+
+        client, _ = gateway_client
+        stub_captcha.needs_captcha = False
+        bad = seed_account(fresh_app, _JWT_QUOTA, name="empty-code-zero")
+        clean_mock.state.sequences[_JWT_QUOTA[:16]] = ["empty_code_zero_200"] * 2
+
+        res = await client.post("/v1/chat/completions", json={
+            "model": "glm-5.3-flash",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+
+        assert res.status_code == 503
+        assert bad.use_count == 0
+        assert bad.recent_results[-1]["ok"] is False
+        assert "502" in bad.recent_results[-1]["detail"]
