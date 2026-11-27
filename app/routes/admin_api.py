@@ -660,48 +660,62 @@ def _claim_summary(outcomes: list[dict]) -> dict:
 
 
 async def _run_claim_job(runnable: list, plan_id: str | None, rec: dict) -> None:
-    """后台逐号领取（无响应预算约束；同号经 account_claim_lock 与领取轮互斥）。"""
-    for acc in runnable:
-        try:
-            # 2.7.80：手动全量领取此前走裸 claim（无换绑链）——11-27 晚 14 个
-            # 503 号重试全灭且零换绑动作。改走带出口换绑的 wrapper，与自动轮
-            # 同口径；非出口失败（无投放/参数错）行为不变，原样上抛。
-            async with account_claim_lock(acc.id):
-                result = await do_claim(acc, plan_id)
-            rec["outcomes"].append(
-                {"account_id": acc.id, "account_name": acc.name, "ok": True, **result})
-            # refresh 移出主 try（2026-11-21 review P2）：它在成功 outcome 之后，
-            # 原本与 append 同 try——refresh 抛异常会落兜底 except 再 append 一条
-            # ok:False，同号双 outcome 自相矛盾，摘要把已领成功的号计成 fail。
-            # 刷新失败只降级留痕，不影响领取结果。
-            try:
-                await refresh_accounts([acc])
-            except Exception as refresh_err:  # noqa: BLE001 - 额度刷新失败不掩盖领取成功
-                logs.warn("claim", f"账号 {acc.name} 领取成功但额度刷新失败: {refresh_err!r}")
-        except ClaimError as err:
-            logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
-            outcome = {"account_id": acc.id, "account_name": acc.name,
-                       "ok": False, "message": str(err)}
-            if err.code != -1:
-                outcome["code"] = err.code
-            if err.next_at:
-                outcome["next_at"] = err.next_at
-            rec["outcomes"].append(outcome)
-        except CaptchaSolveError as err:
-            # 验证码求解失败（get_verify_param）：明确业务回执而非裸 500
-            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
-            rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
-                                    "ok": False, "message": str(err)})
-        except RuntimeError as err:
-            # 兜底：captcha 层历史语义的运行时故障，防回归裸 500
-            logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
-            rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
-                                    "ok": False, "message": str(err)})
-        except Exception as err:  # noqa: BLE001 - 后台任务无人接收，必须自兜
-            logs.err("claim", f"账号 {acc.name} 领取任务异常: {type(err).__name__}: {err}")
-            rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
-                                    "ok": False, "message": str(err)})
+    """后台并发领取（无响应预算约束；同号经 account_claim_lock 与领取轮互斥）。
+
+    2.7.83：逐号串行 → Semaphore(CLAIM_ROUND_CONCURRENCY) 并发（缺省 10），与
+    自动领取轮同口径。验证码求解另有进程级上限，浏览器压力不随之放大。
+    """
+    sem = asyncio.Semaphore(max(1, int(settings.CLAIM_ROUND_CONCURRENCY)))
+
+    async def _one(acc) -> None:
+        async with sem:
+            await _claim_job_one(acc, plan_id, rec)
+
+    await asyncio.gather(*[_one(acc) for acc in runnable])
     rec["done"] = True
+
+
+async def _claim_job_one(acc, plan_id: str | None, rec: dict) -> None:
+    """单号领取并把 outcome 追加到 rec（各分支自兜异常，不向 gather 抛出）。"""
+    try:
+        # 2.7.80：手动全量领取此前走裸 claim（无换绑链）——11-27 晚 14 个
+        # 503 号重试全灭且零换绑动作。改走带出口换绑的 wrapper，与自动轮
+        # 同口径；非出口失败（无投放/参数错）行为不变，原样上抛。
+        async with account_claim_lock(acc.id):
+            result = await do_claim(acc, plan_id)
+        rec["outcomes"].append(
+            {"account_id": acc.id, "account_name": acc.name, "ok": True, **result})
+        # refresh 移出主 try（2026-11-21 review P2）：它在成功 outcome 之后，
+        # 原本与 append 同 try——refresh 抛异常会落兜底 except 再 append 一条
+        # ok:False，同号双 outcome 自相矛盾，摘要把已领成功的号计成 fail。
+        # 刷新失败只降级留痕，不影响领取结果。
+        try:
+            await refresh_accounts([acc])
+        except Exception as refresh_err:  # noqa: BLE001 - 额度刷新失败不掩盖领取成功
+            logs.warn("claim", f"账号 {acc.name} 领取成功但额度刷新失败: {refresh_err!r}")
+    except ClaimError as err:
+        logs.warn("claim", f"账号 {acc.name} 领取失败: {err}")
+        outcome = {"account_id": acc.id, "account_name": acc.name,
+                   "ok": False, "message": str(err)}
+        if err.code != -1:
+            outcome["code"] = err.code
+        if err.next_at:
+            outcome["next_at"] = err.next_at
+        rec["outcomes"].append(outcome)
+    except CaptchaSolveError as err:
+        # 验证码求解失败（get_verify_param）：明确业务回执而非裸 500
+        logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
+        rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
+                                "ok": False, "message": str(err)})
+    except RuntimeError as err:
+        # 兜底：captcha 层历史语义的运行时故障，防回归裸 500
+        logs.err("claim", f"账号 {acc.name} 领取失败: {err}")
+        rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
+                                "ok": False, "message": str(err)})
+    except Exception as err:  # noqa: BLE001 - 后台任务无人接收，必须自兜
+        logs.err("claim", f"账号 {acc.name} 领取任务异常: {type(err).__name__}: {err}")
+        rec["outcomes"].append({"account_id": acc.id, "account_name": acc.name,
+                                "ok": False, "message": str(err)})
 
 
 async def _run_claim_job_guarded(runnable: list, plan_id: str | None, rec: dict) -> None:
